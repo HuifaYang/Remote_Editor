@@ -1,0 +1,8 @@
+PySide6>=6.5
+paramiko>=2.9
+Pygments>=2.11
+
+# 开发 / 测试
+pytest>=7.0
+pytest-qt>=4.2
+pyinstaller>=6.0
