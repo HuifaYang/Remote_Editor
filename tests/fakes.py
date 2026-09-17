@@ -11,10 +11,10 @@ import posixpath
 import stat
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
-from app.git.git_client import RepoInfo
-from app.remote.remote_fs import FileFingerprint
+from app.git.git_client import FileStatus, RepoInfo
+from app.remote.remote_fs import FileFingerprint, normalize_remote_path
 from app.remote.ssh_client import CommandResult
 from app.remote.sftp_client import RemoteEntry
 from app.utils.encoding import DecodedText, decode_bytes
@@ -57,6 +57,11 @@ class FakeSSHServer:
 
         if "command -v git" in command:
             return CommandResult(command, 0 if self.has_git else 1, "/usr/bin/git\n" if self.has_git else "", "")
+        if "rev-parse --show-toplevel" in command and "--abbrev-ref" in command:
+            # 合并调用（真实实现把仓库根与分支名合并成一次 rev-parse）
+            if not self.is_repo:
+                return CommandResult(command, 128, "", "fatal: not a git repository")
+            return CommandResult(command, 0, f"{self.root}\n{self.branch}\n", "")
         if "rev-parse --show-toplevel" in command:
             if not self.is_repo:
                 return CommandResult(command, 128, "", "fatal: not a git repository")
@@ -98,10 +103,28 @@ class FakeSSHServer:
             return raw.strip("'\"")
         return ""
 
+    def _relative_target(self, target: str) -> str:
+        """把 pathspec（可能是仓库根下的绝对路径）转成仓库内相对路径。"""
+        root = self.root.rstrip("/")
+        if target == root:
+            return ""
+        if target.startswith(root + "/"):
+            return target[len(root) + 1 :]
+        return target.strip("/")
+
     def _status_output(self, command: str) -> str:
         target = self._target_path(command)
         lines: List[str] = []
-        paths = [target] if target else sorted(set(self.head) | set(self.worktree))
+        if target:
+            # git status <pathspec>：只报该子树下的变更（含目录折叠）
+            prefix = self._relative_target(target)
+            paths = [
+                path
+                for path in sorted(set(self.head) | set(self.worktree))
+                if not prefix or path == prefix or path.startswith(prefix + "/")
+            ]
+        else:
+            paths = sorted(set(self.head) | set(self.worktree))
         for path in paths:
             in_head = path in self.head
             in_work = path in self.worktree
@@ -152,6 +175,8 @@ class FakeFileSystem:
         self.deleted: List[str] = []
         self.renamed: List[tuple] = []
         self.created: List[str] = []
+        self.list_calls: List[str] = []
+        self.read_calls: List[str] = []
 
     # -- 帮助方法 ----------------------------------------------------------
     def add_file(self, path: str, content: str = "") -> None:
@@ -188,9 +213,14 @@ class FakeFileSystem:
 
     # -- 接口 --------------------------------------------------------------
     def list_dir(self, path: str) -> List[RemoteEntry]:
+        self.list_calls.append(path)
         return list(self.directories.get(path, []))
 
     def read_text(self, path, *, encoding=None, max_bytes=None) -> DecodedText:
+        return self.read_text_with_stat(path, encoding=encoding, max_bytes=max_bytes)[0]
+
+    def read_text_with_stat(self, path, *, encoding=None, max_bytes=None):
+        self.read_calls.append(path)
         if self.fail_on_read is not None:
             raise self.fail_on_read
         if path not in self.files:
@@ -202,7 +232,14 @@ class FakeFileSystem:
             from app.utils.errors import SFTError
 
             raise SFTError("文件过大")
-        return decode_bytes(raw, encoding=encoding)
+        entry = RemoteEntry(
+            name=posixpath.basename(path),
+            path=path,
+            is_dir=False,
+            size=len(raw),
+            mtime=self._mtime.get(path, 0.0),
+        )
+        return decode_bytes(raw, encoding=encoding), entry
 
     def write_text(self, path, text, *, encoding="utf-8", newline="\n") -> None:
         if self.fail_on_write is not None:
@@ -279,6 +316,10 @@ class FakeGitClient:
         )
         self.diff_text = diff_text
         self.diff_calls: List[tuple] = []
+        #: ``status_map`` 调用记录 (path, scope)，用于断言「本地更新后不再跑 git status」
+        self.status_calls: List[Tuple[Optional[str], Optional[str]]] = []
+        #: ``git status --porcelain`` 结果（相对仓库根路径 → 状态码），供快照测试使用
+        self.status_lines: Dict[str, str] = {}
 
     def repo_info(self, directory: str) -> RepoInfo:  # noqa: D401
         return self.repo
@@ -286,10 +327,46 @@ class FakeGitClient:
     def is_repository(self, directory: str) -> bool:
         return self.repo.is_repository
 
-    def file_diff(self, directory: str, relative_path: str, *, content: str = "", head: str = "HEAD"):
+    def status_map(
+        self, directory: str, *, path: Optional[str] = None, scope: Optional[str] = None
+    ) -> Dict[str, FileStatus]:
+        self.status_calls.append((path, scope))
+        statuses: Dict[str, FileStatus] = {}
+        for name, code in self.status_lines.items():
+            if path and name != path:
+                continue
+            if scope:
+                absolute = normalize_remote_path(name, self.repo.root)
+                if not absolute.startswith(scope.rstrip("/") + "/") and absolute != scope.rstrip("/"):
+                    continue
+            statuses[name] = FileStatus(
+                path=name, index_status=code[0], worktree_status=code[1]
+            )
+        return statuses
+
+    def tree_status(self, directory: str, *, info=None, scope: Optional[str] = None):
+        from app.git.git_client import build_tree_status
+
+        info = info or self.repo
+        return build_tree_status(
+            info.root,
+            branch=info.branch,
+            statuses=self.status_map(info.root, scope=scope),
+            scope=scope or info.root,
+        )
+
+    def file_diff(
+        self,
+        directory: str,
+        relative_path: str,
+        *,
+        content: str = "",
+        head: str = "HEAD",
+        status=None,
+    ):
         from app.git.diff_parser import build_file_diff, build_added_file_diff, line_count
 
-        self.diff_calls.append((directory, relative_path, content))
+        self.diff_calls.append((directory, relative_path, content, status))
         if self.diff_text:
             return build_file_diff(
                 self.diff_text, path=relative_path, new_line_count=line_count(content)
@@ -305,6 +382,8 @@ class FakeSession:
 
         self.host = host or HostConfig(name="Robot-3566", host="192.168.1.100")
         self.workspace = workspace
+        self.workspace_configured = bool(workspace)
+        self.home = posixpath.dirname(workspace.rstrip("/")) or "/"
         self.fs = FakeFileSystem()
         self.git = FakeGitClient()
         self.ssh = FakeSSHServer(root=workspace)
@@ -315,6 +394,16 @@ class FakeSession:
     def connect(self) -> None:  # pragma: no cover - 已连接
         self.connected = True
 
+    def remote_home(self) -> str:
+        return self.home
+
+    def expand_path(self, path: str) -> str:
+        return normalize_remote_path(path, self.home)
+
+    def set_workspace(self, path: str) -> None:
+        self.workspace = self.expand_path(path)
+        self.workspace_configured = True
+
     def close(self) -> None:
         self.closed = True
         self.connected = False
@@ -323,10 +412,14 @@ class FakeSession:
         self.connected = True
 
     def repo_info(self, *, refresh: bool = False) -> RepoInfo:
+        if refresh:
+            self._repo_info = self.git.repo
         return self._repo_info
 
-    def set_workspace(self, path: str) -> None:
-        self.workspace = path
+    def set_repo(self, repo: RepoInfo) -> None:
+        """替换仓库识别结果（同步更新假 Git 客户端与会话缓存）。"""
+        self.git.repo = repo
+        self._repo_info = repo
 
     def state(self):  # pragma: no cover - 状态栏用
         from app.remote.session import SessionState

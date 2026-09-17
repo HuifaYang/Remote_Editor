@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from PySide6.QtCore import Qt
@@ -22,6 +23,9 @@ from PySide6.QtWidgets import (
 from app.config.hosts import HostConfig, HostStore
 from app.ui.ssh_dialog import HostFormDialog
 from app.utils.errors import ConfigError
+from app.utils.ssh_keys import SSHConfigHost, load_ssh_config_hosts
+
+logger = logging.getLogger(__name__)
 
 
 class HostManagerDialog(QDialog):
@@ -42,13 +46,15 @@ class HostManagerDialog(QDialog):
         self.edit_button = QPushButton("编辑", self)
         self.delete_button = QPushButton("删除", self)
         self.connect_button = QPushButton("连接", self)
+        self.import_button = QPushButton("从 ~/.ssh/config 导入", self)
+        self.import_button.clicked.connect(self._on_import_config)
         self.add_button.clicked.connect(self._on_add)
         self.edit_button.clicked.connect(self._on_edit)
         self.delete_button.clicked.connect(self._on_delete)
         self.connect_button.clicked.connect(self._on_connect)
 
         toolbar = QHBoxLayout()
-        for button in (self.add_button, self.edit_button, self.delete_button):
+        for button in (self.add_button, self.edit_button, self.delete_button, self.import_button):
             toolbar.addWidget(button)
         toolbar.addStretch(1)
         toolbar.addWidget(self.connect_button)
@@ -128,6 +134,50 @@ class HostManagerDialog(QDialog):
         if confirm == QMessageBox.StandardButton.Yes:
             self._store.delete(host.id)
             self.reload()
+
+    def _on_import_config(self) -> None:
+        """读取本机 ~/.ssh/config，把其中已配置好的主机导入主机列表。"""
+        try:
+            entries = load_ssh_config_hosts()
+        except OSError as exc:  # pragma: no cover - 权限异常
+            QMessageBox.warning(self, "读取失败", f"无法读取 ~/.ssh/config：{exc}")
+            return
+        if not entries:
+            QMessageBox.information(
+                self,
+                "没有可导入的主机",
+                "未在本机 ~/.ssh/config 中找到可导入的 Host 条目。\n"
+                "（含通配符的 Host 段落会被忽略。）",
+            )
+            return
+
+        imported = 0
+        skipped = 0
+        for entry in entries:
+            if self._already_present(entry):
+                skipped += 1
+                continue
+            try:
+                self._store.add(HostConfig.from_ssh_config(entry))
+            except ConfigError as exc:
+                logger.warning("导入 %s 失败：%s", entry.alias, exc.message)
+                skipped += 1
+                continue
+            imported += 1
+        self.reload()
+        QMessageBox.information(
+            self,
+            "导入完成",
+            f"从 ~/.ssh/config 导入 {imported} 台主机，跳过 {skipped} 条（已存在或无效）。",
+        )
+
+    def _already_present(self, entry: SSHConfigHost) -> bool:
+        return any(
+            host.host == entry.connect_host
+            and int(host.port) == int(entry.port or 22)
+            and (not entry.username or host.username == entry.username)
+            for host in self._store.all()
+        )
 
     def _on_connect(self) -> None:
         host = self.current_host()

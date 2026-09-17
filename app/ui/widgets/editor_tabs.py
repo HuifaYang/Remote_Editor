@@ -9,14 +9,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QTabWidget, QVBoxLayout, QWidget
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtWidgets import QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget
 
 from app.config.settings import AppSettings
 from app.editor.document import Document
 from app.editor.editor import CodeEditor
 from app.git.models import ChangeType
+from app.ui.icons import make_icon
 from app.ui.theme import Theme
+
+#: 标签页关闭按钮：Qt 自带的图形在深色主题下是红色小方块，自己画一个灰色的叉
+CLOSE_BUTTON_SIZE = 16
+CLOSE_ICON_SIZE = 12
 
 
 @dataclass
@@ -61,6 +66,17 @@ class EditorTabs(QTabWidget):
         self._theme = theme
         for tab in self._tabs():
             tab.editor.set_theme(theme)
+        self._refresh_close_buttons()
+
+    def _refresh_close_buttons(self) -> None:
+        icon = make_icon("close", self._theme.color("gutter_fg"), size=CLOSE_ICON_SIZE)
+        tab_bar = self.tabBar()
+        for tab in self._tabs():
+            button = tab_bar.tabButton(
+                self._tab_index(tab), QTabBar.ButtonPosition.RightSide
+            )
+            if isinstance(button, QToolButton):
+                button.setIcon(icon)
 
     def apply_settings(self, settings: AppSettings) -> None:
         self._settings = settings
@@ -157,6 +173,9 @@ class EditorTabs(QTabWidget):
 
         index = self.addTab(page, document.tab_title)
         self.setTabToolTip(index, document.remote_path or document.display_name)
+        self.tabBar().setTabButton(
+            index, QTabBar.ButtonPosition.RightSide, self._make_close_button(page)
+        )
 
         editor.cursorMoved.connect(self._on_editor_cursor)
         editor.document().modificationChanged.connect(
@@ -184,6 +203,25 @@ class EditorTabs(QTabWidget):
         if tab is not None:
             tab.editor.deleteLater()
         self._on_current_changed(self.currentIndex() if self.count() else -1)
+
+    def _make_close_button(self, page: QWidget) -> QToolButton:
+        """自绘关闭按钮（Qt 默认图形的红色方块和 VSCode 风格不搭）。"""
+        button = QToolButton(self)
+        button.setObjectName("tab_close")
+        button.setAutoRaise(True)
+        button.setFixedSize(CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE)
+        button.setIconSize(QSize(CLOSE_ICON_SIZE, CLOSE_ICON_SIZE))
+        button.setToolTip("关闭")
+        button.setCursor(Qt.CursorShape.ArrowCursor)
+        button.setIcon(make_icon("close", self._theme.color("gutter_fg"), size=CLOSE_ICON_SIZE))
+        button.clicked.connect(lambda: self._request_close_page(page))
+        return button
+
+    def _request_close_page(self, page: QWidget) -> None:
+        """按页面（而不是序号）找标签，避免标签拖动后关错文件。"""
+        index = self.indexOf(page)
+        if index >= 0:
+            self.close_document(index)
 
     def close_path(self, path: str) -> bool:
         index = self.index_of_path(path)

@@ -17,6 +17,10 @@ class Document:
     host_id: str = ""
     text: str = ""
     saved_text: Optional[str] = None
+    #: 打开时从远端读到的原始内容（判断「撤销回原样」时要用到，不随保存变化）
+    loaded_text: str = ""
+    #: 打开时该文件相对 HEAD 是否干净（来自文件树快照，快照答不上来时为 ``False``）
+    clean_at_open: bool = False
     encoding: str = "utf-8"
     newline: str = "\n"
     language: str = "Plain Text"
@@ -31,6 +35,16 @@ class Document:
         # 未显式给出 saved_text 时，认为当前内容即已保存内容
         if self.saved_text is None:
             self.saved_text = self.text
+        if not self.loaded_text:
+            self.loaded_text = self.text
+
+    @property
+    def reverted(self) -> bool:
+        """内容是否已经回到打开时的样子，且当时本来就是干净的。
+
+        「撤销掉全部修改」之后文件相对 ``HEAD`` 依然干净，文件树着色应当撤掉。
+        """
+        return self.clean_at_open and self.text == self.loaded_text
 
     # -- 状态 --------------------------------------------------------------
     @property

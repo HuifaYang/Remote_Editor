@@ -19,6 +19,30 @@ from app.utils.errors import SFTError
 logger = logging.getLogger(__name__)
 
 
+def normalize_remote_path(path: str, home: str = "") -> str:
+    """把用户输入的远程路径规范化为 SFTP 可以直接使用的绝对路径。
+
+    SFTP 不像交互式 shell 那样会展开 ``~``，用户填 ``~/ros2_ws/src/``
+    时 ``stat`` 会直接报 ENOENT。这里统一按以下规则处理：
+
+    * ``~`` / ``~/x`` → 远端家目录（由 ``home`` 传入）；
+    * 其他相对路径 → 相对远端家目录（无家目录信息时相对 ``/``）；
+    * 折叠 ``.`` / ``..`` 与结尾多余的 ``/``。
+    """
+    raw = (path or "").strip()
+    base = (home or "").rstrip("/")
+    if not raw:
+        return base or "/"
+    if raw == "~":
+        return base or "/"
+    if raw.startswith("~/"):
+        raw = posixpath.join(base or "/", raw[2:])
+    elif not raw.startswith("/"):
+        raw = posixpath.join(base or "/", raw)
+    normalized = posixpath.normpath(raw)
+    return normalized if normalized.startswith("/") else f"/{normalized}"
+
+
 @dataclass(frozen=True)
 class FileFingerprint:
     """远程文件指纹，用于保存前的冲突检测。"""
@@ -77,6 +101,16 @@ class RemoteFileSystem:
         max_bytes: Optional[int] = None,
     ) -> DecodedText:
         return self.sftp.read_text(path, encoding=encoding, max_bytes=max_bytes)
+
+    def read_text_with_stat(
+        self,
+        path: str,
+        *,
+        encoding: Optional[str] = None,
+        max_bytes: Optional[int] = None,
+    ) -> "tuple[DecodedText, RemoteEntry]":
+        """读取文本并同时返回元信息（一次 SFTP 会话完成下载与指纹采集）。"""
+        return self.sftp.read_text_with_stat(path, encoding=encoding, max_bytes=max_bytes)
 
     def write_text(
         self,

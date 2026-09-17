@@ -13,6 +13,7 @@ from app.remote.remote_fs import FileFingerprint
 from app.remote.session import RemoteSession
 from app.remote.ssh_client import CommandResult, SSHConnectionOptions
 from app.git.git_client import RepoInfo
+from app.utils.ssh_keys import PrivateKeyInfo
 
 
 class FakeSSHClient:
@@ -79,6 +80,26 @@ def test_connect_keeps_configured_workspace(patched_ssh, host: HostConfig) -> No
     assert patched_ssh.instances[-1].commands == []
 
 
+def test_connect_expands_tilde_workspace(patched_ssh, host: HostConfig) -> None:
+    host.remote_workspace = "~/ros2_ws/src/"
+    session = RemoteSession(host)
+    session.connect()
+    assert session.workspace == "/home/user/ros2_ws/src"
+    assert session.workspace_configured is True
+
+
+def test_expand_path_handles_home_and_relative(patched_ssh, host: HostConfig) -> None:
+    host.remote_workspace = "/opt/app"
+    session = RemoteSession(host)
+    session.connect()
+    assert session.expand_path("~") == "/home/user"
+    assert session.expand_path("~/ros2_ws") == "/home/user/ros2_ws"
+    assert session.expand_path("logs") == "/home/user/logs"
+    assert session.expand_path("/var/log/../tmp") == "/var/tmp"
+    # 已经是绝对路径时不会为了取家目录而多跑一次命令
+    assert session.expand_path("/opt/app") == "/opt/app"
+
+
 def test_build_options_password_auth_ignores_key(patched_ssh, host: HostConfig) -> None:
     host.auth_method = AuthMethod.PASSWORD
     host.private_key_path = "/home/u/.ssh/id_rsa"
@@ -99,6 +120,18 @@ def test_build_options_key_auth(patched_ssh, host: HostConfig) -> None:
     assert options.private_key_path == "/home/u/.ssh/id_ed25519"
     assert options.passphrase == "pp"
     assert options.password is None
+
+
+def test_build_options_falls_back_to_local_default_key(patched_ssh, host: HostConfig, tmp_path, monkeypatch) -> None:
+    key_path = tmp_path / "id_ed25519"
+    key_path.write_text("fake", encoding="utf-8")
+    monkeypatch.setattr(
+        session_module, "default_private_key", lambda: PrivateKeyInfo(path=key_path)
+    )
+    host.auth_method = AuthMethod.PRIVATE_KEY
+    host.private_key_path = ""
+    session = RemoteSession(host)
+    assert session.build_options().private_key_path == str(key_path)
 
 
 def test_repo_info_is_cached(patched_ssh, host: HostConfig, monkeypatch) -> None:

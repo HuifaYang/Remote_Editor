@@ -5,6 +5,8 @@ from __future__ import annotations
 import pytest
 
 from app.git.git_client import RepoInfo
+from app.git.models import ChangeType
+from app.remote.remote_fs import normalize_remote_path
 from app.remote.session import RemoteSession
 from app.ui import remote_ops
 from app.utils.errors import RemoteFileNotFoundError, SFTError
@@ -31,6 +33,30 @@ def test_list_directory(session: FakeSession) -> None:
     path, entries = remote_ops.list_directory(session, f"{DEFAULT_ROOT}/src")  # type: ignore[arg-type]
     assert path.endswith("/src")
     assert [entry.name for entry in entries] == ["main.c"]
+
+
+def test_normalize_remote_path_expands_home() -> None:
+    assert normalize_remote_path("", "/home/user") == "/home/user"
+    assert normalize_remote_path("", "") == "/"
+    assert normalize_remote_path("~", "/home/user") == "/home/user"
+    assert normalize_remote_path("~/ros2_ws/src/", "/home/user") == "/home/user/ros2_ws/src"
+    assert normalize_remote_path("ros2_ws", "/home/user") == "/home/user/ros2_ws"
+    assert normalize_remote_path("/opt/app/", "/home/user") == "/opt/app"
+    assert normalize_remote_path("/var/log/../tmp", "/home/user") == "/var/tmp"
+
+
+def test_remote_home_and_subdirectories(session: FakeSession) -> None:
+    assert remote_ops.remote_home(session) == "/home/user"  # type: ignore[arg-type]
+    path, entries = remote_ops.list_subdirectories(session, "~")  # type: ignore[arg-type]
+    assert path == "/home/user"
+    assert [entry.name for entry in entries] == ["project"]
+    assert all(entry.is_dir for entry in entries)
+
+
+def test_parent_of() -> None:
+    assert remote_ops.parent_of("/home/user/project/") == "/home/user"
+    assert remote_ops.parent_of("/home") == "/"
+    assert remote_ops.parent_of("/") == "/"
 
 
 def test_load_file(session: FakeSession) -> None:
@@ -82,10 +108,54 @@ def test_load_git_diff_uses_relative_path(session: FakeSession) -> None:
 
 
 def test_load_git_diff_outside_repository(session: FakeSession) -> None:
-    session._repo_info = RepoInfo(directory=DEFAULT_ROOT, is_repository=False)
+    session.set_repo(RepoInfo(directory=DEFAULT_ROOT, is_repository=False))
     diff = remote_ops.load_git_diff(session, "/etc/hosts", "x\n")  # type: ignore[arg-type]
     assert diff.markers == {}
     assert session.git.diff_calls == []
+
+
+def test_load_git_diff_passes_snapshot_status(session: FakeSession) -> None:
+    from app.git.git_client import FileStatus
+
+    status = FileStatus(path="src/main.c", index_status=" ", worktree_status="M")
+    remote_ops.load_git_diff(
+        session, f"{DEFAULT_ROOT}/src/main.c", "a\n", status=status  # type: ignore[arg-type]
+    )
+    assert session.git.diff_calls[-1][3] is status
+
+
+# ---------------------------------------------------------------------------
+# 文件树 Git 状态快照
+# ---------------------------------------------------------------------------
+
+
+def test_load_tree_status_snapshot(session: FakeSession) -> None:
+    session.git.status_lines = {"src/main.c": " M", "src/new.c": "??"}
+    tree = remote_ops.load_tree_status(session)  # type: ignore[arg-type]
+    assert tree.is_repository
+    assert tree.branch == "main"
+    assert tree.files == {
+        f"{DEFAULT_ROOT}/src/main.c": ChangeType.MODIFIED,
+        f"{DEFAULT_ROOT}/src/new.c": ChangeType.ADDED,
+    }
+    # 目录取子树内优先级最高的变更：新增 > 修改
+    assert tree.dirs[f"{DEFAULT_ROOT}/src"] is ChangeType.ADDED
+
+
+def test_load_tree_status_outside_repository(session: FakeSession) -> None:
+    session.set_repo(RepoInfo(directory=DEFAULT_ROOT, is_repository=False))
+    tree = remote_ops.load_tree_status(session)  # type: ignore[arg-type]
+    assert not tree.is_repository
+    assert tree.files == {}
+    assert tree.label == "Git: Not a repository"
+
+
+def test_load_tree_status_uses_explicit_directory(session: FakeSession) -> None:
+    session.workspace = ""
+    session.git.status_lines = {"src/main.c": " M"}
+    tree = remote_ops.load_tree_status(session, DEFAULT_ROOT)  # type: ignore[arg-type]
+    assert tree.is_repository
+    assert tree.total == 1
 
 
 def test_git_available(session: FakeSession) -> None:

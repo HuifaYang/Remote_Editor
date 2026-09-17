@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -26,6 +28,9 @@ from PySide6.QtWidgets import (
 from app.config.hosts import AuthMethod, HostConfig, HostStore
 from app.utils.errors import ConfigError
 from app.utils.paths import ssh_key_dir
+from app.utils.ssh_keys import list_private_keys
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -60,18 +65,21 @@ class HostFormDialog(QDialog):
         self.user_edit = QLineEdit(self)
         self.user_edit.setText("root")
         self.workspace_edit = QLineEdit(self)
-        self.workspace_edit.setPlaceholderText("留空则使用远端家目录")
+        self.workspace_edit.setPlaceholderText("留空则连接后在远端选择")
 
         self.password_radio = QRadioButton("密码认证", self)
         self.key_radio = QRadioButton("私钥认证", self)
         self.password_radio.setChecked(True)
-        self.key_path_edit = QLineEdit(self)
-        self.key_path_edit.setPlaceholderText("~/.ssh/id_rsa")
+        self.key_combo = QComboBox(self)
+        self.key_combo.setEditable(True)
+        self.key_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.key_combo.lineEdit().setPlaceholderText("~/.ssh/id_ed25519")
         self.browse_button = QPushButton("浏览…", self)
         self.browse_button.clicked.connect(self._browse_key)
+        self._load_local_keys()
 
         key_row = QHBoxLayout()
-        key_row.addWidget(self.key_path_edit, 1)
+        key_row.addWidget(self.key_combo, 1)
         key_row.addWidget(self.browse_button)
         key_widget = QWidget(self)
         key_widget.setLayout(key_row)
@@ -86,7 +94,11 @@ class HostFormDialog(QDialog):
         form.addRow("私钥文件", key_widget)
         form.addRow("远程工作目录", self.workspace_edit)
 
-        hint = QLabel("为安全起见，密码与私钥口令不会写入配置文件。", self)
+        hint = QLabel(
+            "私钥列表来自本机 ~/.ssh（可直接选择或手动输入路径）；\n"
+            "为安全起见，密码与私钥口令不会写入配置文件，工作目录可连接后再选择。",
+            self,
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
 
@@ -116,7 +128,7 @@ class HostFormDialog(QDialog):
         self.workspace_edit.setText(host.remote_workspace)
         self.password_radio.setChecked(host.auth_method is AuthMethod.PASSWORD)
         self.key_radio.setChecked(host.auth_method is AuthMethod.PRIVATE_KEY)
-        self.key_path_edit.setText(host.private_key_path)
+        self._set_key_path(host.private_key_path)
 
     def host_config(self) -> HostConfig:
         host = self._host or HostConfig()
@@ -127,21 +139,62 @@ class HostFormDialog(QDialog):
         host.auth_method = (
             AuthMethod.PRIVATE_KEY if self.key_radio.isChecked() else AuthMethod.PASSWORD
         )
-        host.private_key_path = self.key_path_edit.text().strip()
+        host.private_key_path = self.key_path()
         host.remote_workspace = self.workspace_edit.text().strip()
         return host
 
     # -- 交互 --------------------------------------------------------------
     def _update_auth_fields(self) -> None:
         uses_key = self.key_radio.isChecked()
-        self.key_path_edit.setEnabled(uses_key)
+        self.key_combo.setEnabled(uses_key)
         self.browse_button.setEnabled(uses_key)
+        if uses_key and not self.key_path():
+            keys = list_private_keys()
+            if keys:
+                self._set_key_path(str(keys[0].path))
+
+    def key_path(self) -> str:
+        """当前选择的私钥路径。
+
+        下拉框里显示的是「文件名（类型）」这样的标签，真正的路径存在 item data 里；
+        用户手动输入的文本则原样返回。
+        """
+        text = self.key_combo.currentText().strip()
+        index = self.key_combo.currentIndex()
+        if index >= 0 and text == self.key_combo.itemText(index):
+            data = self.key_combo.itemData(index)
+            if data:
+                return str(data)
+        return text
+
+    def _load_local_keys(self) -> None:
+        """把 ``~/.ssh`` 里的私钥填进下拉框（读取失败则退化为纯手输）。"""
+        try:
+            keys = list_private_keys()
+        except OSError as exc:  # pragma: no cover - 权限等异常时退化为手输
+            logger.debug("扫描 ~/.ssh 失败：%s", exc)
+            keys = []
+        if not keys:
+            self.key_combo.lineEdit().setPlaceholderText("未找到 ~/.ssh 私钥，可手动输入路径")
+            return
+        for key in keys:
+            self.key_combo.addItem(key.label, str(key.path))
+            tip = f"{key.path}\n{key.comment}" if key.comment else str(key.path)
+            self.key_combo.setItemData(self.key_combo.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+
+    def _set_key_path(self, path: str) -> None:
+        text = (path or "").strip()
+        index = self.key_combo.findData(text) if text else -1
+        if index >= 0:
+            self.key_combo.setCurrentIndex(index)
+        else:
+            self.key_combo.setCurrentText(text)
 
     def _browse_key(self) -> None:
         start = str(ssh_key_dir() if ssh_key_dir().exists() else Path.home())
         path, _ = QFileDialog.getOpenFileName(self, "选择私钥文件", start)
         if path:
-            self.key_path_edit.setText(path)
+            self._set_key_path(path)
 
     def _on_accept(self) -> None:
         try:
@@ -158,10 +211,12 @@ class ConnectDialog(QDialog):
     def __init__(self, store: HostStore, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("SSH 连接")
-        self.setMinimumWidth(440)
+        # 留出足够宽度：主机行 + 三个管理按钮曾经把「密码」输入框挤到不可用
+        self.setMinimumWidth(460)
         self._store = store
 
         self.host_combo = QComboBox(self)
+        self.host_combo.setMinimumWidth(240)
         self.add_button = QPushButton("新增主机…", self)
         self.edit_button = QPushButton("编辑…", self)
         self.delete_button = QPushButton("删除", self)
@@ -171,20 +226,31 @@ class ConnectDialog(QDialog):
 
         host_row = QHBoxLayout()
         host_row.addWidget(self.host_combo, 1)
-        host_row.addWidget(self.add_button)
-        host_row.addWidget(self.edit_button)
-        host_row.addWidget(self.delete_button)
 
-        self.workspace_edit = QLineEdit(self)
-        self.workspace_edit.setPlaceholderText("留空则使用主机配置 / 远端家目录")
+        # 三个管理按钮单独占一行：和下拉框挤在同一行会把对话框撑宽、
+        # 反过来压缩「密码」输入框的可视宽度
+        manage_row = QHBoxLayout()
+        manage_row.addWidget(self.add_button)
+        manage_row.addWidget(self.edit_button)
+        manage_row.addWidget(self.delete_button)
+        manage_row.addStretch(1)
+
+        self.workspace_label = QLabel("-", self)
+        self.workspace_label.setStyleSheet("color: gray;")
+        self.workspace_label.setWordWrap(True)
         self.secret_edit = QLineEdit(self)
         self.secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        # 任何情况下都保证输入框有可用宽度（占位符 / 已输入的密码都不能被裁剪）
+        self.secret_edit.setMinimumWidth(240)
+        self.secret_edit.setMinimumHeight(self.secret_edit.fontMetrics().height() + 12)
         self.secret_label = QLabel("密码", self)
         self.show_secret = QPushButton("显示", self)
+        self.show_secret.setMinimumWidth(56)
         self.show_secret.setCheckable(True)
         self.show_secret.toggled.connect(self._toggle_secret)
 
         secret_row = QHBoxLayout()
+        secret_row.setContentsMargins(0, 0, 0, 0)
         secret_row.addWidget(self.secret_edit, 1)
         secret_row.addWidget(self.show_secret)
         secret_widget = QWidget(self)
@@ -194,9 +260,12 @@ class ConnectDialog(QDialog):
         self.target_label.setStyleSheet("color: gray;")
 
         form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
         form.addRow("主机", host_row)
+        form.addRow("", manage_row)
         form.addRow("连接目标", self.target_label)
-        form.addRow("远程工作目录", self.workspace_edit)
+        form.addRow("默认文件夹", self.workspace_label)
         form.addRow(self.secret_label, secret_widget)
 
         self.buttons = QDialogButtonBox(
@@ -207,8 +276,13 @@ class ConnectDialog(QDialog):
         self.buttons.accepted.connect(self._on_accept)
         self.buttons.rejected.connect(self.reject)
 
+        note = QLabel("连接成功后可在远端浏览并选择工作目录，无需事先填写路径。", self)
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray;")
+
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addWidget(note)
         layout.addWidget(self.buttons)
 
         self.host_combo.currentIndexChanged.connect(self._on_host_changed)
@@ -254,8 +328,8 @@ class ConnectDialog(QDialog):
         if host is None:
             return
         self.target_label.setText(host.target)
-        self.workspace_edit.setPlaceholderText(
-            host.remote_workspace or "留空则使用远端家目录"
+        self.workspace_label.setText(
+            host.remote_workspace or "连接后在远端选择"
         )
         self.secret_label.setText("密码" if host.auth_method is AuthMethod.PASSWORD else "私钥口令")
         self.secret_edit.clear()
@@ -322,11 +396,4 @@ class ConnectDialog(QDialog):
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
-        workspace = self.workspace_edit.text().strip()
-        if workspace:
-            host.remote_workspace = workspace
-            try:
-                self._store.update(host)
-            except ConfigError as exc:  # pragma: no cover - 端口等已校验
-                QMessageBox.warning(self, "保存失败", exc.message)
         self.accept()

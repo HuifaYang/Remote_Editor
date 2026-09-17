@@ -117,7 +117,11 @@ class SSHClient:
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
         self._secrets: list[str] = []
+        #: 连接生命周期锁（connect / close / 创建 SFTP 子系统）
         self._lock = threading.RLock()
+        #: SFTP 会话不是线程安全的，用独立锁串行化 I/O；
+        #: 与 ``_lock`` 分开，避免一次慢速 ``git status`` 把文件下载堵在后面
+        self._sftp_lock = threading.RLock()
 
     # -- 状态 --------------------------------------------------------------
     @property
@@ -136,8 +140,13 @@ class SSHClient:
 
     @property
     def lock(self) -> threading.RLock:
-        """串行化 SFTP 等非线程安全操作的锁。"""
+        """连接生命周期锁。"""
         return self._lock
+
+    @property
+    def sftp_lock(self) -> threading.RLock:
+        """串行化 SFTP I/O 的锁（与命令通道互不阻塞）。"""
+        return self._sftp_lock
 
     # -- 连接管理 ----------------------------------------------------------
     def connect(self) -> None:
@@ -247,7 +256,14 @@ class SSHClient:
 
     # -- SFTP --------------------------------------------------------------
     def open_sftp(self) -> paramiko.SFTPClient:
-        """获取（或创建）SFTP 会话。"""
+        """获取（或创建）SFTP 会话。
+
+        已建立时走无锁快路径：否则每次文件操作都要等 ``_lock``（可能正被一条
+        慢速 ``git`` 命令持有多秒），下载会被无谓地拖慢。
+        """
+        cached = self._sftp
+        if cached is not None:
+            return cached
         with self._lock:
             if self._sftp is not None:
                 return self._sftp

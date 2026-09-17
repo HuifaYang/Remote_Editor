@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional
 from app.config.settings import atomic_write_json, load_json
 from app.utils.errors import ConfigError
 from app.utils.paths import config_dir
+from app.utils.ssh_keys import SSHConfigHost
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,23 @@ class HostConfig:
         }
 
     @classmethod
+    def from_ssh_config(cls, entry: SSHConfigHost) -> "HostConfig":
+        """把 ``~/.ssh/config`` 里的一个 Host 段落转成本项目的主机配置。
+
+        带 ``IdentityFile`` 的段落按私钥认证导入，否则按密码认证（连接时输入）。
+        """
+        identity = (entry.identity_file or "").strip()
+        return cls(
+            name=entry.alias,
+            host=entry.connect_host,
+            port=max(1, min(65535, int(entry.port or 22))),
+            username=entry.username or _local_username(),
+            auth_method=AuthMethod.PRIVATE_KEY if identity else AuthMethod.PASSWORD,
+            private_key_path=identity,
+            remote_workspace="",
+        )
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HostConfig":
         raw_auth = str(data.get("auth_method", AuthMethod.PASSWORD.value))
         try:
@@ -94,6 +112,15 @@ class HostConfig:
             private_key_path=str(data.get("private_key_path", "")),
             remote_workspace=str(data.get("remote_workspace", "")),
         )
+
+
+def _local_username() -> str:
+    try:
+        import getpass
+
+        return getpass.getuser() or "root"
+    except Exception:  # pragma: no cover - 容器等异常环境
+        return "root"
 
 
 def default_hosts_path() -> Path:

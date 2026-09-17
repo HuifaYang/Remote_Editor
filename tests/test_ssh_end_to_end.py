@@ -211,6 +211,8 @@ class LocalSSHServerInterface(paramiko.ServerInterface):
 
     def _run_command(self, channel, command_text: str, event: threading.Event) -> None:
         env = dict(os.environ)
+        # 让「远端」的家目录就是服务端根目录，这样 ~ 展开后才能被 SFTP 解析到
+        env["HOME"] = str(self.root)
         env.setdefault("GIT_AUTHOR_NAME", "Remote Tester")
         env.setdefault("GIT_AUTHOR_EMAIL", "tester@example.invalid")
         env.setdefault("GIT_COMMITTER_NAME", "Remote Tester")
@@ -557,6 +559,46 @@ def test_git_diff_for_untracked_file(ssh_client: SSHClient, repo_root: Path) -> 
     assert diff.markers == {1: ChangeType.ADDED, 2: ChangeType.ADDED}
 
 
+def test_git_tree_status_over_ssh(ssh_client: SSHClient, repo_root: Path) -> None:
+    """真实仓库上验证状态快照：文件 / 目录着色与 diff 复用都基于它。"""
+    (repo_root / "main.c").write_text("int main() {\n    return 1;\n}\n", encoding="utf-8")
+    (repo_root / "brand_new.c").write_text("a\nb\n", encoding="utf-8")
+    (repo_root / "util.c").unlink()
+    git = GitClient(ssh_client)
+
+    tree = git.tree_status(str(repo_root))
+
+    assert tree.is_repository
+    assert tree.branch == "main"
+    assert tree.files[f"{repo_root}/main.c"] is ChangeType.MODIFIED
+    assert tree.files[f"{repo_root}/brand_new.c"] is ChangeType.ADDED
+    assert tree.files[f"{repo_root}/util.c"] is ChangeType.DELETED
+    assert tree.dirs[str(repo_root)] is ChangeType.DELETED
+    assert tree.label == "Git: main · 3 处变更"
+    assert tree.status_for_diff(f"{repo_root}/main.c").worktree_status == "M"
+    # 未修改且不在 status 输出里的文件 → 判定为干净，可跳过远端 git 调用
+    clean = tree.status_for_diff(f"{repo_root}/main.c.orig")
+    assert clean is not None
+    assert clean.change_type is None
+
+
+def test_git_diff_skips_remote_work_for_clean_file(
+    ssh_client: SSHClient, repo_root: Path
+) -> None:
+    """未修改的文件：快照判定干净后不再执行任何远端 git 命令。"""
+    git = GitClient(ssh_client)
+    tree = git.tree_status(str(repo_root))
+    status = tree.status_for_diff(f"{repo_root}/main.c")
+    assert status.change_type is None
+
+    diff = git.file_diff(
+        str(repo_root), "main.c", content=(repo_root / "main.c").read_text(), status=status
+    )
+
+    assert diff.markers == {}
+    assert not diff.has_changes
+
+
 def test_git_diff_for_deleted_lines(ssh_client: SSHClient, repo_root: Path) -> None:
     # 删除文件中的一行（保留其他行），删除标记落在其后续行
     (repo_root / "multi.c").write_text("a\nb\nc\n", encoding="utf-8")
@@ -655,6 +697,82 @@ def test_remote_session_full_flow(ssh_server: InProcessSSHServer, client_key_pat
 # ---------------------------------------------------------------------------
 # MainWindow 端到端（打开 → 编辑 → Ctrl+S → 远端更新 + Gutter 标记）
 # ---------------------------------------------------------------------------
+
+
+def test_session_expands_tilde_workspace(
+    ssh_server: InProcessSSHServer, client_key_path: Path, ssh_root: Path, repo_root: Path
+):
+    """回归：主机配置写 ``~/project/`` 时必须先展开成绝对路径再交给 SFTP。
+
+    SFTP 不像交互式 shell 那样展开 ``~``，之前的实现会把 ``~/ros2_ws/src/``
+    原样发给 SFTP 并得到 ENOENT。
+    """
+    host = HostConfig(
+        name="Local-Test",
+        host="127.0.0.1",
+        port=ssh_server.port,
+        username=USERNAME,
+        auth_method=AuthMethod.PRIVATE_KEY,
+        private_key_path=str(client_key_path),
+        remote_workspace="~/project/",
+    )
+    session = RemoteSession(host, settings=_fast_settings())
+    session.connect()
+    try:
+        assert session.home == str(ssh_root)
+        assert session.workspace == str(repo_root)
+        _path, entries = remote_ops.list_directory(session, session.workspace)
+        assert {entry.name for entry in entries} >= {"main.c", "util.c"}
+    finally:
+        session.close()
+
+
+def test_folder_picker_over_real_sftp(
+    qtbot,
+    ssh_server: InProcessSSHServer,
+    client_key_path: Path,
+    ssh_root: Path,
+    repo_root: Path,
+):
+    """连接后选目录：默认落在远端家目录，只列目录，选中后路径可直接使用。"""
+    from app.ui.workspace_dialog import RemoteFolderPickerDialog
+
+    host = HostConfig(
+        name="Local-Test",
+        host="127.0.0.1",
+        port=ssh_server.port,
+        username=USERNAME,
+        auth_method=AuthMethod.PRIVATE_KEY,
+        private_key_path=str(client_key_path),
+    )
+    session = RemoteSession(host, settings=_fast_settings())
+    session.connect()
+    dialog = RemoteFolderPickerDialog(session, initial_path="~")
+    qtbot.addWidget(dialog)
+    try:
+        qtbot.waitUntil(lambda: dialog.path_edit.text() == str(ssh_root), timeout=15000)
+        names = [dialog.list_widget.item(i).text() for i in range(dialog.list_widget.count())]
+        assert "project" in names
+        assert "main.c" not in names  # 只列目录
+
+        item = next(
+            dialog.list_widget.item(i)
+            for i in range(dialog.list_widget.count())
+            if dialog.list_widget.item(i).text() == "project"
+        )
+        dialog._on_item_activated(item)
+        qtbot.waitUntil(lambda: dialog.chosen_path() == str(repo_root), timeout=15000)
+        child_names = [
+            dialog.list_widget.item(i).text() for i in range(dialog.list_widget.count())
+        ]
+        assert "main.c" not in child_names and "util.c" not in child_names  # 只列目录
+
+        # 选中的目录可以立刻用来列目录
+        _path, entries = remote_ops.list_directory(session, dialog.chosen_path())
+        assert {entry.name for entry in entries} >= {"main.c", "util.c"}
+    finally:
+        dialog.close()
+        session.close()
 
 
 @pytest.fixture

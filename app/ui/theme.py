@@ -32,6 +32,16 @@ class Theme:
     border: str
     accent: str
     status_fg: str
+    # 界面外框（VSCode 风格：扁平、无边框、配色克制）
+    menu_bg: str
+    toolbar_bg: str
+    tab_active_bg: str
+    tab_inactive_bg: str
+    list_hover: str
+    list_selection: str
+    list_inactive_selection: str
+    status_bar_bg: str
+    status_bar_fg: str
     # Git Gutter
     marker_added: str
     marker_modified: str
@@ -76,6 +86,15 @@ LIGHT = Theme(
     border="#d9d9d9",
     accent="#0a66c2",
     status_fg="#444444",
+    menu_bg="#ececec",
+    toolbar_bg="#ececec",
+    tab_active_bg="#ffffff",
+    tab_inactive_bg="#ececec",
+    list_hover="#e8e8e8",
+    list_selection="#0060c0",
+    list_inactive_selection="#e4e6f1",
+    status_bar_bg="#0060c0",
+    status_bar_fg="#ffffff",
     marker_added="#2ea043",
     marker_modified="#d29922",
     marker_deleted="#d1242f",
@@ -106,6 +125,15 @@ DARK = Theme(
     border="#333333",
     accent="#3794ff",
     status_fg="#cccccc",
+    menu_bg="#3c3c3c",
+    toolbar_bg="#3c3c3c",
+    tab_active_bg="#1e1e1e",
+    tab_inactive_bg="#2d2d2d",
+    list_hover="#2a2d2e",
+    list_selection="#094771",
+    list_inactive_selection="#37373d",
+    status_bar_bg="#007acc",
+    status_bar_fg="#ffffff",
     marker_added="#3fb950",
     marker_modified="#e3b341",
     marker_deleted="#f85149",
@@ -166,15 +194,67 @@ def apply_theme(app: QApplication, theme: Theme) -> None:
     palette.setColor(QPalette.ColorRole.Highlight, QColor(theme.accent))
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff" if theme.dark else "#ffffff"))
     app.setPalette(palette)
+    accent_hover = QColor(theme.accent).lighter(125).name()
+    # 仿 VSCode：扁平、无边框、紧凑，选中 / 悬停用列表底色而不是系统高亮
     app.setStyleSheet(
         f"""
-        QToolTip {{ color: {theme.editor_fg}; background: {theme.panel_bg}; border: 1px solid {theme.border}; }}
-        QStatusBar {{ color: {theme.status_fg}; }}
-        QTabWidget::pane {{ border: 1px solid {theme.border}; }}
-        QTabBar::tab {{ padding: 4px 10px; }}
+        QMainWindow, QDialog {{ background: {theme.window_bg}; }}
+        QToolTip {{ color: {theme.editor_fg}; background: {theme.panel_bg};
+                    border: 1px solid {theme.border}; padding: 2px 4px; }}
+        QMenuBar {{ background: {theme.menu_bg}; color: {theme.status_fg}; padding: 1px 2px; }}
+        QMenuBar::item {{ background: transparent; padding: 4px 8px; }}
+        QMenuBar::item:selected {{ background: {theme.list_selection}; }}
+        QMenu {{ background: {theme.panel_bg}; color: {theme.editor_fg};
+                 border: 1px solid {theme.border}; padding: 4px 0px; }}
+        QMenu::item {{ padding: 5px 26px 5px 22px; }}
+        QMenu::item:selected {{ background: {theme.list_selection}; }}
+        QMenu::separator {{ height: 1px; background: {theme.border}; margin: 4px 10px; }}
+        QToolBar {{ background: {theme.toolbar_bg}; border: 0px; spacing: 2px; padding: 2px 4px; }}
+        QToolBar::separator {{ background: {theme.border}; width: 1px; margin: 4px 6px; }}
+        QToolButton {{ background: transparent; color: {theme.editor_fg};
+                       border: 1px solid transparent; border-radius: 3px; padding: 4px 6px; }}
+        QToolButton:hover {{ background: {theme.list_hover}; }}
+        QToolButton:checked {{ background: {theme.list_selection}; }}
+        QStatusBar {{ background: {theme.status_bar_bg}; color: {theme.status_bar_fg};
+                      border: 0px; }}
+        QStatusBar QLabel {{ color: {theme.status_bar_fg}; padding: 0px 5px; }}
+        QStatusBar::item {{ border: 0px; }}
+        QDockWidget {{ border: 0px; }}
+        QDockWidget::title {{ background: {theme.panel_bg}; color: {theme.status_fg};
+                              padding: 4px 8px; border-bottom: 1px solid {theme.border}; }}
+        QSplitter::handle {{ background: {theme.border}; }}
+        QSplitter::handle:horizontal {{ width: 1px; }}
+        QSplitter::handle:vertical {{ height: 1px; }}
+        QTabWidget::pane {{ border: 0px; }}
+        QTabBar {{ background: {theme.tab_inactive_bg}; }}
+        QTabBar::tab {{ background: {theme.tab_inactive_bg}; color: {theme.gutter_fg};
+                        padding: 6px 12px; border: 0px; border-right: 1px solid {theme.border};
+                        border-top: 1px solid transparent; }}
+        QTabBar::tab:selected {{ background: {theme.tab_active_bg}; color: {theme.editor_fg};
+                                 border-top: 1px solid {theme.accent}; }}
+        QTabBar::tab:hover:!selected {{ background: {theme.list_hover}; }}
+        QToolButton#tab_close {{ background: transparent; border: 0px; padding: 0px; }}
+        QToolButton#tab_close:hover {{ background: {theme.list_hover}; border-radius: 3px; }}
         QHeaderView::section {{ background: {theme.panel_bg}; color: {theme.status_fg};
                                 border: 0px; border-right: 1px solid {theme.border};
                                 border-bottom: 1px solid {theme.border}; padding: 3px 6px; }}
-        QTreeView, QListView, QTableView {{ background: {theme.panel_bg}; color: {theme.editor_fg}; }}
+        QTreeView, QListView, QTableView {{ background: {theme.panel_bg}; color: {theme.editor_fg};
+                                            border: 0px; outline: 0px;
+                                            show-decoration-selected: 1; }}
+        QTreeView::item:hover, QListView::item:hover {{ background: {theme.list_hover}; }}
+        QTreeView::item:selected {{ background: {theme.list_selection}; color: #ffffff; }}
+        QTreeView::item:selected:!active {{ background: {theme.list_inactive_selection}; }}
+        QLineEdit, QSpinBox, QComboBox {{ background: {theme.editor_bg}; color: {theme.editor_fg};
+                                          border: 1px solid {theme.border}; border-radius: 2px;
+                                          padding: 2px 4px; }}
+        QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{ border: 1px solid {theme.accent}; }}
+        QPushButton {{ background: {theme.toolbar_bg}; color: {theme.editor_fg};
+                       border: 1px solid {theme.border}; border-radius: 2px; padding: 4px 12px; }}
+        QPushButton:hover {{ background: {theme.list_hover}; }}
+        QPushButton:checked {{ background: {theme.list_selection}; color: #ffffff; }}
+        QPushButton:default {{ background: {theme.accent}; color: #ffffff; border: 0px; }}
+        QPushButton:default:hover {{ background: {accent_hover}; }}
+        QPushButton:disabled {{ color: {theme.gutter_fg}; }}
+        QCheckBox, QRadioButton, QGroupBox, QLabel {{ color: {theme.editor_fg}; }}
         """
     )

@@ -20,6 +20,8 @@ from app.utils.paths import config_dir, ensure_dir
 logger = logging.getLogger(__name__)
 
 SETTINGS_FILENAME = "settings.json"
+#: 配置结构版本，用于把老配置迁移到新的默认行为
+SETTINGS_VERSION = 2
 
 
 @dataclass
@@ -35,7 +37,8 @@ class AppSettings:
     use_spaces: bool = True
     word_wrap: bool = False
     show_line_numbers: bool = True
-    auto_save: bool = False
+    #: 默认开启：远端编辑器里「每次改完都手动 Ctrl+S」体验太差
+    auto_save: bool = True
     auto_save_delay_ms: int = 1500
     highlight_current_line: bool = True
     # 文件
@@ -48,6 +51,8 @@ class AppSettings:
     remote_workspace: str = ""
     # 日志
     log_level: str = "INFO"
+    #: 配置版本（用于迁移，见 :func:`_migrate`）
+    settings_version: int = SETTINGS_VERSION
 
     def merged(self, other: "AppSettings") -> "AppSettings":
         """用 ``other`` 中用户显式设置过的字段覆盖自身（供设置对话框使用）。"""
@@ -70,6 +75,22 @@ def default_settings_path() -> Path:
     return config_dir() / SETTINGS_FILENAME
 
 
+def _migrate(settings: AppSettings, raw: dict[str, Any]) -> AppSettings:
+    """把老版本配置迁移到当前默认行为。
+
+    V1 的 ``auto_save`` 默认关闭（每次改完都要手动 Ctrl+S），V2 起默认开启；
+    老配置里没有版本号时按 V1 处理，强制打开自动保存。
+    """
+    try:
+        version = int(raw.get("settings_version", 1) or 1)
+    except (TypeError, ValueError):  # pragma: no cover - 配置被手工改坏
+        version = 1
+    if version < 2:
+        settings.auto_save = True
+        settings.settings_version = SETTINGS_VERSION
+    return settings
+
+
 class SettingsStore:
     """设置的读写入口。"""
 
@@ -85,6 +106,7 @@ class SettingsStore:
             try:
                 raw = json.loads(self.path.read_text(encoding="utf-8"))
                 settings = AppSettings.from_dict(raw)
+                settings = _migrate(settings, raw)
             except (OSError, json.JSONDecodeError) as exc:
                 logger.warning("读取设置失败，使用默认值: %s", exc)
                 settings = AppSettings()

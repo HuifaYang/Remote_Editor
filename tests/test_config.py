@@ -7,7 +7,7 @@ import json
 import pytest
 
 from app.config.hosts import AuthMethod, HostConfig, HostStore
-from app.config.settings import SettingsStore, atomic_write_json
+from app.config.settings import SETTINGS_VERSION, SettingsStore, atomic_write_json
 from app.utils.errors import ConfigError
 
 
@@ -20,7 +20,29 @@ def test_settings_defaults(settings_store: SettingsStore) -> None:
     settings = settings_store.load()
     assert settings.theme == "dark"
     assert settings.tab_size == 4
-    assert settings.auto_save is False
+    # V2 起默认开启自动保存（远端编辑器里手动 Ctrl+S 体验太差）
+    assert settings.auto_save is True
+    assert settings.settings_version == SETTINGS_VERSION
+
+
+def test_settings_migrates_legacy_auto_save(settings_store: SettingsStore) -> None:
+    """老配置（没有版本号且 auto_save=false）升级后自动打开自动保存。"""
+    settings_store.path.write_text(
+        json.dumps({"theme": "light", "auto_save": False}), encoding="utf-8"
+    )
+    settings = SettingsStore(settings_store.path).load()
+    assert settings.auto_save is True
+    assert settings.theme == "light"
+    assert settings.settings_version == SETTINGS_VERSION
+
+
+def test_settings_respects_explicit_auto_save_off(settings_store: SettingsStore) -> None:
+    """当前版本配置里显式关闭时不再被迁移覆盖。"""
+    settings_store.path.write_text(
+        json.dumps({"auto_save": False, "settings_version": SETTINGS_VERSION}),
+        encoding="utf-8",
+    )
+    assert SettingsStore(settings_store.path).load().auto_save is False
 
 
 def test_settings_round_trip(settings_store: SettingsStore) -> None:

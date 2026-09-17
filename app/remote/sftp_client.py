@@ -15,7 +15,7 @@ import stat
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Optional, Tuple
 
 import paramiko
 
@@ -116,7 +116,7 @@ class SftpClient:
         return SFTError(str(exc), detail=str(exc))
 
     def _call(self, func: Callable[..., object], *args: object, **kwargs: object) -> object:
-        with self._ssh.lock:
+        with self._ssh.sftp_lock:
             try:
                 return func(*args, **kwargs)
             except Exception as exc:
@@ -179,36 +179,87 @@ class SftpClient:
     # -- 读取 --------------------------------------------------------------
     def read_bytes(self, path: str, *, max_bytes: Optional[int] = None) -> bytes:
         """读取整个文件；``max_bytes`` 用于拒绝超大文件。"""
-        sftp = self._session()
-        entry = self.stat(path)
-        if entry.is_dir:
-            raise SFTError(f"{path} 是目录，无法下载")
-        if max_bytes is not None and entry.size > max_bytes:
-            raise SFTError(
-                f"文件过大（{human_size(entry.size)}），已超过上限 {human_size(max_bytes)}"
-            )
-        handle = self._call(sftp.open, path, "rb")
-        try:
-            chunks: List[bytes] = []
-            while True:
-                chunk = self._call(handle.read, CHUNK_SIZE)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-        finally:
-            self._call(handle.close)
-        return b"".join(chunks)
+        return self._read_all(path, max_bytes=max_bytes)[0]
 
     def read_text(
         self, path: str, *, encoding: Optional[str] = None, max_bytes: Optional[int] = None
     ) -> DecodedText:
         """读取并解码文本文件。"""
-        data = self.read_bytes(path, max_bytes=max_bytes)
+        return self.read_text_with_stat(path, encoding=encoding, max_bytes=max_bytes)[0]
+
+    def read_text_with_stat(
+        self, path: str, *, encoding: Optional[str] = None, max_bytes: Optional[int] = None
+    ) -> Tuple[DecodedText, RemoteEntry]:
+        """读取并解码文本文件，同时返回文件元信息（大小 / 修改时间）。
+
+        供「下载 + 保存前冲突检测所需指纹」一次性完成，避免额外的 ``stat`` 往返。
+        """
+        data, entry = self._read_all(path, max_bytes=max_bytes)
         decoded = decode_bytes(data, encoding=encoding)
+        if entry is None:  # pragma: no cover - 服务端不支持 fstat
+            entry = RemoteEntry(path=path, name=posixpath.basename(path), is_dir=False, size=len(data))
         logger.info(
             "SFTP 下载 %s (%d bytes, %s)", path, len(data), decoded.encoding
         )
-        return decoded
+        return decoded, entry
+
+    def _read_all(
+        self, path: str, *, max_bytes: Optional[int] = None
+    ) -> Tuple[bytes, Optional[RemoteEntry]]:
+        """一次会话读完整个文件：open → fstat → 分块读（大文件走 prefetch 流水线）。
+
+        相对「先 stat 再 open 逐块读」的做法省掉一次往返，并且大文件不必为每个
+        64KB 数据块都等一次 RTT——弱网 / 高延迟链路上差距很明显。
+        """
+        sftp = self._session()
+        handle = self._call(sftp.open, path, "rb")
+        try:
+            entry = self._entry_from_handle(path, handle)
+            if entry is not None and entry.is_dir:
+                raise SFTError(f"{path} 是目录，无法下载")
+            if entry is not None and max_bytes is not None and entry.size > max_bytes:
+                raise SFTError(
+                    f"文件过大（{human_size(entry.size)}），已超过上限 {human_size(max_bytes)}"
+                )
+            if entry is not None and entry.size > CHUNK_SIZE:
+                self._prefetch(handle, entry.size)
+            chunks: List[bytes] = []
+            received = 0
+            while True:
+                chunk = self._call(handle.read, CHUNK_SIZE)
+                if not chunk:
+                    break
+                received += len(chunk)
+                if max_bytes is not None and received > max_bytes:
+                    raise SFTError(
+                        f"文件过大（超过上限 {human_size(max_bytes)}）"
+                    )
+                chunks.append(chunk)
+        finally:
+            self._call(handle.close)
+        return b"".join(chunks), entry
+
+    def _entry_from_handle(self, path: str, handle: object) -> Optional[RemoteEntry]:
+        """在已打开的句柄上取元信息（fstat），服务端不支持时返回 ``None``。"""
+        stat_method = getattr(handle, "stat", None)
+        if stat_method is None:  # pragma: no cover - 老版本 paramiko
+            return None
+        try:
+            attr = self._call(stat_method)
+        except Exception:  # pragma: no cover - 个别服务端不支持 fstat
+            return None
+        return self._to_entry(path, attr)  # type: ignore[arg-type]
+
+    @staticmethod
+    def _prefetch(handle: object, size: int) -> None:
+        """让 paramiko 预先并发请求后续数据块（对高延迟链路提升明显）。"""
+        prefetch = getattr(handle, "prefetch", None)
+        if prefetch is None:  # pragma: no cover - 老版本 paramiko
+            return
+        try:
+            prefetch(size)
+        except Exception:  # pragma: no cover - 不支持时退化为同步读取
+            logger.debug("prefetch 不可用，退化为逐块同步读取")
 
     # -- 写入 --------------------------------------------------------------
     def write_bytes(self, path: str, data: bytes, *, atomic: bool = True) -> None:
@@ -217,13 +268,30 @@ class SftpClient:
         if atomic:
             self._atomic_write(sftp, path, data)
         else:
-            handle = self._call(sftp.open, path, "wb")
+            handle = self._open_write(sftp, path, "wb")
             try:
-                for offset in range(0, len(data), CHUNK_SIZE):
-                    self._call(handle.write, data[offset : offset + CHUNK_SIZE])
+                self._write_chunks(handle, data)
             finally:
                 self._call(handle.close)
         logger.info("SFTP 上传 %s (%d bytes)", path, len(data))
+
+    def _open_write(self, sftp: paramiko.SFTPClient, path: str, mode: str = "wb") -> object:
+        """打开写句柄并启用流水线写入（弱网下上传同样受 RTT 拖累）。"""
+        handle = self._call(sftp.open, path, mode)
+        setter = getattr(handle, "set_pipelined", None)
+        if setter is not None:
+            try:
+                setter(True)
+            except Exception:  # pragma: no cover - 个别服务端不支持
+                logger.debug("set_pipelined 不可用，退化为同步写入")
+        return handle
+
+    def _write_chunks(self, handle: object, data: bytes) -> None:
+        for offset in range(0, len(data), CHUNK_SIZE):
+            self._call(handle.write, data[offset : offset + CHUNK_SIZE])
+        flush = getattr(handle, "flush", None)
+        if flush is not None:
+            self._call(flush)
 
     def _atomic_write(self, sftp: paramiko.SFTPClient, path: str, data: bytes) -> None:
         directory = posixpath.dirname(path) or "."
@@ -234,10 +302,9 @@ class SftpClient:
         except SFTError:
             existing_mode = None
 
-        handle = self._call(sftp.open, tmp_path, "wb")
+        handle = self._open_write(sftp, tmp_path, "wb")
         try:
-            for offset in range(0, len(data), CHUNK_SIZE):
-                self._call(handle.write, data[offset : offset + CHUNK_SIZE])
+            self._write_chunks(handle, data)
         finally:
             self._call(handle.close)
 

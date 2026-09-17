@@ -8,19 +8,24 @@ from __future__ import annotations
 
 import logging
 import posixpath
+import time
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QSize, QTimer, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDockWidget,
+    QHBoxLayout,
     QInputDialog,
+    QLabel,
     QLineEdit,
     QMainWindow,
     QMessageBox,
     QSplitter,
+    QStackedWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -31,26 +36,50 @@ from app.config.settings import AppSettings, SettingsStore
 from app.editor.document import Document
 from app.editor.syntax import detect_language
 from app.git.models import FileDiff
-from app.remote.remote_fs import FileFingerprint
+from app.remote.remote_fs import FileFingerprint, normalize_remote_path
 from app.remote.session import RemoteSession
 from app.ui import remote_ops
 from app.ui.remote_ops import LoadedFile, SavedFile
 from app.ui.settings_dialog import SettingsDialog
 from app.ui.ssh_dialog import ConnectDialog
 from app.ui.host_manager import HostManagerDialog
+from app.ui.icons import make_icon
+from app.ui.workspace_dialog import RemoteFolderPickerDialog
 from app.ui.tasks import TaskRunner
 from app.ui.theme import Theme, apply_theme, get_theme
+from app.ui.widgets.activity_bar import ActivityBar, ActivityItem
 from app.ui.widgets.editor_tabs import EditorTabs
 from app.ui.widgets.file_tree import RemoteFileTree
 from app.ui.widgets.log_view import LogView
+from app.ui.widgets.scm_view import SourceControlView
 from app.ui.widgets.search_bar import SearchBar
 from app.ui.widgets.status_bar import StatusBar
+from app.ui.widgets.welcome import WelcomeView
 from app.utils.encoding import SELECTABLE_ENCODINGS, UnknownEncodingError
+from app.utils.errors import ConfigError
 from app.utils.paths import APP_NAME, APP_VERSION
 
 logger = logging.getLogger(__name__)
 
 GIT_REFRESH_DELAY_MS = 800
+
+#: 目录列举结果的缓存有效期：远端 RTT 约 1 秒时一次列目录要 3~4 秒，
+#: 结果在手边就不该再问一次（本地操作会主动失效，F5 强制刷新）
+DIR_CACHE_TTL_SECONDS = 120.0
+#: 展开一个目录后顺带预取的子目录数量（只预取、不写入控件；让下一次点击秒开）
+PREFETCH_LIMIT = 3
+#: 缓存目录数上限，防止长时间浏览后内存无限增长
+DIR_CACHE_MAX_ENTRIES = 200
+
+#: 活动栏条目：``files`` / ``source-control`` 切换侧边栏视图，其余是命令
+ACTIVITY_ITEMS = (
+    ActivityItem("files", "资源管理器", "files", checkable=True),
+    ActivityItem("search", "查找（Ctrl+F）", "search"),
+    ActivityItem("source-control", "源代码管理", "source-control", checkable=True),
+    ActivityItem("host", "连接主机…", "host"),
+    ActivityItem("open-folder", "打开远程文件夹…（Ctrl+O）", "folder"),
+    ActivityItem("settings", "设置…（Ctrl+,）", "settings", at_bottom=True),
+)
 
 
 class MainWindow(QMainWindow):
@@ -73,6 +102,8 @@ class MainWindow(QMainWindow):
         self.runner = TaskRunner(self)
         self.session: Optional[RemoteSession] = None
         self.workspace = self.settings.remote_workspace or ""
+        #: 连接后是否已经就「打不开工作目录」提醒过用户（避免反复弹窗）
+        self._workspace_prompted = False
 
         self._git_timer = QTimer(self)
         self._git_timer.setSingleShot(True)
@@ -84,6 +115,16 @@ class MainWindow(QMainWindow):
         self._auto_save_timer.timeout.connect(self._auto_save)
 
         self._encoding_override: Dict[str, str] = {}
+        #: 正在异步列举的目录（去重：同一路径不重复发远端请求）
+        self._pending_listings: set[str] = set()
+        #: 目录列举结果缓存：{路径: (写入时间, 条目列表)}
+        self._dir_cache: Dict[str, tuple[float, List]] = {}
+        #: 正在后台预取的目录
+        self._prefetching: set[str] = set()
+        #: 资源管理器顶部的图标按钮：``[(QToolButton, 图标名), ...]``，换主题时重建图标
+        self.explorer_buttons: List[tuple] = []
+        #: 侧边栏视图名 -> QStackedWidget 下标
+        self._side_views: Dict[str, int] = {}
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1280, 820)
@@ -97,25 +138,110 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # UI 构建
     # ------------------------------------------------------------------
+    def _build_explorer_header(self) -> QWidget:
+        """侧边栏顶部：当前文件夹名 + 常用操作图标（仿 VSCode 资源管理器）。"""
+        header = QWidget(self)
+        layout = QHBoxLayout(header)
+        layout.setContentsMargins(4, 1, 4, 1)
+        layout.setSpacing(1)
+        layout.addWidget(self.explorer_title)
+        layout.addStretch(1)
+        for icon, tooltip, slot in (
+            (
+                "new-file",
+                "在选中目录下新建文件",
+                lambda: self._create_entry(self._new_entry_dir(), is_dir=False),
+            ),
+            (
+                "new-folder",
+                "在选中目录下新建文件夹",
+                lambda: self._create_entry(self._new_entry_dir(), is_dir=True),
+            ),
+            ("refresh", "刷新工作目录（F5）", lambda: self._on_refresh_requested("")),
+            ("collapse", "全部折叠", self.file_tree.collapseAll),
+        ):
+            button = QToolButton(header)
+            button.setIcon(make_icon(icon, self.theme.color("gutter_fg")))
+            button.setIconSize(QSize(16, 16))
+            button.setToolTip(tooltip)
+            button.setAutoRaise(True)
+            button.clicked.connect(slot)
+            layout.addWidget(button)
+            self.explorer_buttons.append((button, icon))
+        return header
+
+    def _new_entry_dir(self) -> str:
+        """新建文件 / 文件夹的目标目录：选中的目录，或当前工作目录。"""
+        path = self.file_tree.current_path() or ""
+        if path and self.file_tree.is_directory(path):
+            return path
+        if path:
+            return posixpath.dirname(path)
+        return self.workspace or ""
+
     def _build_ui(self) -> None:
-        self.file_tree = RemoteFileTree(self)
+        self.file_tree = RemoteFileTree(self, theme=self.theme)
         self.editor_tabs = EditorTabs(self.theme, self.settings, self)
         self.search_bar = SearchBar(self)
 
-        right = QWidget(self)
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(0)
-        right_layout.addWidget(self.search_bar)
-        right_layout.addWidget(self.editor_tabs, 1)
+        # 活动栏（仿 VSCode 最左侧的一列图标）：切换侧边栏视图 / 触发常用命令
+        self.activity_bar = ActivityBar(ACTIVITY_ITEMS, self.theme, self)
+        self.activity_bar.itemTriggered.connect(self._on_activity_triggered)
+
+        # 侧边栏视图 1：资源管理器——顶部是当前文件夹标题 + 常用操作图标，下面是文件树
+        self.explorer_title = QLabel("资源管理器", self)
+        self.explorer_title.setContentsMargins(10, 4, 4, 4)
+        title_font = self.explorer_title.font()
+        title_font.setPointSizeF(max(7.5, title_font.pointSizeF() - 1.5))
+        self.explorer_title.setFont(title_font)
+        self.explorer = QWidget(self)
+        explorer_layout = QVBoxLayout(self.explorer)
+        explorer_layout.setContentsMargins(0, 0, 0, 0)
+        explorer_layout.setSpacing(0)
+        explorer_layout.addWidget(self._build_explorer_header())
+        explorer_layout.addWidget(self.file_tree, 1)
+
+        # 还没打开文件夹时，侧边栏给一句提示（对齐 VSCode：空工作区不留一片空白）
+        self.explorer_hint = QLabel(
+            "尚未打开文件夹。\n\n连接主机后按 Ctrl+O 选择远端目录。", self
+        )
+        self.explorer_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.explorer_hint.setWordWrap(True)
+        explorer_layout.addWidget(self.explorer_hint, 1)
+
+        # 侧边栏视图 2：源代码管理——与文件树共用同一份 Git 快照，打开面板不发远端请求
+        self.scm_view = SourceControlView(self.theme, self)
+        self.side_panel = QStackedWidget(self)
+        for key, view in (("files", self.explorer), ("source-control", self.scm_view)):
+            self._side_views[key] = self.side_panel.addWidget(view)
+
+        # 编辑区：「标签页」与「欢迎页」互斥显示（对齐 VSCode：空工作区就是一个 Welcome 标签）
+        self.welcome = WelcomeView(self.theme, self)
+        self.editor_stack = QStackedWidget(self)
+        self.editor_stack.addWidget(self.editor_tabs)
+        self.editor_stack.addWidget(self.welcome)
+
+        editor_area = QWidget(self)
+        editor_layout = QVBoxLayout(editor_area)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        editor_layout.setSpacing(0)
+        editor_layout.addWidget(self.search_bar)
+        editor_layout.addWidget(self.editor_stack, 1)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        self.splitter.addWidget(self.file_tree)
-        self.splitter.addWidget(right)
+        self.splitter.addWidget(self.side_panel)
+        self.splitter.addWidget(editor_area)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([280, 1000])
-        self.setCentralWidget(self.splitter)
+
+        central = QWidget(self)
+        central_layout = QHBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.activity_bar)
+        central_layout.addWidget(self.splitter, 1)
+        self.setCentralWidget(central)
 
         self.file_tree_dock = QDockWidget("Remote Files", self)
         self.file_tree_dock.setObjectName("file_tree_dock")
@@ -153,6 +279,57 @@ class MainWindow(QMainWindow):
         self.search_bar.replaceRequested.connect(self._on_replace)
         self.search_bar.replaceAllRequested.connect(self._on_replace_all)
 
+        self.scm_view.fileActivated.connect(self.open_remote_file)
+        self.scm_view.refreshRequested.connect(self._refresh_tree_status)
+        self.welcome.connectRequested.connect(self._on_connect)
+        self.welcome.openFolderRequested.connect(self._on_open_folder)
+
+        self.side_panel.setCurrentIndex(self._side_views["files"])
+        self.activity_bar.set_view("files")
+        self._update_explorer_state()
+        self._update_editor_stack()
+
+    def _update_explorer_state(self) -> None:
+        """有工作目录就显示文件树，否则显示「尚未打开文件夹」的提示。"""
+        has_workspace = bool(self.workspace)
+        self.file_tree.setVisible(has_workspace)
+        self.explorer_hint.setVisible(not has_workspace)
+
+    # ------------------------------------------------------------------
+    # 活动栏 / 侧边栏
+    # ------------------------------------------------------------------
+    def _on_activity_triggered(self, key: str, checked: bool) -> None:
+        """活动栏点击：视图按钮切换（再点一次收起），其余按钮等价菜单命令。"""
+        if key in self._side_views:
+            self._show_side_view(key if checked else None)
+        elif key == "search":
+            self._show_search(False)
+        elif key == "host":
+            self._on_connect()
+        elif key == "open-folder":
+            self._on_open_folder()
+        elif key == "settings":
+            self._on_settings()
+
+    def _show_side_view(self, key: Optional[str]) -> None:
+        """切换侧边栏视图；``None`` 表示收起整列（VSCode 的 Ctrl+B）。"""
+        if key is None or key not in self._side_views:
+            self.side_panel.setVisible(False)
+            self.activity_bar.set_view("")
+            self.action_toggle_tree.setChecked(False)
+            return
+        self.side_panel.setVisible(True)
+        self.side_panel.setCurrentIndex(self._side_views[key])
+        self.activity_bar.set_view(key)
+        self.action_toggle_tree.setChecked(key == "files")
+
+    def _update_editor_stack(self) -> None:
+        """没有打开的标签页时显示欢迎页（对齐 VSCode 的空标签页）。"""
+        has_tabs = self.editor_tabs.count() > 0
+        self.editor_stack.setCurrentWidget(self.editor_tabs if has_tabs else self.welcome)
+        if not has_tabs:
+            self.search_bar.setVisible(False)
+
     def _build_actions(self) -> None:
         def action(text: str, shortcut: Optional[str] = None, slot=None) -> QAction:
             item = QAction(text, self)
@@ -163,6 +340,7 @@ class MainWindow(QMainWindow):
             return item
 
         self.action_connect = action("连接主机…", "Ctrl+K", self._on_connect)
+        self.action_open_folder = action("打开远程文件夹…", "Ctrl+O", self._on_open_folder)
         self.action_disconnect = action("断开连接", None, self._on_disconnect)
         self.action_hosts = action("主机管理…", None, self._on_manage_hosts)
         self.action_save = action("保存", "Ctrl+S", lambda: self._save_document(self._current_document()))
@@ -192,12 +370,26 @@ class MainWindow(QMainWindow):
         self.action_about = action("关于", None, self._show_about)
 
         self.action_disconnect.setEnabled(False)
+        self.action_open_folder.setEnabled(False)
         self.action_save.setEnabled(False)
         self.action_save_all.setEnabled(False)
+
+        # 工具栏 / 菜单与活动栏共用同一套自绘图标（换成纯文字会占掉一整行）
+        self._action_icons: List[tuple] = [
+            (self.action_connect, "host"),
+            (self.action_open_folder, "folder"),
+            (self.action_disconnect, "disconnect"),
+            (self.action_save, "save"),
+            (self.action_refresh_tree, "refresh"),
+            (self.action_refresh_git, "history"),
+            (self.action_find, "search"),
+            (self.action_settings, "settings"),
+        ]
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("文件")
         file_menu.addAction(self.action_connect)
+        file_menu.addAction(self.action_open_folder)
         file_menu.addAction(self.action_hosts)
         file_menu.addAction(self.action_disconnect)
         file_menu.addSeparator()
@@ -236,7 +428,10 @@ class MainWindow(QMainWindow):
 
         toolbar = self.addToolBar("主工具栏")
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        toolbar.setIconSize(QSize(18, 18))
         toolbar.addAction(self.action_connect)
+        toolbar.addAction(self.action_open_folder)
         toolbar.addAction(self.action_disconnect)
         toolbar.addSeparator()
         toolbar.addAction(self.action_save)
@@ -252,6 +447,16 @@ class MainWindow(QMainWindow):
     def _apply_settings_to_ui(self, *, first_time: bool = False) -> None:
         apply_theme(QApplication.instance(), self.theme)
         self.editor_tabs.apply_theme(self.theme)
+        self.file_tree.apply_theme(self.theme)
+        self.activity_bar.apply_theme(self.theme)
+        self.scm_view.apply_theme(self.theme)
+        self.welcome.apply_theme(self.theme)
+        icon_color = self.theme.color("gutter_fg")
+        self.explorer_hint.setStyleSheet(f"color: {self.theme.gutter_fg};")
+        for button, icon in self.explorer_buttons:
+            button.setIcon(make_icon(icon, icon_color))
+        for action, icon in self._action_icons:
+            action.setIcon(make_icon(icon, icon_color))
         self.editor_tabs.apply_settings(self.settings)
         if first_time:
             self.log_view.setVisible(False)
@@ -275,7 +480,7 @@ class MainWindow(QMainWindow):
         self.action_toggle_log.setChecked(checked)
 
     def _toggle_tree(self, checked: bool) -> None:
-        self.file_tree.setVisible(checked)
+        self._show_side_view("files" if checked else None)
 
     def _clear_cache(self) -> None:
         confirm = QMessageBox.question(
@@ -357,17 +562,18 @@ class MainWindow(QMainWindow):
     def _on_connected(self, session: RemoteSession, state) -> None:
         self._set_busy(False)
         self.session = session
-        workspace = session.workspace or "/"
-        self.workspace = workspace
-        self.settings.remote_workspace = workspace
-        self.settings_store.save(self.settings)
+        self._workspace_prompted = False
         self._update_status_connection(True)
         self.status.set_save_status("已连接")
-        logger.info("已连接到 %s，工作目录 %s", session.host.target, workspace)
+        logger.info("已连接到 %s，工作目录 %s", session.host.target, session.workspace or "-")
         repo = session.repo_info()
         self.status.set_git(repo.label)
-        self.file_tree.set_root(workspace)
-        self._load_directory(workspace)
+        if session.workspace_configured and session.workspace:
+            # 这台主机之前记住过工作目录，直接打开
+            self._open_workspace(session.workspace, persist=False)
+            return
+        # 首次连接：像 VSCode 一样先连接，再让用户选择要打开哪个文件夹
+        self._prompt_open_folder()
 
     def _on_connect_failed(self, message: str) -> None:
         self._set_busy(False)
@@ -391,6 +597,11 @@ class MainWindow(QMainWindow):
     def _teardown_session(self) -> None:
         session = self.session
         self.session = None
+        self._pending_listings.clear()
+        self._prefetching.clear()
+        self._dir_cache.clear()
+        self.file_tree.set_status_snapshot(None)
+        self.scm_view.set_snapshot(None)
         if session is not None:
             self.runner.submit(remote_ops.close_session, args=(session,))
         self._update_status_connection(False)
@@ -399,10 +610,87 @@ class MainWindow(QMainWindow):
         host = self.session.host.display_name if self.session else ""
         self.status.set_connection(connected, host)
         self.action_disconnect.setEnabled(connected)
+        self.action_open_folder.setEnabled(connected)
         self.action_save.setEnabled(connected)
         self.action_save_all.setEnabled(connected)
         if not connected:
+            self.status.set_folder("-")
             self.status.set_git("-")
+        # 活动栏与欢迎页跟随连接状态：未连接时「打开文件夹」是不可用入口
+        self.activity_bar.set_enabled("open-folder", connected)
+        self.welcome.set_connected(connected)
+        if not connected:
+            self._update_editor_stack()
+
+    # ------------------------------------------------------------------
+    # 工作目录（连接之后再选择，对齐 VSCode 的「打开文件夹」）
+    # ------------------------------------------------------------------
+    def _on_open_folder(self) -> None:
+        """手动切换工作目录（Ctrl+O）。"""
+        session = self._require_session()
+        if session is None:
+            return
+        self._workspace_prompted = False
+        self._pick_folder(session)
+
+    def _prompt_open_folder(self, *, reason: Optional[str] = None) -> None:
+        """连接后（或记住的目录已失效时）询问要打开哪个远端文件夹。"""
+        session = self.session
+        if session is None:
+            return
+        # 同一连接周期内只自动提示一次，避免目录不可用时反复弹窗
+        self._workspace_prompted = True
+        if reason:
+            QMessageBox.warning(self, "无法打开工作目录", reason)
+        if self._pick_folder(session):
+            return
+        # 用户取消：回退到远端家目录（家目录未知时用 /），保证界面可用
+        fallback = session.home or "/"
+        self._open_workspace(fallback, persist=False)
+        self.status.set_save_status("未选择工作目录，已回退到远端家目录")
+
+    def _pick_folder(self, session: RemoteSession) -> bool:
+        """弹出目录选择器，选中则切换工作目录并返回 ``True``。"""
+        dialog = RemoteFolderPickerDialog(
+            session,
+            # 优先用当前会话的目录，避免刚连上新主机却定位到上一台主机的路径
+            initial_path=session.workspace or self.workspace or session.home,
+            runner=self.runner,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.chosen_path():
+            return False
+        self._open_workspace(dialog.chosen_path(), persist=True)
+        return True
+
+    def _open_workspace(self, path: str, *, persist: bool) -> None:
+        """切换到远端工作目录；``persist=True`` 时写回该主机的配置。"""
+        session = self.session
+        if session is None:
+            return
+        text = (path or "").strip()
+        # 已经是绝对路径时只做纯字符串规范化，避免 GUI 线程里再走一次 SSH
+        resolved = normalize_remote_path(text) if text.startswith("/") else session.expand_path(text)
+        self.workspace = resolved
+        session.set_workspace(resolved)
+        self.settings.remote_workspace = resolved
+        self.settings_store.save(self.settings)
+        if persist:
+            host = session.host
+            host.remote_workspace = resolved
+            try:
+                self.host_store.update(host)
+            except ConfigError as exc:
+                logger.warning("保存主机工作目录失败：%s", exc.message)
+        self.status.set_folder(resolved)
+        self.explorer_title.setText(posixpath.basename(resolved.rstrip("/")) or resolved)
+        self.file_tree.set_root(resolved)
+        self._update_explorer_state()
+        self.scm_view.set_snapshot(None)
+        self._dir_cache.clear()
+        self._prefetching.clear()
+        self._load_directory(resolved)
+        self._refresh_repo_info()
 
     # ------------------------------------------------------------------
     # 文件树
@@ -413,10 +701,21 @@ class MainWindow(QMainWindow):
             return None
         return self.session
 
-    def _load_directory(self, path: str) -> None:
+    def _load_directory(self, path: str, *, force: bool = False) -> None:
         session = self._require_session()
         if session is None:
             return
+        if not force:
+            cached = self._cached_listing(path)
+            if cached is not None:
+                # 命中缓存（含后台预取的结果）：立刻上屏，不再花 3~4 秒等远端
+                self.file_tree.set_children(path, cached)
+                return
+        if path in self._pending_listings:
+            # 同一条目录已经在异步列举中：展开信号 + 打开工作目录会各请求一次，
+            # 高延迟链路（RTT ~1s）下一次列目录就是 2~3 个 RTT，不能重复发。
+            return
+        self._pending_listings.add(path)
         self.file_tree.mark_loading(path)
         self.runner.submit(
             remote_ops.list_directory,
@@ -426,28 +725,101 @@ class MainWindow(QMainWindow):
         )
 
     def _on_directory_loaded(self, path: str, entries: List) -> None:
+        self._pending_listings.discard(path)
+        self._remember_listing(path, entries)
         self.file_tree.set_children(path, entries)
+        self._prefetch_children(entries)
+
+    # -- 目录缓存与预取 ----------------------------------------------------
+    def _cached_listing(self, path: str) -> Optional[List]:
+        entry = self._dir_cache.get(path)
+        if entry is None:
+            return None
+        written_at, entries = entry
+        if time.monotonic() - written_at > DIR_CACHE_TTL_SECONDS:
+            self._dir_cache.pop(path, None)
+            return None
+        return entries
+
+    def _remember_listing(self, path: str, entries: List) -> None:
+        self._dir_cache[path] = (time.monotonic(), entries)
+        if len(self._dir_cache) > DIR_CACHE_MAX_ENTRIES:
+            oldest = sorted(self._dir_cache, key=lambda key: self._dir_cache[key][0])
+            for stale in oldest[: len(self._dir_cache) - DIR_CACHE_MAX_ENTRIES]:
+                self._dir_cache.pop(stale, None)
+
+    def _invalidate_listing(self, path: str) -> None:
+        """本地改动（新建 / 删除 / 重命名）后丢掉该路径及其子树的缓存。"""
+        if not path:
+            return
+        prefix = path.rstrip("/") + "/"
+        for key in [
+            key for key in self._dir_cache if key == path or key.startswith(prefix)
+        ]:
+            self._dir_cache.pop(key, None)
+
+    def _prefetch_children(self, entries: List) -> None:
+        """展开目录后顺带预取几个子目录：高延迟链路上让下一次点击秒开。
+
+        只在没有用户可见请求排队时进行，且最多 ``PREFETCH_LIMIT`` 个，
+        避免后台流量把用户真正想看的东西挤在后面。
+        """
+        session = self.session
+        if session is None or self._pending_listings:
+            return
+        targets = [entry.path for entry in entries if entry.is_dir][:PREFETCH_LIMIT]
+        for path in targets:
+            if (
+                path in self._dir_cache
+                or path in self._prefetching
+                or path in self._pending_listings
+            ):
+                continue
+            self._prefetching.add(path)
+            self.runner.submit(
+                remote_ops.list_directory,
+                args=(session, path),
+                on_success=lambda result: self._on_prefetch_done(*result),
+                on_error=lambda _message, path=path: self._prefetching.discard(path),
+            )
+
+    def _on_prefetch_done(self, path: str, entries: List) -> None:
+        self._prefetching.discard(path)
+        self._remember_listing(path, entries)
 
     def _on_directory_failed(self, path: str, message: str) -> None:
+        self._pending_listings.discard(path)
         self.file_tree.mark_failed(path, message)
         logger.warning("列目录失败 %s：%s", path, message)
+        if path == self.workspace and not self._workspace_prompted:
+            # 记住的工作目录已经不存在（被删除/改名）：让用户重新选一个
+            self._workspace_prompted = True
+            self._prompt_open_folder(reason=f"目录 {path} 无法打开：{message}")
 
     def _refresh_workspace(self) -> None:
         if self.session is None:
             return
         root = self.workspace or self.session.workspace or "/"
+        # F5 是「我要看最新的」：清掉缓存与预取状态，强制回远端重新列举
+        self._dir_cache.clear()
+        self._prefetching.clear()
         self.file_tree.set_root(root)
-        self._load_directory(root)
+        self._load_directory(root, force=True)
         self._refresh_repo_info()
 
     def _on_refresh_requested(self, path: str) -> None:
         target = path or self.workspace or (self.session.workspace if self.session else "")
         if target:
-            self._load_directory(target)
+            self._invalidate_listing(target)
+            self._load_directory(target, force=True)
 
     def _create_entry(self, directory: str, *, is_dir: bool) -> None:
         session = self._require_session()
         if session is None:
+            return
+        directory = directory or self.workspace or session.home or ""
+        if not directory:
+            QMessageBox.warning(self, "无目标目录", "请先打开一个远端工作目录")
             return
         title = "新建文件夹" if is_dir else "新建文件"
         name, ok = QInputDialog.getText(self, title, "名称：", QLineEdit.EchoMode.Normal, "")
@@ -515,11 +887,24 @@ class MainWindow(QMainWindow):
     def _after_delete(self, path: str) -> None:
         if self.editor_tabs.index_of_path(path) >= 0:
             self.editor_tabs.close_path(path)
+        self._invalidate_listing(path)
+        self._forget_deleted_path(path)
         self._after_mutation(posixpath.dirname(path), "已删除")
+
+    def _forget_deleted_path(self, path: str) -> None:
+        """删除后本地更新 Git 快照；判断不了时退回一次远端刷新。"""
+        snapshot = self.file_tree.status_snapshot()
+        if snapshot is None or not snapshot.mark_removed(path):
+            self._git_timer.start()
+            return
+        self.file_tree.refresh_status()
+        self.scm_view.set_snapshot(snapshot)
+        self.status.set_git(snapshot.label)
 
     def _after_mutation(self, directory: str, message: str) -> None:
         self.status.set_save_status(message)
         if directory:
+            self._invalidate_listing(directory)
             self._load_directory(directory)
 
     def _on_operation_failed(self, title: str, message: str) -> None:
@@ -574,6 +959,8 @@ class MainWindow(QMainWindow):
             host_id=self.session.host.id if self.session else "",
             text=loaded.text,
             saved_text=loaded.text,
+            loaded_text=loaded.text,
+            clean_at_open=self._clean_at_open(loaded.path),
             encoding=loaded.encoding,
             newline=loaded.newline,
             language=loaded.language,
@@ -585,7 +972,16 @@ class MainWindow(QMainWindow):
         self.cache.add_recent(document.host_id, document.remote_path)
         self.status.set_save_status("已加载")
         logger.info("已打开 %s（%s，%s）", loaded.path, loaded.encoding, loaded.language)
-        self._refresh_git(document)
+        # 先让编辑器完成首次绘制，再拉取 Git diff，避免打开大文件时界面顿一下
+        QTimer.singleShot(0, lambda: self._refresh_git(document))
+
+    def _clean_at_open(self, path: str) -> bool:
+        """打开时该文件是否相对 ``HEAD`` 干净（供「撤销修改后撤掉着色」判断）。"""
+        snapshot = self.file_tree.status_snapshot()
+        if snapshot is None:
+            return False
+        status = snapshot.status_for_diff(path)
+        return status is not None and status.change_type is None
 
     def _on_file_failed(self, path: str, message: str, exc: Optional[BaseException] = None) -> None:
         if isinstance(exc, UnknownEncodingError):
@@ -610,30 +1006,46 @@ class MainWindow(QMainWindow):
     def _current_document(self) -> Optional[Document]:
         return self.editor_tabs.current_document()
 
-    def _save_document(self, document: Optional[Document]) -> None:
+    def _save_document(self, document: Optional[Document], *, auto: bool = False) -> None:
+        """保存文档；``auto=True`` 表示由自动保存触发（不弹任何模态框）。"""
         if document is None:
             return
         session = self._require_session()
         if session is None:
             return
         if document.read_only:
-            QMessageBox.information(self, "只读文件", "该文件为只读，未执行保存。")
+            if auto:
+                self.status.set_save_status("只读文件，未自动保存")
+            else:
+                QMessageBox.information(self, "只读文件", "该文件为只读，未执行保存。")
             return
         text = self.editor_tabs.sync_text(document)
         # 冲突检测：远程文件在打开后被外部修改过
         self.runner.submit(
             session.fs.fingerprint,
             args=(document.remote_path,),
-            on_success=lambda current: self._after_fingerprint(document, current, text),
+            on_success=lambda current: self._after_fingerprint(document, current, text, auto=auto),
             on_error=lambda message: self._on_operation_failed("保存前检查失败", message),
         )
 
     def _after_fingerprint(
-        self, document: Document, current: Optional[FileFingerprint], text: str
+        self,
+        document: Document,
+        current: Optional[FileFingerprint],
+        text: str,
+        *,
+        auto: bool = False,
     ) -> None:
         if current is not None and document.fingerprint is not None and current.differs_from(
             document.fingerprint
         ):
+            if auto:
+                # 自动保存绝不打断输入：只提示，等用户自己决定
+                logger.info("远端文件已被外部修改，跳过自动保存：%s", document.remote_path)
+                self.status.set_save_status(
+                    f"{document.display_name} 远端已变化，未自动保存（Ctrl+S 处理）"
+                )
+                return
             choice = self._ask_conflict(document)
             if choice == "cancel":
                 self.status.set_save_status("已取消保存")
@@ -642,7 +1054,7 @@ class MainWindow(QMainWindow):
                 self._reload_document(document)
                 return
             # overwrite：继续上传
-        self._upload_document(document, text)
+        self._upload_document(document, text, auto=auto)
 
     def _ask_conflict(self, document: Document) -> str:
         """远程文件已被外部修改：让用户选择处理方式（需求 5.10）。"""
@@ -671,32 +1083,49 @@ class MainWindow(QMainWindow):
         self.editor_tabs.close_path(document.remote_path)
         self.open_remote_file(document.remote_path)
 
-    def _upload_document(self, document: Document, text: str) -> None:
+    def _upload_document(self, document: Document, text: str, *, auto: bool = False) -> None:
         session = self._require_session()
         if session is None:
             return
-        self.status.set_save_status("正在上传…")
+        self.status.set_save_status("自动保存中…" if auto else "正在上传…")
         self.runner.submit(
             remote_ops.save_file,
             args=(session, document.remote_path, text),
             kwargs={"encoding": document.encoding, "newline": document.newline},
-            on_success=lambda saved: self._on_file_saved(document, text, saved),
-            on_error=lambda message: self._on_save_failed(document, message),
+            on_success=lambda saved: self._on_file_saved(document, text, saved, auto=auto),
+            on_error=lambda message: self._on_save_failed(document, message, auto=auto),
         )
 
-    def _on_file_saved(self, document: Document, text: str, saved: SavedFile) -> None:
+    def _on_file_saved(
+        self, document: Document, text: str, saved: SavedFile, *, auto: bool = False
+    ) -> None:
         document.mark_saved(text)
         document.fingerprint = saved.fingerprint
         editor = self.editor_tabs.editor_for_path(document.remote_path)
         if editor is not None:
             editor.document().setModified(False)
         self.editor_tabs.update_titles()
-        self.status.set_save_status("已保存")
-        logger.info("已上传 %s（%d 字节）", saved.path, saved.size)
-        self._git_timer.start()
+        self.status.set_save_status("已自动保存" if auto else "已保存")
+        logger.info("已上传 %s（%d 字节，%s）", saved.path, saved.size, "自动" if auto else "手动")
+        self._apply_saved_status(saved.path, clean=document.reverted)
 
-    def _on_save_failed(self, document: Document, message: str) -> None:
-        QMessageBox.critical(self, "保存失败", f"{document.remote_path}\n\n{message}")
+    def _apply_saved_status(self, path: str, *, clean: bool = False) -> None:
+        """保存后按本地知识更新 Git 标记，省掉一次 ``git status`` 往返。
+
+        只有快照覆盖这个文件时才敢下结论；否则（文件在工作目录之外、或快照
+        尚未建立）安排一次延迟刷新兜底。
+        """
+        snapshot = self.file_tree.status_snapshot()
+        if snapshot is None or not snapshot.mark_saved(path, clean=clean):
+            self._git_timer.start()
+            return
+        self.file_tree.refresh_status()
+        self.scm_view.set_snapshot(snapshot)
+        self.status.set_git(snapshot.label)
+
+    def _on_save_failed(self, document: Document, message: str, *, auto: bool = False) -> None:
+        if not auto:
+            QMessageBox.critical(self, "保存失败", f"{document.remote_path}\n\n{message}")
         self.status.set_save_status("保存失败")
 
     def _save_all(self) -> None:
@@ -710,7 +1139,7 @@ class MainWindow(QMainWindow):
         if dirty:
             logger.info("自动保存 %d 个文件", len(dirty))
             for document in dirty:
-                self._save_document(document)
+                self._save_document(document, auto=True)
 
     def _close_document(self, document: Document) -> None:
         index = self.editor_tabs.index_of_path(document.remote_path)
@@ -750,9 +1179,17 @@ class MainWindow(QMainWindow):
         if document is None or self.session is None:
             return
         text = document.text
+        # 复用文件树快照里的文件状态：状态干净且文件自快照以来未被改过时，
+        # 连 `git diff` 都能省掉，打开未修改的文件几乎零远端开销
+        snapshot = self.file_tree.status_snapshot()
+        status = None
+        if snapshot is not None:
+            mtime = document.fingerprint.mtime if document.fingerprint else 0.0
+            status = snapshot.status_for_diff(document.remote_path, mtime=mtime)
         self.runner.submit(
             remote_ops.load_git_diff,
             args=(self.session, document.remote_path, text),
+            kwargs={"status": status},
             on_success=lambda diff: self._on_diff_loaded(document, diff),
             on_error=lambda message: self._on_diff_failed(document, message),
         )
@@ -762,19 +1199,29 @@ class MainWindow(QMainWindow):
         if document is None:
             return
         self.editor_tabs.sync_text(document)
-        self._refresh_repo_info()
+        self._refresh_tree_status()
         self._refresh_git(document)
 
     def _refresh_repo_info(self) -> None:
+        """识别工作目录所属仓库并刷新状态栏（同时刷新文件树着色）。"""
+        self._refresh_tree_status()
+
+    def _refresh_tree_status(self) -> None:
+        """取整棵文件树的 Git 状态快照，用于着色 / 状态栏 / diff 复用。"""
         session = self.session
         if session is None:
             return
         self.runner.submit(
-            remote_ops.load_repo_info,
-            args=(session,),
-            on_success=lambda repo: self.status.set_git(repo.label),
+            remote_ops.load_tree_status,
+            args=(session, self.workspace or session.workspace),
+            on_success=self._on_tree_status_loaded,
             on_error=lambda _message: self.status.set_git("Git: unavailable"),
         )
+
+    def _on_tree_status_loaded(self, status) -> None:
+        self.file_tree.set_status_snapshot(status)
+        self.scm_view.set_snapshot(status)
+        self.status.set_git(status.label)
 
     def _on_diff_loaded(self, document: Document, diff: FileDiff) -> None:
         max_lines = None
@@ -803,6 +1250,7 @@ class MainWindow(QMainWindow):
     # 文档 / 编辑器事件
     # ------------------------------------------------------------------
     def _on_document_activated(self, document: Optional[Document]) -> None:
+        self._update_editor_stack()
         if document is None:
             self.status.set_file("-")
             self.status.set_language("-")

@@ -25,6 +25,7 @@ class StatusBar(QStatusBar):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.connection_cell = _Cell("SSH", "Disconnected")
+        self.folder_cell = _Cell("Folder", "-")
         self.git_cell = _Cell("Git", "-")
         self.file_cell = _Cell("File", "-")
         self.language_cell = _Cell("Language", "-")
@@ -38,6 +39,7 @@ class StatusBar(QStatusBar):
         layout.setSpacing(0)
         for cell in (
             self.connection_cell,
+            self.folder_cell,
             self.git_cell,
             self.file_cell,
             self.language_cell,
@@ -58,8 +60,14 @@ class StatusBar(QStatusBar):
             value = f"Connected · {host}"
         self.connection_cell.set_value(value)
 
+    def set_folder(self, path: str) -> None:
+        self.folder_cell.set_value(path or "-")
+
     def set_git(self, label: str, summary: str = "") -> None:
-        value = label if not summary else f"{label} {summary}"
+        # 仓库标签自带 "Git: " 前缀，去掉它，避免出现「Git: Git: main」
+        value = label[len("Git: ") :] if label.startswith("Git: ") else label
+        if summary:
+            value = f"{value} {summary}"
         self.git_cell.set_value(value)
 
     def set_file(self, name: str) -> None:

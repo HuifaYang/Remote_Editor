@@ -29,11 +29,30 @@ class FakeAttributes:
 
 
 class FakeHandle:
+    """模拟 paramiko 的 SFTPFile（含 fstat / prefetch / 流水线写入）。"""
+
     def __init__(self, node: Dict[str, object], mode: str) -> None:
         self._node = node
         self._mode = mode
         self._position = 0
         self.closed = False
+        self.prefetch_sizes: List[int] = []
+        self.pipelined = False
+        self.flushed = 0
+
+    # paramiko 在真实句柄上提供的能力，客户端会用到
+    def stat(self) -> "FakeAttributes":
+        data = self._node["data"]  # type: ignore[assignment]
+        return FakeAttributes("", int(self._node["mode"]), len(data))  # type: ignore[arg-type]
+
+    def prefetch(self, size: int = -1) -> None:
+        self.prefetch_sizes.append(size)
+
+    def set_pipelined(self, pipelined: bool = True) -> None:
+        self.pipelined = pipelined
+
+    def flush(self) -> None:
+        self.flushed += 1
 
     def read(self, size: int = -1) -> bytes:
         data = self._node["data"]  # type: ignore[assignment]
@@ -61,6 +80,8 @@ class FakeParamikoSFTP:
         self.directories: set[str] = {"/"}
         self.support_posix_rename = support_posix_rename
         self.chmod_calls: List[tuple] = []
+        self.last_read_handle: "FakeHandle | None" = None
+        self.last_write_handle: "FakeHandle | None" = None
         if not support_posix_rename:
             # 服务端不支持 posix_rename 扩展时，属性为 None，客户端会走回退分支
             self.posix_rename = None  # type: ignore[assignment]
@@ -120,7 +141,12 @@ class FakeParamikoSFTP:
         node = self.files[path]
         if "w" in mode:
             node["data"] = b""
-        return FakeHandle(node, mode)
+        handle = FakeHandle(node, mode)
+        if "w" in mode:
+            self.last_write_handle = handle
+        else:
+            self.last_read_handle = handle
+        return handle
 
     def mkdir(self, path: str) -> None:
         if path in self.directories:
@@ -159,6 +185,7 @@ class FakeSSH:
     def __init__(self, sftp: FakeParamikoSFTP) -> None:
         self._sftp = sftp
         self.lock = threading.RLock()
+        self.sftp_lock = threading.RLock()
 
     def open_sftp(self) -> FakeParamikoSFTP:
         return self._sftp
@@ -228,6 +255,42 @@ def test_read_text_detects_bom(client: SftpClient) -> None:
     decoded = client.read_text("/home/user/project/bom.txt")
     assert decoded.encoding == "utf-8-sig"
     assert decoded.has_bom
+
+
+def test_read_bytes_prefetches_large_files(
+    client: SftpClient, sftp_server: FakeParamikoSFTP
+) -> None:
+    """大文件走 prefetch 流水线；小文件不做多余往返。"""
+    payload = b"x" * (64 * 1024 * 3 + 7)
+    sftp_server.add_file("/home/user/project/big.bin", payload)
+    handle_before = len(sftp_server.files)
+    assert client.read_bytes("/home/user/project/big.bin") == payload
+    assert len(sftp_server.files) == handle_before
+
+    handle = sftp_server.last_read_handle
+    assert handle is not None
+    assert handle.prefetch_sizes == [len(payload)]
+
+    client.read_bytes("/home/user/project/main.c")
+    assert sftp_server.last_read_handle is not None
+    assert sftp_server.last_read_handle.prefetch_sizes == []
+
+
+def test_read_text_with_stat_returns_metadata(client: SftpClient) -> None:
+    decoded, entry = client.read_text_with_stat("/home/user/project/main.c")
+    assert decoded.text == "int main() {}\n"
+    assert entry.size == len(b"int main() {}\n")
+    assert not entry.is_dir
+
+
+def test_write_bytes_uses_pipelining(
+    client: SftpClient, sftp_server: FakeParamikoSFTP
+) -> None:
+    client.write_bytes("/home/user/project/main.c", b"new content\n")
+    handle = sftp_server.last_write_handle
+    assert handle is not None
+    assert handle.pipelined is True
+    assert handle.flushed == 1
 
 
 def test_read_text_respects_max_bytes(client: SftpClient) -> None:

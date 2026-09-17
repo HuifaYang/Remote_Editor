@@ -13,8 +13,9 @@ from typing import Optional
 from app.config.hosts import AuthMethod, HostConfig
 from app.config.settings import AppSettings
 from app.git.git_client import GitClient, RepoInfo
-from app.remote.remote_fs import RemoteFileSystem
+from app.remote.remote_fs import RemoteFileSystem, normalize_remote_path
 from app.remote.ssh_client import SSHClient, SSHConnectionOptions
+from app.utils.ssh_keys import default_private_key
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,11 @@ class RemoteSession:
         self.password = password
         self.passphrase = passphrase
         self.settings = settings or AppSettings()
-        self.workspace = host.remote_workspace or ""
+        self.workspace = (host.remote_workspace or "").strip()
+        #: 主机配置里显式保存过的工作目录（区别于自动回退的家目录）
+        self.workspace_configured = bool(self.workspace)
+        #: 远端家目录，连接后按需探测并缓存
+        self.home = ""
 
         self._ssh: Optional[SSHClient] = None
         self._fs: Optional[RemoteFileSystem] = None
@@ -63,9 +68,7 @@ class RemoteSession:
             username=self.host.username,
             password=self.password,
             private_key_path=(
-                self.host.private_key_path
-                if self.host.auth_method is AuthMethod.PRIVATE_KEY
-                else ""
+                self._key_path() if self.host.auth_method is AuthMethod.PRIVATE_KEY else ""
             ),
             passphrase=self.passphrase,
             timeout=float(self.settings.ssh_timeout_seconds),
@@ -73,15 +76,25 @@ class RemoteSession:
             strict_host_key=bool(self.settings.ssh_strict_host_key),
         )
 
+    def _key_path(self) -> str:
+        """私钥认证使用的私钥路径；未显式配置时回退到本机 ``~/.ssh`` 里的默认私钥。"""
+        configured = (self.host.private_key_path or "").strip()
+        if configured:
+            return configured
+        default_key = default_private_key()
+        return str(default_key.path) if default_key is not None else ""
+
     def connect(self) -> None:
-        """建立连接并解析默认工作目录。"""
+        """建立连接并解析工作目录（``~`` 相对远端家目录展开）。"""
         ssh = SSHClient(self.build_options())
         ssh.connect()
         self._ssh = ssh
         self._fs = RemoteFileSystem(ssh)
         self._git = GitClient(ssh)
-        if not self.workspace:
-            self.workspace = self._detect_home()
+        if not self.workspace_configured:
+            self.workspace = self.remote_home()
+        else:
+            self.workspace = self.expand_path(self.workspace)
         logger.info("会话就绪：%s，工作目录 %s", self.host.target, self.workspace)
 
     def close(self) -> None:
@@ -141,8 +154,23 @@ class RemoteSession:
         home = result.stdout.strip()
         return home if result.ok and home else "/"
 
+    def remote_home(self) -> str:
+        """远端家目录（首次调用会执行一次 ``$HOME`` 查询并缓存）。"""
+        if not self.home:
+            self.home = self._detect_home()
+        return self.home
+
+    def expand_path(self, path: str) -> str:
+        """把用户输入的路径展开为绝对路径（``~`` 与相对路径都相对家目录）。"""
+        text = (path or "").strip()
+        needs_home = text in ("", "~") or text.startswith("~/") or not text.startswith("/")
+        home = self.remote_home() if needs_home else self.home
+        return normalize_remote_path(text, home)
+
     def set_workspace(self, path: str) -> None:
-        self.workspace = path
+        """切换工作目录（重启后仍生效需要同时写回 :class:`HostConfig`）。"""
+        self.workspace = self.expand_path(path)
+        self.workspace_configured = True
         self._repo_info = None
 
     def repo_info(self, *, refresh: bool = False) -> RepoInfo:
