@@ -82,6 +82,9 @@ remote-code-editor/
 │   │   ├── host_manager.py      # 主机管理面板（含 ~/.ssh/config 导入）
 │   │   ├── settings_dialog.py   # 设置面板
 │   │   ├── theme.py             # 主题与配色（唯一颜色来源）
+│   │   ├── fonts.py             # 内置 / 用户字体注册
+│   │   ├── icon_theme.py        # VSCode 文件图标主题
+│   │   ├── resources.py         # 用户可替换资源目录（打包后仍可新增）
 │   │   ├── tasks.py             # QThreadPool 异步任务运行器
 │   │   ├── remote_ops.py        # GUI ↔ 远程能力的粘合层
 │   │   ├── icons.py             # QPainter 现画的单色线条图标（无外部资源）
@@ -103,9 +106,9 @@ remote-code-editor/
 │   ├── config/                  # 配置管理（设置 + 主机列表）
 │   ├── cache/                   # 本地缓存（内容缓存 + 最近文件）
 │   └── utils/                   # 日志脱敏 / 异常 / 路径 / 编码 / ssh_keys
-├── docs/                        # 需求与设计文档
+├── docs/                        # 需求 / 设计 / 打包与资源替换 / 开发日志
 ├── tests/                       # 单元测试 + 真实 SSH/SFTP 端到端测试
-├── scripts/                     # 跨平台打包脚本 + 图标生成
+├── scripts/                     # 打包脚本：build_linux.sh(+build_deb.sh) / build_windows.bat(+NSIS 安装包)
 ├── requirements.txt
 ├── pyproject.toml
 └── LICENSE
@@ -131,7 +134,7 @@ remote-code-editor/
 - 支持密码与私钥两种认证；私钥解析兼容 paramiko 3.x 的 `PKey.from_path()` 与 2.9 的类型逐个尝试；
 - 主机密钥校验默认开启（`RejectPolicy`），设置项可显式放开供内网调试；
 - SFTP 上传采用**临时文件 + 原子重命名**（`.rce-upload-*` → 目标文件），避免传输中断损坏远端源码；
-- 远程路径用 `posixpath` 拼接，本地路径一律 `pathlib`（满足需求 §6.3）；
+- 远程路径用 `posixpath` 拼接，本地路径一律 `pathlib`（满足需求 §6.4）；
 - **两把锁而不是一把**：命令通道用 `_lock`，SFTP 通道用独立的 `sftp_lock`。paramiko 的
   `SFTPClient` 与 `Channel` 各自非线程安全，但两者之间没有共享状态——分开加锁后，
   一次几秒的 `git status` 不会再把「打开文件」「列目录」的 SFTP 请求堵在它后面；
@@ -345,6 +348,176 @@ Delegate 自己排版，超长名称在其中间省略（`ElideMiddle`），不�
 
 ---
 
+### 4.14 外观资源：内置字体 / 可切换主题 / 文件图标主题
+
+目标：**界面和编辑器在任何机器上都长得一样**，不依赖目标机器装了什么字体，也不需要
+联网下载 —— 资源随程序分发，放在 `assets/` 下，启动时加载。
+
+| 资源 | 目录 | 模块 | 说明 |
+| --- | --- | --- | --- |
+| 字体 | `assets/fonts/` | `app/ui/fonts.py` | 启动时把 `*.ttf/.otf/.ttc/.otc` 逐个 `QFontDatabase.addApplicationFont`；等宽字体按 `MONOSPACE_PREFERENCE`（JetBrains Mono → Cascadia → Fira Code → …）挑第一个已注册的，挑不到才回退系统字体（Consolas / Menlo / DejaVu Sans Mono） |
+| 配色主题 | `assets/themes/` + `<配置目录>/themes/` | `app/ui/theme.py` | 直接吃 **VSCode 主题 JSON**（`colors` + `tokenColors`），映射到内置 `Theme` 字段 |
+| 文件图标主题 | `assets/icon-themes/<主题>/` + `<配置目录>/icon-themes/` | `app/ui/icon_theme.py` | 直接吃 **VSCode 文件图标主题**（`iconDefinitions` / `fileNames` / `fileExtensions` / `folderNames` …），图标本体支持 SVG 与 PNG |
+
+**为什么用 VSCode 的格式而不是自造一套**：GitHub Dark、One Dark Pro、Material Icon Theme
+这些开源主题的**现成文件**可以直接用，用户想换主题就是「下载 → 放进目录 → 下拉框里选中」，
+不需要我们转格式，也不用为每个主题写适配代码。
+
+**配色主题的映射与兜底**（`theme_from_vscode`）：
+
+* 每个 `Theme` 字段配一组候选 VSCode 键（如 `panel_bg` ← `sideBar.background` /
+  `activityBar.background` / `editorWidget.background`），按顺序取第一个存在的；主题里
+  没写的字段沿用内置深色 / 浅色（按 `editor.background` 亮度自动判断用哪套），
+  所以**不完整的主题也能安全加载**；
+* 语法高亮按 TextMate scope 前缀匹配（`comment`、`keyword.control`、`string` …），
+  同样逐级兜底；
+* **透明度要换算**：VSCode 写 `#rrggbbaa`，Qt 写 `#aarrggbb`，直接塞进去会把 alpha
+  当红色用（选中底色会变红）。统一按编辑器底色做 alpha 合成后再交给 Qt；
+* 主题名取**文件名**（稳定、可写进配置、能当目录名），界面显示名取 JSON 的 `name`；
+  同名不会覆盖内置的 `dark` / `light`。
+
+**文件图标主题的解析顺序**与 VSCode 一致：精确文件名 → 最长扩展名匹配（`a.tar.gz` 命中
+`tar.gz` 而不是 `gz`）→ 默认文件图标；文件夹同理，还支持展开 / 收起两态。主题 JSON 与
+`icons` 目录不在同一层级时（Material Icon Theme 的 `dist/` 布局）按文件名在邻近目录再找
+一次。SVG 由 PySide6 自带的 `QtSvg` 渲染（**不新增依赖**，QtSvg 本来就随 PySide6 分发，
+打包脚本里补了 `--hidden-import PySide6.QtSvg`）。
+
+**逐项回退，绝不因为资源缺失而启动失败**：字体目录不存在 / 文件损坏 → 用系统字体；
+主题 JSON 坏掉或不是主题 → 跳过该文件；图标主题缺失 / 某种文件类型没定义 → 该项回退到
+系统图标。这些都写成了测试（`test_fonts.py` / `test_theme_loading.py` / `test_icon_theme.py`）。
+
+**切换入口**：设置对话框的「外观」组与「视图 → 主题」子菜单，即时生效并写回配置
+（`theme` / `icon_theme` 两个设置项）。切换时 `_apply_settings_to_ui()` 一处分发到
+编辑器、文件树、活动栏、SCM、欢迎页与所有自绘图标，颜色仍然只来自 `theme.py`（§5.7.1）。
+
+### 4.15 控件外观：QSS 覆盖范围与界面字体
+
+**为什么还要单独做一层 QSS**：Qt 默认（Fusion）的绘制在深色主题下很扎眼 —— 立体滚动条、
+三角下拉箭头、凸起的微调按钮、带描边的 GroupBox。这不是颜色问题而是**绘制方式**问题，
+只换调色板没用，必须在样式表里显式接管。因此 `apply_theme` 的 QSS 是这些控件外观的
+**唯一来源**：新增控件样式加在这里，而不是在业务代码里 `setStyleSheet`。
+
+覆盖到的原生控件：`QScrollBar`（12px、无箭头按钮、滑块半透明且悬停加亮）、
+`QComboBox::drop-down/::down-arrow`、`QSpinBox::up/down-button` 与箭头、
+`QCheckBox/QRadioButton::indicator`（强调色 + 白色对勾）、无边框 `QGroupBox`
+（分隔线 + 小节标题）、`QTabBar`（选中态顶部 2px 强调色）、`QMenu`（圆角 + 悬停圆角）、
+`QSplitter::handle:hover`、`QProgressBar`、`QToolTip` 等。
+
+**勾 / 箭头的图片来源**：QSS 的 `image:` 只能引用图片文件。`theme.py` 在 `apply_theme`
+时按当前主题色生成 `check-*.svg` / `arrow-up-*.svg` / `arrow-down-*.svg` 到临时目录
+（`glyph_dir()`，文件名带主题名避免串色），QSS 再按路径引用。图标颜色仍只来自主题，
+也不用往仓库里塞图片；临时目录不可写时对应项退化成 `image: none`（纯色块），
+样式表依旧合法，主题切换不会失败。箭头颜色取「前景色 / 底色」的中间灰，深浅主题都清晰。
+
+**界面字号：只在启动阶段设一次。** `apply_ui_font(app)` 把 `QApplication` 字体统一到
+`UI_FONT_POINT_SIZE`（10pt ≈ VSCode 的 13px），**必须在任何控件创建之前**调用
+（`app/main.py` 里紧跟 `load_bundled_fonts()`）；运行期的全局缩放（`Ctrl+=`）则只改
+样式表里的 `font-size`，不碰应用字体。原因是本机 Qt/PySide 在应用级字体 / 样式表被改来改去时
+容易出现 `setStyleSheet()` 段错误（详见下面的「样式表清零」陷阱）。具体地：
+
+* `apply_theme` 只负责调色板 + 样式表，**不碰字体**；
+* 界面字体用**磅值**而不是像素值：徽标、侧边栏小节标题都是「父字体 ± 固定磅值」算出来的
+  （`badge.py` −1.5、`welcome.py` +8），父字体若只有像素大小（`pointSizeF()` 为 −1）会算崩；
+* 编辑器与日志视图有各自的等宽字体，界面字号不覆盖它们。
+
+**样式表清零陷阱（2026-09-18 定位）**：把 `QApplication` 的样式表**清空成空串**之后，
+本机 Qt/PySide 会在**下一次** `apply_theme()` 的 `setStyleSheet()` 上段错误 —— 崩溃点在
+下一个用例建主窗口的时候，所以看起来像「字体问题」，实际是测试收尾动作埋的雷。
+因此测试里带主题的 `QApplication` 统一用 `tests/conftest.py` 的 `themed_app` fixture，
+收尾恢复成 `previous or NEUTRAL_STYLESHEET`（`"QWidget { }"`）而不是空串；
+不要在用例里自己 `app.setStyleSheet("")`。
+
+**提示文字的着色**：弹窗里原先写死的 `color: gray` / `#c0392b`（违反 §5.7.1）改成
+`QLabel[muted="true"]` / `QLabel[severity="error"]` 两个属性选择器，颜色由主题 QSS 下发；
+动态改属性时用 `theme.refresh_style(widget)` 触发重新 polish。
+
+### 4.16 打包形态与资源替换（用户可覆盖目录）
+
+**问题**：`--onefile` 让交付变得简单（一个文件、目标机零依赖），代价是 `assets/`
+在运行期被解压到 `sys._MEIPASS` 临时目录 —— **用户装完之后改不了程序自带的外观资源**，
+而且就算改了，下次启动也会被重新解压覆盖。安装版（.deb / NSIS）如果直接改安装目录，
+还会在升级时被覆盖。
+
+**做法**：把「随程序分发」和「用户自己加」分成两层，扫描顺序统一是「内置 → 用户」：
+
+| 资源 | 内置 | 用户（打包后可写） | 常量 |
+| --- | --- | --- | --- |
+| 配色主题 | `assets/themes/*.json` | `<配置目录>/themes/*.json` | `theme.user_theme_dir()` |
+| 字体 | `assets/fonts/`（`.ttf/.otf/.ttc/.otc`） | `<配置目录>/fonts/` | `fonts.user_font_dir()` |
+| 文件图标主题 | `assets/icon-themes/<名>/` | `<配置目录>/icon-themes/<名>/` | `icon_theme.user_icon_theme_dir()` |
+
+* `<配置目录>` 由 `app/utils/paths.py::config_dir()` 决定（Linux `~/.config/remote-code-editor`、
+  Windows `%APPDATA%\RemoteCodeEditor`、macOS `~/Library/Application Support/RemoteCodeEditor`），
+  所以 AppImage / exe / deb / 安装版**四种形态共用同一套用户目录**；
+* `app/ui/resources.py` 把三个目录收口成 `user_resource_dirs()` / `ensure_user_resource_dirs()`
+  与 `open_resource_dir()`，供设置对话框的「外观 → 资源目录」使用 —— 用户不用去翻文档猜路径；
+* **同名不覆盖内置**：扫描用「先扫到的赢」，内置始终排在最前。所以用户目录是*新增*语义，
+  内置的 `dark` / `light` / Material / JetBrains Mono 永远在。
+* 资源坏了不影响启动（§4.14 已有的逐项回退），用户目录同理：目录不存在直接跳过。
+
+**打包**：Linux 由 `scripts/build_linux.sh` 一次产出 AppImage（免安装）与 .deb（安装版），
+deb 组装逻辑单独放在 `scripts/build_deb.sh`（可脱离 AppImage 单独跑）；Windows 免安装版是
+`build_windows.bat`，安装版是 `installer_windows.nsi` + `build_windows_installer.bat`。
+两个平台的版本号都从 `paths.py::APP_VERSION` 读，避免多份版本号漂移。
+细节（目录布局、依赖声明、自查清单）见 [packaging.md](packaging.md)。
+
+### 4.17 自绘标题栏与无边框窗口
+
+用户要求「不要系统标题栏，自己绘制，参考 VSCode」。做法是 `FramelessWindowHint` +
+`widgets/title_bar.py`（菜单栏 + 标题 + 最小化 / 最大化 / 关闭，全部自绘图标），
+无边框之后系统不再提供三件事，都要自己实现：
+
+| 系统行为 | 自实现方式 |
+| --- | --- |
+| 拖动标题栏移动窗口 | 标题栏空白处按下 → `windowHandle().startSystemMove()`（拿回系统的拖动，不自己算偏移） |
+| 双击最大化 / 还原 | 标题栏 `mouseDoubleClickEvent` 切 `showNormal()` / `showMaximized()` |
+| 拖窗口边缘缩放 | `WindowResizeFilter`：**装在 QApplication 上**的事件过滤器，鼠标在窗口边缘 4px 内按下时 `startSystemResize(edges)` |
+
+两个必须记住的点：
+
+1. **菜单栏必须用 `QMainWindow` 自己那一个**。在标题栏里 `new QMenuBar()` 也「看起来能用」，
+   但 Qt 下次调用 `menuBar()` 会另建一个并把菜单 widget 顶掉 → 菜单整块消失。
+   正确顺序是 `QMainWindow.menuBar()`（建出真的那个）→ 交给 `TitleBar(window, menu_bar)` →
+   `setMenuWidget(title_bar)` → **显式 `menu_bar.show()`**（`setMenuWidget()` 会把它隐藏）。
+   另外 `QMainWindow.menuBar()` 在 C++ 里不是虚函数，Python 侧覆写不会影响 Qt 内部调用，
+   所以主窗口另外覆写了一个 `menuBar()` 供 Python 调用方（含测试）取用。
+2. **不要用 `QDockWidget` 做「贴边面板」**。无边框窗口里，不属于任何 dock 区域的 dock 会变成
+   浮在窗口左上角的独立小窗，正好盖住自绘标题栏的菜单（表现为菜单里凭空多出一个带 ✕ 的项）。
+   文件树住在侧边栏里、终端住在编辑区下方的 `QSplitter` 里，都不需要 dock。
+
+顶部工具栏同时被删掉（用户反馈「大量重复的操作按钮」）：活动栏 + 菜单已经覆盖了同一批命令，
+工具栏只是把同样的图标又摆了一遍，还占掉一整行高度。
+
+### 4.18 集成终端：VT 子集 + 双渲染路径
+
+用户要求「需要终端，且要有强渲染能力、GPU 渲染，参考 wezterm 或开源终端」。
+约束是**不新增第三方依赖**、**远端零常驻服务**，于是分成四层，各层都能单独测：
+
+| 层 | 位置 | 职责 |
+| --- | --- | --- |
+| 屏幕模型 | `app/terminal/screen.py` | 纯 Python 的 VT100/xterm 子集：字符网格 + 转义序列状态机。光标定位 / 擦除 / 插入删除 / 滚动区域 / SGR / 备用屏幕 / 自动换行 / OSC 丢弃 / DSR 应答；宽字符占两格、组合字符并格；回滚区默认 5000 行。颜色用 `None | int | (r,g,b)` 表示，**不认识 Qt**，所以能脱离界面单测 |
+| 按键映射 | `app/terminal/keys.py` | 纯函数：光标键 / 功能键 / Ctrl 组合 / Alt 前缀 / DECCKM（应用光标模式 SS3）/ Shift+Tab |
+| 通道 | `app/remote/shell_channel.py` | `transport.open_session()` + `get_pty()` + `invoke_shell()`；读取线程 + **增量 UTF-8 解码**；`resize_pty()` 同步 SIGWINCH；`recv` 超时只用于周期性检查退出标志，不做网络超时 |
+| 渲染 / 面板 | `widgets/terminal_canvas.py` / `terminal_view.py` / `terminal_panel.py` | 画布（GPU / 软渲染双路径）、单终端视图（屏幕 + 滚动条 + 通道桥接）、底部面板（多页签 + 新建 / 终止 / 收起） |
+
+**渲染**：`gpu_rendering_available()` 判断当前平台能不能用 `QOpenGLWidget`（`offscreen` /
+`minimal` 等无 GL 平台返回 `False`，`REMOTE_EDITOR_NO_GPU` 可强制软渲染）。
+两条路径共用同一个 `TerminalCanvasMixin._paint()`，只有「谁来调它」不同（`paintGL()` vs
+`paintEvent()`），避免只在一处修 bug。绘制本身做了两件事减少调用次数：
+
+- **背景**：同色的连续格子合并成一次 `fillRect`；
+- **文本**：同色同属性的连续格子拼成一个字符串一次 `drawText`（空格要进字符串，否则后面的字符
+  会左移 —— 终端里空格是**占位**的），只有宽字符单独绘制以保证列对齐。
+
+**线程**：面板 / 视图不认识网络，`ShellChannel` 的读取在后台线程，回调经 `_ChannelBridge`
+的信号切回 GUI 线程；开通道这个阻塞动作由主窗口交给 `TaskRunner` 执行
+（`MainWindow._open_shell_for` → `_on_shell_opened`）。断开连接 / 关窗口时 `close_all()`
+统一关闭所有通道，`ShellChannel.close()` 会等读取线程退出（最多 1 秒）。
+
+**面板位置**：编辑区下方的竖直 `QSplitter`（见 §4.17 第 2 点，不用 `QDockWidget`）。
+
+---
+
 ## 5. 测试策略与覆盖
 
 ```bash
@@ -354,8 +527,10 @@ python3 -m pytest tests/test_diff_parser.py -q   # 仅 Git Diff 规则
 
 `tests/test_editor_widget.py` 与 `test_main_window.py` 使用 Qt offscreen 平台，无需显示器。
 `tests/test_ssh_end_to_end.py` 会在进程内启动真实 paramiko SSH/SFTP 服务与真实 git 仓库，
-跑完整链路（连接 → 列目录 → 打开 → 编辑 → 保存 → 远端文件更新 → 标记刷新）；
-若环境不允许监听本地端口，则自动跳过。
+跑完整链路（连接 → 列目录 → 打开 → 编辑 → 保存 → 远端文件更新 → 标记刷新，
+以及交互式终端：shell 通道 + PTY + 窗口大小变更）；服务端带 PTY 起真实 bash，
+所以终端的网络层也是用真实 SSH 协议验证的，不只是假通道。
+若环境不允许监听本地端口（例如受限沙箱），整个模块自动跳过。
 
 覆盖范围：
 
@@ -369,14 +544,31 @@ python3 -m pytest tests/test_diff_parser.py -q   # 仅 Git Diff 规则
   `test_file_tree.py`）：活动栏信号与互斥选中、图标全部能画出非空像素（含 2 倍图）、
   欢迎页按连接状态切换入口、SCM 面板列出相对仓库根的路径与徽标颜色、空态、切面板不发远端请求。
 - 配置与编码：主机配置不落密码、设置读写原子性、BOM 与未知编码处理。
+- 控件外观（`test_theme_style.py`）：滚动条 / 下拉箭头 / 微调框 / 勾选框等原生控件确实被 QSS
+  接管（否则深色主题下还是 Fusion 的立体绘制），运行时生成的小图标带当前主题色、目录不可写时
+  退化成纯色，界面字号只在启动阶段下发，`muted` / `severity="error"` 提示文字取主题色。
+- 外观资源（`test_fonts.py` / `test_theme_loading.py` / `test_icon_theme.py`）：内置字体注册与
+  缺目录 / 坏文件 / 无 QApplication 的安全路径；VSCode 主题的字段与语法映射、透明度合成、
+  外部主题出现在下拉框、同名不覆盖内置主题、坏 JSON 跳过；文件图标主题的解析顺序、多段
+  扩展名、大小写、2 倍图与缓存、`dist/` 布局重定位、缺失时回退系统图标、文件树与设置对话框接入。
 - 工作目录与 `~/.ssh`：远端路径 `~`/相对路径展开、连接后选目录（含目录失效后重新选择、
   选择结果写回主机配置）、`~/.ssh` 私钥识别与 `~/.ssh/config` 导入。
+- 自绘标题栏（`test_title_bar.py`）：菜单栏就是 `QMainWindow` 自己那一个且父控件是标题栏、
+  窗口按钮 / 拖动 / 双击最大化、最大化状态同步、窗口标题组成。
+- 远程资源管理器（`test_hosts_view.py`）：主机与历史目录的展示、点主机名连接、点展开箭头只展开、
+  底部凭据行（提交后清空、不上盘）、右键菜单、连接状态条。
+- 终端（`test_terminal_screen.py` / `test_shell_channel.py` / `test_terminal_view.py` /
+  `test_terminal_panel.py` / `test_terminal_integration.py`）：转义序列逐条断言、回滚与滚动区域、
+  宽字符两格、选区的像素级位置（空格不能被吞）、按键转义（含 DECCKM）、增量解码、
+  PTY 与窗口大小、面板页签生命周期、快捷键开关面板、失败提示、断开 / 退出时清理通道。
 
 ---
 
 ## 6. 已知限制
 
-- V1.0 不支持 LSP、调试、终端、插件（见 [requirements.md](requirements.md) §1.4 功能边界）。
+- V1.0 不支持 LSP、调试、插件（见 [requirements.md](requirements.md) §1.4 功能边界）。
+- 终端是**够用子集**（§4.18）：没有鼠标上报（vim 里不能点）、没有 DEC 字符集重映射，
+  也没有实现 `htop` 用得到的全部高级序列；GPU 渲染路径在无显示器的环境无法实测。
 - 密码不落盘：每次连接需临时输入；后续版本可对接系统钥匙串。
 - 单文件默认上限 32MB（设置项可调），超大文件保证可打开，不保证高亮。
 - `~/.ssh/config` 导入只识别 `Host/HostName/Port/User/IdentityFile`，`ProxyJump`、`ProxyCommand`

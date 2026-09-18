@@ -7,7 +7,7 @@ from typing import Optional
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
-from app.ui.theme import Theme
+from app.ui.theme import Theme, refresh_style
 
 
 class WelcomeView(QWidget):
@@ -55,9 +55,10 @@ class WelcomeView(QWidget):
         self.set_connected(False)
 
     def apply_theme(self, theme: Theme) -> None:
-        self.title.setStyleSheet(f"color: {theme.editor_fg};")
-        self.subtitle.setStyleSheet(f"color: {theme.gutter_fg};")
-        self.hint.setStyleSheet(f"color: {theme.gutter_fg};")
+        self._theme = theme
+        for label in (self.title, self.subtitle, self.hint):
+            label.setProperty("muted", label is not self.title)
+            refresh_style(label)
 
     def set_connected(self, connected: bool) -> None:
         """连接之后「打开远程文件夹」才可用；「连接主机」在已连接时收起。"""

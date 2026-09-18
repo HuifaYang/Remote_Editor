@@ -22,6 +22,17 @@ logger = logging.getLogger(__name__)
 SETTINGS_FILENAME = "settings.json"
 #: 配置结构版本，用于把老配置迁移到新的默认行为
 SETTINGS_VERSION = 2
+#: 编辑器字号范围（设置对话框与 Ctrl+= / Ctrl+- 缩放共用同一组边界）
+FONT_SIZE_MIN = 8
+FONT_SIZE_MAX = 32
+#: Ctrl+0 恢复的字号
+FONT_SIZE_DEFAULT = 12
+
+#: 全局缩放（Ctrl+= / Ctrl+-）：同时作用于界面字体与编辑器字体，1.0 为原始大小
+ZOOM_MIN = 0.7
+ZOOM_MAX = 2.0
+ZOOM_STEP = 0.1
+ZOOM_DEFAULT = 1.0
 
 
 @dataclass
@@ -30,8 +41,12 @@ class AppSettings:
 
     # 外观
     theme: str = "dark"
+    #: 文件图标主题（资源管理器里文件 / 文件夹的图标），空串表示用系统图标
+    icon_theme: str = "material"
     font_family: str = ""
     font_size: int = 12
+    #: 全局缩放系数（界面 + 编辑器一起缩放，对齐 VSCode 的 Ctrl+= / Ctrl+-）
+    zoom_level: float = ZOOM_DEFAULT
     # 编辑器
     tab_size: int = 4
     use_spaces: bool = True

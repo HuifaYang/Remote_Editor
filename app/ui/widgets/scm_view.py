@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 from app.git.git_client import TreeStatus
 from app.git.models import ChangeType
 from app.ui.icons import make_icon
-from app.ui.theme import Theme
+from app.ui.theme import Theme, refresh_style
 from app.ui.widgets.badge import BADGE_COLOR_ROLE, BADGE_ROLE, BadgeDelegate
 
 FILE_ROLE = Qt.ItemDataRole.UserRole
@@ -95,7 +95,8 @@ class SourceControlView(QWidget):
     def apply_theme(self, theme: Theme) -> None:
         self._theme = theme
         self.refresh_button.setIcon(make_icon("refresh", theme.color("gutter_fg")))
-        self.empty_label.setStyleSheet(f"color: {theme.gutter_fg};")
+        self.empty_label.setProperty("muted", True)
+        refresh_style(self.empty_label)
 
     # -- 数据 --------------------------------------------------------------
     def set_snapshot(self, status: Optional[TreeStatus]) -> None:

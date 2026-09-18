@@ -100,6 +100,8 @@ def test_host_store_persists_without_password(host_store: HostStore, host: HostC
         "auth_method",
         "private_key_path",
         "remote_workspace",
+        # 最近打开的工作目录（远程资源管理器展开主机时显示），同样不含任何密钥
+        "recent_workspaces",
     }
 
 

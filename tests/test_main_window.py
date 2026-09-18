@@ -7,17 +7,24 @@ import time
 import pytest
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QDialog, QTabBar, QToolBar, QToolButton
+from PySide6.QtWidgets import QApplication, QDialog, QTabBar, QToolBar, QToolButton
 
 from app.cache.file_cache import FileCache
 from app.config.hosts import HostStore
-from app.config.settings import AppSettings, SettingsStore
+from app.config.settings import (
+    ZOOM_DEFAULT,
+    ZOOM_MAX,
+    ZOOM_MIN,
+    ZOOM_STEP,
+    AppSettings,
+    SettingsStore,
+)
 from app.git.git_client import RepoInfo
 from app.git.models import ChangeType
 from app.utils.errors import RemoteFileNotFoundError
 from app.ui import main_window as main_window_module
 from app.ui.main_window import MainWindow
-from app.ui.theme import get_theme
+from app.ui.theme import UI_FONT_POINT_SIZE, get_theme
 from app.ui.widgets.file_tree import CHANGE_ROLE, DIR_ROLE, PATH_ROLE
 from tests.fakes import DEFAULT_ROOT, FakeSession
 
@@ -417,6 +424,108 @@ def test_theme_change_updates_editors(qtbot, wired) -> None:
     assert editor is not None
     assert editor.theme.name == "light"
     assert window.file_tree._theme.name == "light"
+
+
+def test_missing_icon_theme_falls_back_to_system_icons(qtbot, wired) -> None:
+    """配置里写了没装的图标主题时，回退到系统图标而不是崩掉或显示空白。"""
+    window, _session = wired
+    window.settings = AppSettings(icon_theme="not-installed")
+
+    window._apply_settings_to_ui()
+
+    assert window.icon_theme is None
+    root_icon = window.file_tree.topLevelItem(0).icon(0)
+    assert not root_icon.isNull()
+
+
+def test_view_menu_switches_theme(qtbot, wired) -> None:
+    """「视图 → 主题」可以直接换主题（对齐 VSCode 的快速切换）。"""
+    window, _session = wired
+    assert window._theme_menu_actions["dark"].isChecked()
+    assert not window._theme_menu_actions["light"].isChecked()
+
+    window._theme_menu_actions["light"].trigger()
+
+    assert window.theme.name == "light"
+    assert window.settings_store.load().theme == "light"  # 选择被记住
+    assert window._theme_menu_actions["light"].isChecked()
+    assert not window._theme_menu_actions["dark"].isChecked()
+    assert window.file_tree._theme.name == "light"
+
+
+def test_zoom_shortcuts_scale_whole_ui(qtbot, wired) -> None:
+    """Ctrl+= / Ctrl+- / Ctrl+0 缩放**整个界面**，不只是代码区。
+
+    界面字号走主题 QSS（`apply_theme(ui_scale=...)`），编辑器字号把缩放折进字号后
+    交给标签页，所以一次快捷键两类字号一起变，并且结果被记住。
+    """
+    window, session = wired
+    open_file(qtbot, window, session)
+    base_font = window.settings.font_size
+    assert window.settings.zoom_level == ZOOM_DEFAULT
+
+    window.action_zoom_in.trigger()
+
+    assert window.settings.zoom_level == pytest.approx(ZOOM_DEFAULT + ZOOM_STEP)
+    # 编辑器：字号按缩放比例放大
+    assert window.editor_tabs.current_editor().font().pointSize() > base_font
+    # 界面：样式表里的字号也跟着放大（菜单 / 侧边栏 / 弹窗都吃这条）
+    qss = QApplication.instance().styleSheet()
+    assert f"font-size: {UI_FONT_POINT_SIZE * window.settings.zoom_level:g}pt" in qss
+    assert window.settings_store.load().zoom_level == pytest.approx(window.settings.zoom_level)
+
+    window.action_zoom_out.trigger()
+    assert window.settings.zoom_level == pytest.approx(ZOOM_DEFAULT)
+    assert window.editor_tabs.current_editor().font().pointSize() == base_font
+
+    window.action_zoom_reset.trigger()
+    assert window.settings.zoom_level == ZOOM_DEFAULT
+
+
+def test_zoom_shortcuts_are_registered(qtbot, window) -> None:
+    """快捷键本身要绑上（Ctrl+= 在不少键盘布局上要按 Shift，所以额外绑 Ctrl++）。"""
+    shortcut_texts = {
+        key.toString()
+        for action in (window.action_zoom_in, window.action_zoom_out, window.action_zoom_reset)
+        for key in action.shortcuts()
+    }
+    assert {"Ctrl+=", "Ctrl++", "Ctrl+-", "Ctrl+0"} <= shortcut_texts
+
+
+def test_zoom_shortcut_fires_while_editing(qtbot, wired) -> None:
+    """焦点在编辑器里时按键也要生效（VSCode 里就是这么用的）。"""
+    window, session = wired
+    open_file(qtbot, window, session)
+    editor = window.editor_tabs.current_editor()
+    assert editor is not None
+    window.show()
+    # 快捷键是 WindowShortcut，窗口得是激活态才会派发；offscreen 平台下
+    # activateWindow() 不生效，只能用它（Qt 标记为 deprecated，但测试里够用）
+    QApplication.setActiveWindow(window)
+    editor.setFocus()
+    base = window.settings.zoom_level
+
+    qtbot.keyClick(window, Qt.Key.Key_Equal, Qt.KeyboardModifier.ControlModifier)
+    assert window.settings.zoom_level == pytest.approx(base + ZOOM_STEP)
+
+    qtbot.keyClick(window, Qt.Key.Key_Minus, Qt.KeyboardModifier.ControlModifier)
+    assert window.settings.zoom_level == pytest.approx(base)
+
+
+def test_zoom_stops_at_limits(qtbot, wired) -> None:
+    """到边界后不再变化，也不重复写盘。"""
+    window, _session = wired
+    window.settings.zoom_level = ZOOM_MAX
+    window.settings_store.save(window.settings)
+    before = window.settings_store.path.read_text(encoding="utf-8")
+
+    window.action_zoom_in.trigger()
+    assert window.settings.zoom_level == ZOOM_MAX
+    assert window.settings_store.path.read_text(encoding="utf-8") == before  # 没有重复写盘
+
+    window.settings.zoom_level = ZOOM_MIN
+    window.action_zoom_out.trigger()
+    assert window.settings.zoom_level == ZOOM_MIN
 
 
 def test_tree_colors_changed_directory_from_snapshot(qtbot, wired) -> None:
@@ -898,19 +1007,42 @@ def test_tab_close_button_is_self_drawn_and_closes_the_document(qtbot, wired) ->
     assert window.editor_tabs.count() == 0
 
 
-def test_toolbar_is_icon_only(qtbot, wired) -> None:
-    """顶部工具栏只放图标（文字按钮会占掉一整行，对齐 VSCode 的图标风格）。"""
-    window, session = wired
-    toolbar = window.findChild(QToolBar)
-    assert toolbar is not None
-    assert toolbar.toolButtonStyle() == Qt.ToolButtonStyle.ToolButtonIconOnly
+def test_no_duplicate_toolbar_and_commands_stay_reachable(qtbot, wired) -> None:
+    """不再有顶部工具栏：同一批命令只留「标题栏菜单 + 活动栏」两个入口。
 
-    for action in toolbar.actions():
-        if action.isSeparator():
-            continue
-        # 图标画出来了，文字仍然保留给菜单 / 无障碍读屏使用
-        assert not action.icon().isNull()
-        assert action.text()
+    用户反馈「大量重复的操作按钮」—— 工具栏上的连接 / 打开文件夹 / 保存 / 刷新 /
+    查找 / 设置与活动栏、侧边栏头部完全重复。删掉工具栏之后，命令必须仍然可达：
+    每个 action 至少出现在一个菜单里，常用命令还留在活动栏上。
+    """
+    window, session = wired
+
+    assert window.findChild(QToolBar) is None
+    assert window.title_bar.menu_bar.isVisibleTo(window)
+
+    def collect(menu) -> set:
+        found = set()
+        for action in menu.actions():
+            found.add(action)
+            if action.menu() is not None:
+                found |= collect(action.menu())
+        return found
+
+    menu_actions = collect(window.menuBar())
+    for action in (
+        window.action_connect,
+        window.action_open_folder,
+        window.action_disconnect,
+        window.action_save,
+        window.action_save_all,
+        window.action_refresh_tree,
+        window.action_refresh_git,
+        window.action_find,
+        window.action_settings,
+    ):
+        assert action in menu_actions
+
+    for key in ("files", "search", "source-control", "hosts", "open-folder", "settings"):
+        assert window.activity_bar.button(key) is not None
 
 
 def test_explorer_shows_a_hint_until_a_folder_is_opened(qtbot, window: MainWindow) -> None:

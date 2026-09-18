@@ -28,6 +28,39 @@ from app.utils.ssh_keys import SSHConfigHost, load_ssh_config_hosts
 logger = logging.getLogger(__name__)
 
 
+def import_hosts_from_ssh_config(store: HostStore) -> tuple:
+    """把本机 ``~/.ssh/config`` 里还没导入过的主机加进主机列表。
+
+    返回 ``(导入数, 跳过数)``；读取 ``~/.ssh/config`` 失败时抛 :class:`OSError`
+    （由调用方决定怎么提示用户）。侧边栏「远程资源管理器」与主机管理面板共用这一份逻辑。
+    """
+    entries = load_ssh_config_hosts()
+    imported = 0
+    skipped = 0
+    for entry in entries:
+        if _already_imported(store, entry):
+            skipped += 1
+            continue
+        try:
+            store.add(HostConfig.from_ssh_config(entry))
+        except ConfigError as exc:
+            logger.warning("导入 %s 失败：%s", entry.alias, exc.message)
+            skipped += 1
+            continue
+        imported += 1
+    return imported, skipped
+
+
+def _already_imported(store: HostStore, entry: SSHConfigHost) -> bool:
+    """同「主机 + 端口 + 用户名」已经存在就不重复导入。"""
+    return any(
+        host.host == entry.connect_host
+        and int(host.port) == int(entry.port or 22)
+        and (not entry.username or host.username == entry.username)
+        for host in store.all()
+    )
+
+
 class HostManagerDialog(QDialog):
     """主机列表面板。"""
 
@@ -60,13 +93,15 @@ class HostManagerDialog(QDialog):
         toolbar.addWidget(self.connect_button)
 
         self.hint = QLabel("密码不会保存在配置文件中，连接时再输入。", self)
-        self.hint.setStyleSheet("color: gray;")
+        self.hint.setProperty("muted", True)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
         buttons.rejected.connect(self.reject)
         buttons.clicked.connect(lambda _b: self.reject())
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
         layout.addWidget(self.list_widget, 1)
         layout.addLayout(toolbar)
         layout.addWidget(self.hint)
@@ -138,11 +173,11 @@ class HostManagerDialog(QDialog):
     def _on_import_config(self) -> None:
         """读取本机 ~/.ssh/config，把其中已配置好的主机导入主机列表。"""
         try:
-            entries = load_ssh_config_hosts()
+            imported, skipped = import_hosts_from_ssh_config(self._store)
         except OSError as exc:  # pragma: no cover - 权限异常
             QMessageBox.warning(self, "读取失败", f"无法读取 ~/.ssh/config：{exc}")
             return
-        if not entries:
+        if not imported and not skipped:
             QMessageBox.information(
                 self,
                 "没有可导入的主机",
@@ -150,33 +185,11 @@ class HostManagerDialog(QDialog):
                 "（含通配符的 Host 段落会被忽略。）",
             )
             return
-
-        imported = 0
-        skipped = 0
-        for entry in entries:
-            if self._already_present(entry):
-                skipped += 1
-                continue
-            try:
-                self._store.add(HostConfig.from_ssh_config(entry))
-            except ConfigError as exc:
-                logger.warning("导入 %s 失败：%s", entry.alias, exc.message)
-                skipped += 1
-                continue
-            imported += 1
         self.reload()
         QMessageBox.information(
             self,
             "导入完成",
             f"从 ~/.ssh/config 导入 {imported} 台主机，跳过 {skipped} 条（已存在或无效）。",
-        )
-
-    def _already_present(self, entry: SSHConfigHost) -> bool:
-        return any(
-            host.host == entry.connect_host
-            and int(host.port) == int(entry.port or 22)
-            and (not entry.username or host.username == entry.username)
-            for host in self._store.all()
         )
 
     def _on_connect(self) -> None:

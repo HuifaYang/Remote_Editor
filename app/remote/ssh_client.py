@@ -30,6 +30,10 @@ from app.utils.logging_setup import forget_secret, register_secret
 
 logger = logging.getLogger(__name__)
 
+#: 私钥被口令保护时的提示文案。UI 靠这条常量（而不是猜字符串）决定要不要弹出
+#: 「私钥口令」输入行 —— 提示文案与判断逻辑必须一致。
+PASSPHRASE_REQUIRED_MESSAGE = "私钥需要口令（passphrase），请填写"
+
 DEFAULT_CONNECT_TIMEOUT = 15.0
 DEFAULT_KEEPALIVE = 30
 
@@ -312,7 +316,7 @@ class SSHClient:
         try:
             key = load_private_key(path, passphrase=self.options.passphrase)
         except paramiko.PasswordRequiredException:
-            return None, SSHAuthenticationError("私钥需要口令（passphrase），请填写")
+            return None, SSHAuthenticationError(PASSPHRASE_REQUIRED_MESSAGE)
         except paramiko.SSHException as exc:
             return None, SSHAuthenticationError(f"无法解析私钥：{exc}")
         except OSError as exc:

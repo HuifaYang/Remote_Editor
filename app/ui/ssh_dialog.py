@@ -100,7 +100,7 @@ class HostFormDialog(QDialog):
             self,
         )
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: gray;")
+        hint.setProperty("muted", True)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self
@@ -109,6 +109,8 @@ class HostFormDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
         layout.addLayout(form)
         layout.addWidget(hint)
         layout.addWidget(buttons)
@@ -236,7 +238,7 @@ class ConnectDialog(QDialog):
         manage_row.addStretch(1)
 
         self.workspace_label = QLabel("-", self)
-        self.workspace_label.setStyleSheet("color: gray;")
+        self.workspace_label.setProperty("muted", True)
         self.workspace_label.setWordWrap(True)
         self.secret_edit = QLineEdit(self)
         self.secret_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -257,7 +259,7 @@ class ConnectDialog(QDialog):
         secret_widget.setLayout(secret_row)
 
         self.target_label = QLabel("-", self)
-        self.target_label.setStyleSheet("color: gray;")
+        self.target_label.setProperty("muted", True)
 
         form = QFormLayout()
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
@@ -278,9 +280,11 @@ class ConnectDialog(QDialog):
 
         note = QLabel("连接成功后可在远端浏览并选择工作目录，无需事先填写路径。", self)
         note.setWordWrap(True)
-        note.setStyleSheet("color: gray;")
+        note.setProperty("muted", True)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
         layout.addLayout(form)
         layout.addWidget(note)
         layout.addWidget(self.buttons)

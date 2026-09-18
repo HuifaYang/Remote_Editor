@@ -15,7 +15,7 @@ import posixpath
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor
+from PySide6.QtGui import QAction, QBrush, QColor, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QMenu,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 from app.git.git_client import TreeStatus
 from app.git.models import ChangeType
 from app.remote.sftp_client import RemoteEntry
+from app.ui.icon_theme import FileIconTheme
 from app.ui.theme import Theme
 from app.ui.widgets.badge import BADGE_COLOR_ROLE, BADGE_ROLE, BadgeDelegate
 
@@ -80,7 +81,11 @@ class RemoteFileTree(QTreeWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
         self.itemExpanded.connect(self._on_expanded)
+        # 文件夹展开 / 收起时换用主题里的「打开 / 关闭」图标
+        self.itemExpanded.connect(lambda item: self._refresh_icon(item))
+        self.itemCollapsed.connect(lambda item: self._refresh_icon(item))
         self.itemDoubleClicked.connect(self._on_double_clicked)
+        self._icon_theme: Optional[FileIconTheme] = None
         self._icon_dir = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon)
         self._icon_file = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
 
@@ -89,6 +94,34 @@ class RemoteFileTree(QTreeWidget):
         """切换主题后重新着色（颜色只来自 :mod:`app.ui.theme`）。"""
         self._theme = theme
         self._recolor_items()
+
+    def set_icon_theme(self, icon_theme: Optional[FileIconTheme]) -> None:
+        """切换文件图标主题；``None`` 表示回退到系统图标。"""
+        self._icon_theme = icon_theme
+        self._refresh_icons()
+
+    def _icon_for(self, name: str, *, is_dir: bool, expanded: bool = False) -> QIcon:
+        if self._icon_theme is not None:
+            icon = self._icon_theme.icon_for(name, is_dir=is_dir, expanded=expanded)
+            if icon is not None:
+                return icon
+        return self._icon_dir if is_dir else self._icon_file
+
+    def _refresh_icons(self) -> None:
+        stack = [self.topLevelItem(index) for index in range(self.topLevelItemCount())]
+        while stack:
+            item = stack.pop()
+            if item is None:
+                continue
+            self._refresh_icon(item)
+            stack.extend(item.child(index) for index in range(item.childCount()))
+
+    def _refresh_icon(self, item: QTreeWidgetItem) -> None:
+        name = item.text(0)
+        if not name or not item.data(0, PATH_ROLE):
+            return  # 占位行（加载中 / 出错）不配图标
+        is_dir = bool(item.data(0, DIR_ROLE))
+        item.setIcon(0, self._icon_for(name, is_dir=is_dir, expanded=item.isExpanded()))
 
     def set_status_snapshot(self, status: Optional[TreeStatus]) -> None:
         """应用整棵文件树的 Git 状态快照；``None`` 表示清除着色。
@@ -258,7 +291,7 @@ class RemoteFileTree(QTreeWidget):
         item.setData(0, PATH_ROLE, entry.path)
         item.setData(0, DIR_ROLE, entry.is_dir)
         item.setData(0, LOADED_ROLE, False)
-        item.setIcon(0, self._icon_dir if entry.is_dir else self._icon_file)
+        item.setIcon(0, self._icon_for(entry.name, is_dir=entry.is_dir))
         item.setTextAlignment(0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         item.setData(
             0,

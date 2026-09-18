@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenuBar,
     QMessageBox,
     QSplitter,
     QStackedWidget,
@@ -31,29 +32,51 @@ from PySide6.QtWidgets import (
 )
 
 from app.cache.file_cache import FileCache
-from app.config.hosts import HostStore
-from app.config.settings import AppSettings, SettingsStore
+from app.config.hosts import AuthMethod, HostConfig, HostStore
+from app.config.settings import (
+    FONT_SIZE_MAX,
+    FONT_SIZE_MIN,
+    ZOOM_DEFAULT,
+    ZOOM_MAX,
+    ZOOM_MIN,
+    ZOOM_STEP,
+    AppSettings,
+    SettingsStore,
+)
 from app.editor.document import Document
 from app.editor.syntax import detect_language
 from app.git.models import FileDiff
 from app.remote.remote_fs import FileFingerprint, normalize_remote_path
+from app.remote.ssh_client import PASSPHRASE_REQUIRED_MESSAGE
 from app.remote.session import RemoteSession
+from app.remote.shell_channel import ShellChannel
 from app.ui import remote_ops
 from app.ui.remote_ops import LoadedFile, SavedFile
 from app.ui.settings_dialog import SettingsDialog
-from app.ui.ssh_dialog import ConnectDialog
-from app.ui.host_manager import HostManagerDialog
+from app.ui.ssh_dialog import HostFormDialog
+from app.ui.host_manager import HostManagerDialog, import_hosts_from_ssh_config
 from app.ui.icons import make_icon
 from app.ui.workspace_dialog import RemoteFolderPickerDialog
 from app.ui.tasks import TaskRunner
-from app.ui.theme import Theme, apply_theme, get_theme
+from app.ui.theme import (
+    Theme,
+    apply_theme,
+    available_themes,
+    get_theme,
+    monospace_font,
+    refresh_style,
+)
+from app.ui.icon_theme import get_icon_theme
 from app.ui.widgets.activity_bar import ActivityBar, ActivityItem
 from app.ui.widgets.editor_tabs import EditorTabs
 from app.ui.widgets.file_tree import RemoteFileTree
+from app.ui.widgets.hosts_view import HostsView
 from app.ui.widgets.log_view import LogView
 from app.ui.widgets.scm_view import SourceControlView
 from app.ui.widgets.search_bar import SearchBar
 from app.ui.widgets.status_bar import StatusBar
+from app.ui.widgets.terminal_panel import TerminalPanel
+from app.ui.widgets.title_bar import TitleBar, WindowResizeFilter
 from app.ui.widgets.welcome import WelcomeView
 from app.utils.encoding import SELECTABLE_ENCODINGS, UnknownEncodingError
 from app.utils.errors import ConfigError
@@ -76,7 +99,7 @@ ACTIVITY_ITEMS = (
     ActivityItem("files", "资源管理器", "files", checkable=True),
     ActivityItem("search", "查找（Ctrl+F）", "search"),
     ActivityItem("source-control", "源代码管理", "source-control", checkable=True),
-    ActivityItem("host", "连接主机…", "host"),
+    ActivityItem("hosts", "远程资源管理器（连接主机）", "host", checkable=True),
     ActivityItem("open-folder", "打开远程文件夹…（Ctrl+O）", "folder"),
     ActivityItem("settings", "设置…（Ctrl+,）", "settings", at_bottom=True),
 )
@@ -98,12 +121,17 @@ class MainWindow(QMainWindow):
         self.cache = cache or FileCache()
         self.settings: AppSettings = self.settings_store.load()
         self.theme: Theme = get_theme(self.settings.theme)
+        self.icon_theme = get_icon_theme(self.settings.icon_theme)
 
         self.runner = TaskRunner(self)
         self.session: Optional[RemoteSession] = None
         self.workspace = self.settings.remote_workspace or ""
         #: 连接后是否已经就「打不开工作目录」提醒过用户（避免反复弹窗）
         self._workspace_prompted = False
+        #: 正在连接 / 等待凭据的主机（私钥被口令保护时用它决定要不要弹输入行）
+        self._connecting_host: Optional[HostConfig] = None
+        #: 连上之后要自动打开的工作目录（从侧边栏的历史目录点进来时设置）
+        self._pending_open_path = ""
 
         self._git_timer = QTimer(self)
         self._git_timer.setSingleShot(True)
@@ -128,12 +156,41 @@ class MainWindow(QMainWindow):
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1280, 820)
+        # 不要系统标题栏：标题栏由 TitleBar 自绘（对齐 VSCode），
+        # 连带的「拖动 / 缩放 / 最大化」三件事也在 title_bar.py 里自己实现。
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
 
         self._build_ui()
         self._build_actions()
         self._build_menus()
         self._apply_settings_to_ui(first_time=True)
         self._update_status_connection(False)
+
+    # ------------------------------------------------------------------
+    # 窗口外壳（自绘标题栏）
+    # ------------------------------------------------------------------
+    def menuBar(self) -> QMenuBar:  # noqa: N802 - 覆写 Qt 接口
+        """菜单栏住在自绘标题栏里，这里转发给调用方（``QMainWindow.menuBar()`` 会另建一个）。
+
+        Qt 的 ``menuBar()`` 不是虚函数，所以 C++ 内部不会走到这里；Python 侧调用
+        （含测试与 ``_build_menus``）拿到的始终是标题栏里那一个。
+        """
+        return self.title_bar.menu_bar
+
+    def _build_window_shell(self) -> None:
+        """自绘标题栏 + 无边框窗口的边缘缩放热区。"""
+        # 先让 QMainWindow 把真正的菜单栏建出来，再交给标题栏收养
+        menu_bar = QMainWindow.menuBar(self)
+        self.title_bar = TitleBar(self, menu_bar)
+        self.setMenuWidget(self.title_bar)
+        # setMenuWidget() 会把「原菜单栏」隐藏，搬进标题栏之后要显式恢复
+        menu_bar.show()
+        # 热区挂在 QApplication 上：鼠标停在滚动条 / 编辑器上也能拖窗口边缘。
+        # 必须自己持有引用，否则会被 GC 掉（事件过滤器就失效了）。
+        self._resize_filter = WindowResizeFilter(self)
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self._resize_filter)
 
     # ------------------------------------------------------------------
     # UI 构建
@@ -180,6 +237,7 @@ class MainWindow(QMainWindow):
         return self.workspace or ""
 
     def _build_ui(self) -> None:
+        self._build_window_shell()
         self.file_tree = RemoteFileTree(self, theme=self.theme)
         self.editor_tabs = EditorTabs(self.theme, self.settings, self)
         self.search_bar = SearchBar(self)
@@ -211,8 +269,25 @@ class MainWindow(QMainWindow):
 
         # 侧边栏视图 2：源代码管理——与文件树共用同一份 Git 快照，打开面板不发远端请求
         self.scm_view = SourceControlView(self.theme, self)
+
+        # 侧边栏视图 3：远程资源管理器——主机列表 + 每台主机的历史工作目录。
+        # 连接入口从「居中模态框」搬到了这里（用户反馈：点连接不该弹在屏幕中间）。
+        self.hosts_view = HostsView(self.host_store, self.theme, self)
+        self.hosts_view.connectRequested.connect(self._on_hosts_connect_requested)
+        self.hosts_view.openWorkspaceRequested.connect(self._on_hosts_open_workspace)
+        self.hosts_view.newHostRequested.connect(self._on_host_add)
+        self.hosts_view.editHostRequested.connect(self._on_host_edit)
+        self.hosts_view.deleteHostRequested.connect(self._on_host_delete)
+        self.hosts_view.importConfigRequested.connect(self._on_hosts_import_config)
+        self.hosts_view.disconnectRequested.connect(self._on_disconnect)
+        self.hosts_view.secretSubmitted.connect(self._on_hosts_secret_submitted)
+
         self.side_panel = QStackedWidget(self)
-        for key, view in (("files", self.explorer), ("source-control", self.scm_view)):
+        for key, view in (
+            ("files", self.explorer),
+            ("source-control", self.scm_view),
+            ("hosts", self.hosts_view),
+        ):
             self._side_views[key] = self.side_panel.addWidget(view)
 
         # 编辑区：「标签页」与「欢迎页」互斥显示（对齐 VSCode：空工作区就是一个 Welcome 标签）
@@ -228,9 +303,29 @@ class MainWindow(QMainWindow):
         editor_layout.addWidget(self.search_bar)
         editor_layout.addWidget(self.editor_stack, 1)
 
+        # 底部终端面板：默认隐藏，放在编辑区下方的竖直 splitter 里（对齐 VSCode 的「面板」），
+        # 用 splitter 而不是 dock，是因为 dock 在无边框窗口里会浮到左上角盖住自绘标题栏
+        # （这个坑在文件树 dock 上已经踩过一次）。
+        self.terminal_panel = TerminalPanel(
+            theme=self.theme,
+            font=self._terminal_font(),
+            open_shell=self._open_shell_for,
+            parent=self,
+        )
+        self.terminal_panel.setObjectName("terminal_panel")
+        self.terminal_panel.setVisible(False)
+
+        editor_column = QSplitter(Qt.Orientation.Vertical, self)
+        editor_column.addWidget(editor_area)
+        editor_column.addWidget(self.terminal_panel)
+        editor_column.setStretchFactor(0, 1)
+        editor_column.setStretchFactor(1, 0)
+        editor_column.setSizes([700, 220])
+        self.editor_column = editor_column
+
         self.splitter = QSplitter(Qt.Orientation.Horizontal, self)
         self.splitter.addWidget(self.side_panel)
-        self.splitter.addWidget(editor_area)
+        self.splitter.addWidget(editor_column)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
         self.splitter.setSizes([280, 1000])
@@ -243,12 +338,9 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(self.splitter, 1)
         self.setCentralWidget(central)
 
-        self.file_tree_dock = QDockWidget("Remote Files", self)
-        self.file_tree_dock.setObjectName("file_tree_dock")
-        self.file_tree_dock.setFeatures(
-            QDockWidget.DockWidgetFeature.DockWidgetMovable
-            | QDockWidget.DockWidgetFeature.DockWidgetClosable
-        )
+        # 注意：这里**不要**建「Remote Files」QDockWidget —— 它不属于任何 dock 区域时
+        # 会变成一个悬在窗口左上角的浮动控件，正好盖住自绘标题栏的菜单
+        # （表现为菜单里多出一个「Remote… ✕」）。文件树住在侧边栏里，不需要第二个容器。
         self.log_view = LogView(self)
         self.log_dock = QDockWidget("日志", self)
         self.log_dock.setObjectName("log_dock")
@@ -304,8 +396,6 @@ class MainWindow(QMainWindow):
             self._show_side_view(key if checked else None)
         elif key == "search":
             self._show_search(False)
-        elif key == "host":
-            self._on_connect()
         elif key == "open-folder":
             self._on_open_folder()
         elif key == "settings":
@@ -329,6 +419,23 @@ class MainWindow(QMainWindow):
         self.editor_stack.setCurrentWidget(self.editor_tabs if has_tabs else self.welcome)
         if not has_tabs:
             self.search_bar.setVisible(False)
+
+    def _update_window_title(self) -> None:
+        """窗口标题：``当前文件 - 工作目录 - 程序名``（与 VSCode 的标题顺序一致）。
+
+        自绘标题栏读的是 :meth:`TitleBar.set_title`；``setWindowTitle()`` 同时更新，
+        这样任务栏 / 窗口列表（窗口管理器那边的显示名）也是对的。
+        """
+        parts: List[str] = []
+        document = self._current_document()
+        if document is not None:
+            parts.append(document.display_name)
+        if self.workspace:
+            parts.append(posixpath.basename(self.workspace.rstrip("/")) or self.workspace)
+        parts.append(f"{APP_NAME} {APP_VERSION}")
+        text = " - ".join(parts)
+        self.setWindowTitle(text)
+        self.title_bar.set_title(text)
 
     def _build_actions(self) -> None:
         def action(text: str, shortcut: Optional[str] = None, slot=None) -> QAction:
@@ -361,11 +468,32 @@ class MainWindow(QMainWindow):
         self.action_paste = action("粘贴", "Ctrl+V", lambda: self._editor_call("paste"))
         self.action_select_all = action("全选", "Ctrl+A", lambda: self._editor_call("selectAll"))
 
+        # 终端（对齐 VSCode）：Ctrl+` 开关面板、Ctrl+Shift+` 新建一个终端
+        self.action_toggle_terminal = action("终端", "Ctrl+`")
+        self.action_toggle_terminal.setCheckable(True)
+        self.action_toggle_terminal.setShortcuts(
+            [QKeySequence("Ctrl+`"), QKeySequence("Ctrl+J")]
+        )
+        # 接 toggled 而不是 triggered：setChecked() 只发 toggled，
+        # 面板收起按钮与「新建终端」都靠它同步状态。
+        self.action_toggle_terminal.toggled.connect(self._toggle_terminal)
+        self.action_new_terminal = action("新建终端", "Ctrl+Shift+`", self._new_terminal)
+        self.terminal_panel.collapseRequested.connect(
+            lambda: self.action_toggle_terminal.setChecked(False)
+        )
+
         self.action_toggle_log = action("显示日志", None, self._toggle_log)
         self.action_toggle_log.setCheckable(True)
         self.action_toggle_tree = action("显示文件树", None, self._toggle_tree)
         self.action_toggle_tree.setCheckable(True)
         self.action_toggle_tree.setChecked(True)
+        # 字号缩放（对齐 VSCode）：Ctrl+= 放大、Ctrl+- 缩小、Ctrl+0 复原
+        self.action_zoom_in = action("放大（全部界面）", None, lambda: self._zoom(1))
+        self.action_zoom_out = action("缩小（全部界面）", None, lambda: self._zoom(-1))
+        self.action_zoom_reset = action("重置缩放", "Ctrl+0", self._reset_zoom)
+        # Ctrl+= 在很多键盘布局上要配合 Shift，两个都绑上
+        self.action_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
+        self.action_zoom_out.setShortcuts([QKeySequence("Ctrl+-"), QKeySequence("Ctrl+_")])
         self.action_clear_cache = action("清空本地缓存", None, self._clear_cache)
         self.action_about = action("关于", None, self._show_about)
 
@@ -418,46 +546,118 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(self.action_replace)
         edit_menu.addAction(self.action_goto)
 
+        terminal_menu = self.menuBar().addMenu("终端")
+        terminal_menu.addAction(self.action_new_terminal)
+        terminal_menu.addAction(self.action_toggle_terminal)
+
         view_menu = self.menuBar().addMenu("视图")
+        view_menu.addAction(self.action_toggle_terminal)
         view_menu.addAction(self.action_toggle_log)
         view_menu.addAction(self.action_toggle_tree)
+        view_menu.addSeparator()
+        self.theme_menu = view_menu.addMenu("主题")
+        self._populate_theme_menu()
+        view_menu.addSeparator()
+        view_menu.addAction(self.action_zoom_in)
+        view_menu.addAction(self.action_zoom_out)
+        view_menu.addAction(self.action_zoom_reset)
 
         help_menu = self.menuBar().addMenu("帮助")
         help_menu.addAction(self.action_clear_cache)
         help_menu.addAction(self.action_about)
 
-        toolbar = self.addToolBar("主工具栏")
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        toolbar.setIconSize(QSize(18, 18))
-        toolbar.addAction(self.action_connect)
-        toolbar.addAction(self.action_open_folder)
-        toolbar.addAction(self.action_disconnect)
-        toolbar.addSeparator()
-        toolbar.addAction(self.action_save)
-        toolbar.addAction(self.action_refresh_tree)
-        toolbar.addAction(self.action_refresh_git)
-        toolbar.addSeparator()
-        toolbar.addAction(self.action_find)
-        toolbar.addAction(self.action_settings)
-
     # ------------------------------------------------------------------
     # 设置 / 主题
     # ------------------------------------------------------------------
+    def _sync_theme_menu(self) -> None:
+        for name, action in self._theme_menu_actions.items():
+            action.setChecked(name == self.theme.name)
+
+    def _populate_theme_menu(self) -> None:
+        """按当前可用主题重建「视图 → 主题」子菜单。
+
+        用户在设置对话框里把主题文件放进「资源目录 / themes」后，`SettingsDialog`
+        会重扫一遍主题目录；保存设置时这里跟着重建，**不用重启**就能在菜单里选到新主题。
+        """
+        self.theme_menu.clear()
+        self._theme_menu_actions = {}
+        for theme in available_themes():
+            action = self.theme_menu.addAction(theme.display_name)
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda _checked=False, name=theme.name: self._switch_theme(name)
+            )
+            self._theme_menu_actions[theme.name] = action
+        self._sync_theme_menu()
+
+    def _switch_theme(self, name: str) -> None:
+        """「视图 → 主题」里的快速切换：只改主题，其余设置不动。"""
+        if name == self.theme.name:
+            return
+        self.settings = self.settings_store.update(theme=name)
+        self.theme = get_theme(name)
+        self._apply_settings_to_ui()
+        logger.info("主题已切换为 %s", self.theme.name)
+
+    def _zoom(self, delta: int) -> None:
+        """Ctrl+= / Ctrl+-：全局缩放（界面 + 编辑器一起，对齐 VSCode 的窗口缩放）。"""
+        self._set_zoom(self.settings.zoom_level + delta * ZOOM_STEP)
+
+    def _reset_zoom(self) -> None:
+        """Ctrl+0：恢复默认缩放（界面字号回默认，编辑器回到设置里的字号）。"""
+        self._set_zoom(ZOOM_DEFAULT)
+
+    def _set_zoom(self, level: float) -> None:
+        clamped = round(max(ZOOM_MIN, min(ZOOM_MAX, float(level))), 2)
+        if abs(clamped - self.settings.zoom_level) < 1e-6:
+            # 已经到边界：只提示，不重复写盘、不重复重排
+            self.status.showMessage(
+                f"缩放已是{'最大值' if clamped >= ZOOM_MAX else '最小值'} {int(clamped * 100)}%",
+                2000,
+            )
+            return
+        self.settings = self.settings_store.update(zoom_level=clamped)
+        # 走同一条分发路径：界面字体、每个标签页的字号 / 行号槽宽度都跟着更新
+        self._apply_settings_to_ui()
+        self.status.showMessage(f"缩放: {int(clamped * 100)}%", 2000)
+        logger.info("全局缩放调整为 %s", clamped)
+
+    def _effective_settings(self) -> AppSettings:
+        """把全局缩放折进字号后交给编辑器（编辑器只认一个字号）。"""
+        scale = max(ZOOM_MIN, min(ZOOM_MAX, float(self.settings.zoom_level)))
+        if abs(scale - 1.0) < 1e-6:
+            return self.settings
+        scaled = AppSettings.from_dict(self.settings.to_dict())
+        scaled.font_size = max(
+            FONT_SIZE_MIN, min(FONT_SIZE_MAX, int(round(self.settings.font_size * scale)))
+        )
+        return scaled
+
     def _apply_settings_to_ui(self, *, first_time: bool = False) -> None:
-        apply_theme(QApplication.instance(), self.theme)
+        apply_theme(
+            QApplication.instance(),
+            self.theme,
+            ui_scale=self.settings.zoom_level,
+        )
         self.editor_tabs.apply_theme(self.theme)
         self.file_tree.apply_theme(self.theme)
+        self.title_bar.apply_theme(self.theme)
+        self.icon_theme = get_icon_theme(self.settings.icon_theme)
+        self.file_tree.set_icon_theme(self.icon_theme)
         self.activity_bar.apply_theme(self.theme)
         self.scm_view.apply_theme(self.theme)
         self.welcome.apply_theme(self.theme)
+        self.terminal_panel.apply_theme(self.theme)
+        self.terminal_panel.set_font(self._terminal_font())
+        self._sync_theme_menu()
         icon_color = self.theme.color("gutter_fg")
-        self.explorer_hint.setStyleSheet(f"color: {self.theme.gutter_fg};")
+        self.explorer_hint.setProperty("muted", True)
+        refresh_style(self.explorer_hint)
         for button, icon in self.explorer_buttons:
             button.setIcon(make_icon(icon, icon_color))
         for action, icon in self._action_icons:
             action.setIcon(make_icon(icon, icon_color))
-        self.editor_tabs.apply_settings(self.settings)
+        self.editor_tabs.apply_settings(self._effective_settings())
         if first_time:
             self.log_view.setVisible(False)
 
@@ -471,9 +671,100 @@ class MainWindow(QMainWindow):
         self.settings = updated
         if theme_changed:
             self.theme = get_theme(updated.theme)
+        self._populate_theme_menu()
         self._apply_settings_to_ui()
-        logger.info("设置已更新（主题=%s，字号=%s）", self.settings.theme, self.settings.font_size)
+        logger.info(
+            "设置已更新（主题=%s，字号=%s，缩放=%s）",
+            self.settings.theme,
+            self.settings.font_size,
+            self.settings.zoom_level,
+        )
         self.status.set_save_status("设置已保存")
+
+    # ------------------------------------------------------------------
+    # 终端（底部面板）
+    # ------------------------------------------------------------------
+    def _terminal_font(self):
+        """终端字号跟随编辑器字号与全局缩放（用户要求 Ctrl+=/- 是全局的）。"""
+        effective = self._effective_settings()
+        return monospace_font(effective.font_size)
+
+    def _close_terminals(self) -> None:
+        """关掉所有终端并把面板收起（断开连接 / 退出时用，避免留一个空面板）。"""
+        self.terminal_panel.close_all()
+        if self.action_toggle_terminal.isChecked():
+            self.action_toggle_terminal.setChecked(False)  # → _toggle_terminal(False)
+        else:
+            self.terminal_panel.setVisible(False)
+
+    def _toggle_terminal(self, checked: bool) -> None:
+        if not checked:
+            self.terminal_panel.setVisible(False)
+            return
+        if self.terminal_panel.isVisible():
+            return
+        if not self._start_terminal_panel():
+            self.action_toggle_terminal.setChecked(False)
+
+    def _start_terminal_panel(self) -> bool:
+        """打开终端面板；还没有终端就建一个。没有会话时返回 ``False``。
+
+        这里**不用** :meth:`_require_session` —— 那个会弹模态框，
+        而按快捷键开终端时只该在状态栏给一句提示。
+        """
+        if self.session is None or not self.session.connected:
+            self.status.set_save_status("请先连接主机，再打开终端")
+            return False
+        self.terminal_panel.setVisible(True)
+        if self.terminal_panel.count() == 0:
+            self.terminal_panel.new_terminal()
+        else:  # 之前只是把面板收起来了，直接恢复原来的终端
+            self.terminal_panel.focus_current()
+        return True
+
+    def _new_terminal(self) -> None:
+        """新建终端；面板没开就先打开它（打开时会建第一个）。"""
+        if not self.terminal_panel.isVisible():
+            if not self.action_toggle_terminal.isChecked():
+                self.action_toggle_terminal.setChecked(True)
+                return  # 上面的 toggled 已经建好第一个终端
+            if not self._start_terminal_panel():
+                self.action_toggle_terminal.setChecked(False)
+            return
+        if self.session is None or not self.session.connected:
+            self.status.set_save_status("请先连接主机，再打开终端")
+            return
+        self.terminal_panel.new_terminal()
+
+    def _open_shell_for(self, view) -> None:
+        """给一个终端页签开远端 shell（``open()`` 是阻塞的，必须放工作线程）。"""
+        session = self.session
+        if session is None:
+            view.show_notice("未连接主机，无法打开终端")
+            return
+        view.show_notice("正在打开终端…")
+
+        def open_channel() -> ShellChannel:
+            channel = ShellChannel(session.ssh)
+            channel.open()
+            return channel
+
+        self.runner.submit(
+            open_channel,
+            on_success=lambda channel: self._on_shell_opened(view, channel),
+            on_error=lambda message: self._on_shell_failed(view, message),
+        )
+
+    def _on_shell_opened(self, view, channel: ShellChannel) -> None:
+        if not view.attached:  # 页签在等待期间被关掉了
+            channel.close()
+            return
+        view.start(channel)
+        view.notice.setVisible(False)
+        view.canvas.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _on_shell_failed(self, view, message: str) -> None:
+        view.show_notice(f"打开终端失败：{message}")
 
     def _toggle_log(self, checked: bool) -> None:
         self.log_dock.setVisible(checked)
@@ -508,28 +799,24 @@ class MainWindow(QMainWindow):
     def _on_manage_hosts(self) -> None:
         dialog = HostManagerDialog(self.host_store, self)
         dialog.exec()
+        self.hosts_view.reload()
         host = dialog.connect_host
         if host is not None:
             self._connect_to_host(host)
 
     def _on_connect(self) -> None:
-        if self.session is not None and self.session.connected:
-            confirm = QMessageBox.question(
-                self,
-                "重新连接",
-                "当前已有连接，是否断开并连接其他主机？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if confirm != QMessageBox.StandardButton.Yes:
-                return
-            self._teardown_session()
-        dialog = ConnectDialog(self.host_store, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        """「连接主机」（Ctrl+K / 活动栏 / 欢迎页）：**打开侧边栏的远程资源管理器**。
+
+        以前这里弹一个居中的连接对话框，用户反馈「点一下为什么弹窗在中间」——
+        现在改成把主机列表亮在侧边栏里（对齐 VSCode 的 Remote Explorer），点主机即连。
+        一台主机都没有时直接进入「新增主机」表单，省掉一次空面板。
+        """
+        if not self.host_store.all():
+            self._show_side_view("hosts")
+            self._on_host_add()
             return
-        request = dialog.request()
-        if request is None:
-            return
-        self._connect_to_host(request.host, password=request.password, passphrase=request.passphrase)
+        self._show_side_view("hosts")
+        self.status.set_save_status("在侧边栏选择要连接的主机")
 
     def _connect_to_host(
         self,
@@ -537,17 +824,25 @@ class MainWindow(QMainWindow):
         *,
         password: Optional[str] = None,
         passphrase: Optional[str] = None,
+        workspace: str = "",
     ) -> None:
-        from app.ui.ssh_dialog import ConnectRequest
+        """开始连接一台主机。
 
+        **凭据缺失时不弹居中对话框**：改在侧边栏底部显示内联输入行（密码 / 私钥口令），
+        用户填完回车即连（见 :meth:`_on_hosts_secret_submitted`）。
+        """
         if password is None and passphrase is None:
-            dialog = ConnectDialog(self.host_store, self)
-            dialog.reload_hosts(select_id=host.id)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
+            needed = self.hosts_view.secret_needed_for(host)
+            if needed:
+                self._pending_open_path = workspace
+                self._connecting_host = host
+                self._show_side_view("hosts")
+                self.hosts_view.request_secret(host, needed)
+                self.status.set_save_status(f"{host.display_name}：请输入{needed}")
                 return
-            request = dialog.request() or ConnectRequest(host=host)
-            host, password, passphrase = request.host, request.password, request.passphrase
 
+        self._pending_open_path = workspace
+        self._connecting_host = host
         session = RemoteSession(host, password=password, passphrase=passphrase, settings=self.settings)
         self.status.set_save_status(f"正在连接 {host.target}…")
         self.status.set_connection(False)
@@ -556,18 +851,24 @@ class MainWindow(QMainWindow):
             remote_ops.open_session,
             args=(session,),
             on_success=lambda state: self._on_connected(session, state),
-            on_error=lambda message: self._on_connect_failed(message),
+            on_error=self._on_connect_failed,  # 需要原始异常来判断「私钥要口令」
         )
 
     def _on_connected(self, session: RemoteSession, state) -> None:
         self._set_busy(False)
         self.session = session
+        self._connecting_host = None
         self._workspace_prompted = False
         self._update_status_connection(True)
         self.status.set_save_status("已连接")
         logger.info("已连接到 %s，工作目录 %s", session.host.target, session.workspace or "-")
         repo = session.repo_info()
         self.status.set_git(repo.label)
+        if self._pending_open_path:
+            # 从侧边栏的历史目录点进来的：连上就直接打开那个目录
+            path, self._pending_open_path = self._pending_open_path, ""
+            self._open_workspace(path, persist=True)
+            return
         if session.workspace_configured and session.workspace:
             # 这台主机之前记住过工作目录，直接打开
             self._open_workspace(session.workspace, persist=False)
@@ -575,11 +876,134 @@ class MainWindow(QMainWindow):
         # 首次连接：像 VSCode 一样先连接，再让用户选择要打开哪个文件夹
         self._prompt_open_folder()
 
-    def _on_connect_failed(self, message: str) -> None:
+    def _on_connect_failed(self, message: str, exc: Optional[BaseException] = None) -> None:
         self._set_busy(False)
+        host = self._connecting_host
         self._teardown_session()
+        if host is not None and message == PASSPHRASE_REQUIRED_MESSAGE:
+            # 私钥有口令：把输入行给出来，而不是甩一个错误弹窗
+            self._connecting_host = host
+            self._show_side_view("hosts")
+            self.hosts_view.request_secret(
+                host, "私钥口令", hint="该私钥有口令，输入后回车连接（无口令可留空）"
+            )
+            self.status.set_save_status("私钥需要口令，请在侧边栏输入")
+            return
+        self._connecting_host = None
         QMessageBox.critical(self, "连接失败", message)
         self.status.set_save_status("连接失败")
+
+    # ------------------------------------------------------------------
+    # 侧边栏「远程资源管理器」的槽
+    # ------------------------------------------------------------------
+    def _confirm_switch_host(self) -> bool:
+        """已有连接时切换主机前先确认；没有连接直接放行。"""
+        if self.session is None or not self.session.connected:
+            return True
+        confirm = QMessageBox.question(
+            self,
+            "重新连接",
+            "当前已有连接，是否断开并连接其他主机？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return False
+        self._teardown_session()
+        return True
+
+    def _on_hosts_connect_requested(self, host_id: str) -> None:
+        host = self.host_store.get(host_id)
+        if host is None:
+            return
+        session = self.session
+        if session is not None and session.connected and session.host.id == host_id:
+            self.status.set_save_status(f"已经连接到 {host.display_name}")
+            return
+        if self._confirm_switch_host():
+            self._connect_to_host(host)
+
+    def _on_hosts_open_workspace(self, host_id: str, path: str) -> None:
+        host = self.host_store.get(host_id)
+        if host is None or not path:
+            return
+        session = self.session
+        if session is not None and session.connected and session.host.id == host_id:
+            # 同一台主机已经连着：直接切目录，不必重连
+            self._open_workspace(path, persist=True)
+            return
+        if self._confirm_switch_host():
+            self._connect_to_host(host, workspace=path)
+
+    def _on_hosts_secret_submitted(self, host_id: str, secret: str) -> None:
+        """侧边栏底部凭据输入行提交：密码 / 私钥口令只在这里经过一次内存。"""
+        host = self.host_store.get(host_id) or self._connecting_host
+        if host is None:
+            return
+        path = self._pending_open_path
+        if not self._confirm_switch_host():
+            return
+        if host.auth_method is AuthMethod.PRIVATE_KEY:
+            self._connect_to_host(host, passphrase=secret, workspace=path)
+        else:
+            self._connect_to_host(host, password=secret, workspace=path)
+
+    def _on_host_add(self) -> None:
+        dialog = HostFormDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        host = dialog.host_config()
+        try:
+            self.host_store.add(host)
+        except ConfigError as exc:
+            QMessageBox.warning(self, "无法保存主机", exc.message)
+            return
+        self.hosts_view.reload(selected_id=host.id)
+        self.status.set_save_status(f"已保存主机 {host.display_name}")
+
+    def _on_host_edit(self, host_id: str) -> None:
+        host = self.host_store.get(host_id)
+        if host is None:
+            return
+        dialog = HostFormDialog(self, host)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        updated = dialog.host_config()
+        try:
+            self.host_store.update(updated)
+        except ConfigError as exc:
+            QMessageBox.warning(self, "无法保存主机", exc.message)
+            return
+        self.hosts_view.reload(selected_id=updated.id)
+        self.status.set_save_status(f"主机 {updated.display_name} 已更新")
+
+    def _on_host_delete(self, host_id: str) -> None:
+        host = self.host_store.get(host_id)
+        if host is None:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "删除主机",
+            f"确定删除主机 {host.display_name} 吗？\n（只删除本机配置，不影响远端任何文件）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.host_store.delete(host_id)
+        self.hosts_view.reload()
+        self.status.set_save_status("主机已删除")
+
+    def _on_hosts_import_config(self) -> None:
+        """侧边栏的「从 ~/.ssh/config 导入」：结果写状态栏，不弹模态框。"""
+        try:
+            imported, skipped = import_hosts_from_ssh_config(self.host_store)
+        except OSError as exc:
+            QMessageBox.warning(self, "读取失败", f"无法读取 ~/.ssh/config：{exc}")
+            return
+        self.hosts_view.reload()
+        if not imported and not skipped:
+            self.status.set_save_status("~/.ssh/config 里没有可导入的主机")
+            return
+        self.status.set_save_status(f"从 ~/.ssh/config 导入 {imported} 台（跳过 {skipped} 条）")
 
     def _on_disconnect(self) -> None:
         if self.editor_tabs.dirty_documents():
@@ -602,6 +1026,7 @@ class MainWindow(QMainWindow):
         self._dir_cache.clear()
         self.file_tree.set_status_snapshot(None)
         self.scm_view.set_snapshot(None)
+        self._close_terminals()
         if session is not None:
             self.runner.submit(remote_ops.close_session, args=(session,))
         self._update_status_connection(False)
@@ -616,6 +1041,9 @@ class MainWindow(QMainWindow):
         if not connected:
             self.status.set_folder("-")
             self.status.set_git("-")
+        self._update_window_title()
+        # 侧边栏「远程资源管理器」：连接状态条 + 主机项加粗
+        self.hosts_view.set_connected(self.session.host if connected and self.session else None)
         # 活动栏与欢迎页跟随连接状态：未连接时「打开文件夹」是不可用入口
         self.activity_bar.set_enabled("open-folder", connected)
         self.welcome.set_connected(connected)
@@ -684,6 +1112,19 @@ class MainWindow(QMainWindow):
                 logger.warning("保存主机工作目录失败：%s", exc.message)
         self.status.set_folder(resolved)
         self.explorer_title.setText(posixpath.basename(resolved.rstrip("/")) or resolved)
+        self._update_window_title()
+        # 记住这台主机的历史工作目录（侧边栏「远程资源管理器」展开主机时能看到）
+        host = session.host
+        changed = host.remember_workspace(resolved)
+        if persist:
+            host.remote_workspace = resolved
+            changed = True
+        if changed:
+            try:
+                self.host_store.update(host)
+            except ConfigError as exc:
+                logger.warning("保存主机工作目录失败：%s", exc.message)
+        self.hosts_view.reload(selected_id=host.id)
         self.file_tree.set_root(resolved)
         self._update_explorer_state()
         self.scm_view.set_snapshot(None)
@@ -1161,9 +1602,11 @@ class MainWindow(QMainWindow):
                 return
             if clicked is discard_button:
                 self.editor_tabs.force_close(index)
+                self._update_window_title()
                 return
             return
         self.editor_tabs.force_close(index)
+        self._update_window_title()
 
     def _close_current_tab(self) -> None:
         document = self._current_document()
@@ -1251,6 +1694,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _on_document_activated(self, document: Optional[Document]) -> None:
         self._update_editor_stack()
+        self._update_window_title()
         if document is None:
             self.status.set_file("-")
             self.status.set_language("-")
@@ -1346,6 +1790,10 @@ class MainWindow(QMainWindow):
         if not self._confirm_exit_with_unsaved():
             event.ignore()
             return
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self._resize_filter)
+        self._close_terminals()
         session = self.session
         if session is not None:
             try:
@@ -1354,6 +1802,12 @@ class MainWindow(QMainWindow):
                 logger.warning("关闭会话失败：%s", exc)
         self.runner.shutdown()
         super().closeEvent(event)
+
+    def changeEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        """窗口最大化 / 还原时同步标题栏按钮图标（自己画的标题栏要自己跟状态）。"""
+        if event.type() == event.Type.WindowStateChange:
+            self.title_bar.sync_window_state()
+        super().changeEvent(event)
 
     def _confirm_exit_with_unsaved(self) -> bool:
         """退出前确认未保存文件；无未保存内容时直接返回 True。"""

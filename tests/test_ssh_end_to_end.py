@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import os
 import posixpath
+import select
 import shutil
 import socket
+import struct
 import subprocess
 import threading
 import time
@@ -32,6 +34,7 @@ from app.config.hosts import AuthMethod, HostConfig
 from app.git.git_client import GitClient
 from app.git.models import ChangeType
 from app.remote.session import RemoteSession
+from app.remote.shell_channel import ShellChannel
 from app.remote.sftp_client import SftpClient
 from app.remote.ssh_client import SSHClient, SSHConnectionOptions
 from app.ui import remote_ops
@@ -175,6 +178,10 @@ class LocalSSHServerInterface(paramiko.ServerInterface):
         self.authorized_fingerprint = authorized_fingerprint
         self.root = root
         self.shell_events: List[threading.Event] = []
+        #: 终端通道收到的窗口大小变更 ``(列, 行)``，供测试断言 SIGWINCH 真的送到了远端
+        self.window_changes: List[tuple] = []
+        #: 终端通道 -> 服务端 PTY 主设备（窗口大小要直接改在这里）
+        self._shell_masters: dict = {}
 
     def check_auth_publickey(self, username: str, key: paramiko.PKey) -> int:
         if username == USERNAME and key.get_fingerprint() == self.authorized_fingerprint:
@@ -204,10 +211,85 @@ class LocalSSHServerInterface(paramiko.ServerInterface):
         return True
 
     def check_channel_shell_request(self, channel) -> bool:
+        threading.Thread(target=self._run_shell, args=(channel,), daemon=True).start()
         return True
 
     def check_channel_pty_request(self, *args, **kwargs) -> bool:  # pragma: no cover
         return True
+
+    def check_channel_window_change_request(
+        self, channel, width, height, pixelwidth, pixelheight
+    ) -> bool:
+        """把窗口大小变更同步给服务端的 PTY（等价真实 sshd 的 SIGWINCH）。"""
+        self.window_changes.append((width, height))
+        master = self._shell_masters.get(channel)
+        if master is not None:
+            try:
+                import fcntl
+                import termios
+
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
+            except (ImportError, OSError):  # pragma: no cover - 非 POSIX 只记录不转发
+                pass
+        return True
+
+    def _run_shell(self, channel) -> None:
+        """起一个真实 bash（带 PTY）并与 SSH 通道双向转发。
+
+        非 POSIX 平台没有 ``pty``，这时直接关掉通道 —— 客户端的终端测试会因此跳过，
+        而不是给出一个假结果。
+        """
+        try:
+            import pty
+        except ImportError:  # pragma: no cover - Windows 上跑到这里
+            channel.close()
+            return
+        master, slave = pty.openpty()
+        env = dict(os.environ)
+        env["HOME"] = str(self.root)
+        env["TERM"] = "xterm-256color"
+        env["PS1"] = "$ "
+        env["PS2"] = "> "
+        process = subprocess.Popen(
+            ["/bin/bash", "--norc", "--noprofile", "-i"],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            cwd=str(self.root),
+            env=env,
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave)
+        self._shell_masters[channel] = master
+        try:
+            while process.poll() is None:
+                readable, _w, _x = select.select([channel, master], [], [], 0.2)
+                if channel in readable:
+                    data = channel.recv(65536)
+                    if not data:
+                        break
+                    os.write(master, data)
+                if master in readable:
+                    try:
+                        output = os.read(master, 65536)
+                    except OSError:  # pragma: no cover - PTY 已关闭
+                        break
+                    if output:
+                        try:
+                            channel.sendall(output)
+                        except (EOFError, OSError):  # pragma: no cover - 客户端已断开
+                            break
+        except (EOFError, OSError, ValueError, paramiko.SSHException):  # pragma: no cover
+            pass
+        finally:
+            self._shell_masters.pop(channel, None)
+            try:
+                channel.close()
+            finally:
+                os.close(master)
+                if process.poll() is None:
+                    process.terminate()
 
     def _run_command(self, channel, command_text: str, event: threading.Event) -> None:
         env = dict(os.environ)
@@ -241,6 +323,8 @@ class InProcessSSHServer:
 
     def __init__(self, root: Path, authorized_fingerprint: bytes) -> None:
         self.root = Path(root)
+        #: 每次连接建的 ServerInterface（测试要读它的 window_changes 等记录）
+        self.interfaces: List[LocalSSHServerInterface] = []
         self.host_key = paramiko.RSAKey.generate(2048)
         self.interface_factory = lambda: LocalSSHServerInterface(
             authorized_fingerprint, self.root
@@ -280,6 +364,7 @@ class InProcessSSHServer:
             "sftp", paramiko.SFTPServer, LocalSFTPServerInterface, str(self.root)
         )
         server = self.interface_factory()
+        self.interfaces.append(server)
         try:
             transport.start_server(server=server)
             while transport.is_active():
@@ -773,6 +858,77 @@ def test_folder_picker_over_real_sftp(
     finally:
         dialog.close()
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# 交互式终端：真实 shell 通道（PTY + bash）
+# ---------------------------------------------------------------------------
+
+
+def _collect_until(channel, needles: List[str], *, timeout: float = 10.0) -> str:
+    """读取通道输出直到出现任一关键字；返回目前收到的全部文本。"""
+    chunks: List[str] = []
+    closed = threading.Event()
+    channel.start_reader(chunks.append, closed.set)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        text = "".join(chunks)
+        if any(needle in text for needle in needles) or closed.is_set():
+            break
+        time.sleep(0.05)
+    return "".join(chunks)
+
+
+def test_shell_channel_runs_a_real_pty(ssh_client: SSHClient) -> None:
+    """在真实 SSH 上开一条 shell 通道，写入命令并读到回显。"""
+    shell = ShellChannel(ssh_client, cols=90, rows=25)
+    shell.open()
+    try:
+        # 先把命令写进去，再等回显（顺序反了就永远等不到）
+        shell.write("echo remote-editor-ok\n")
+        output = _collect_until(shell, ["remote-editor-ok"])
+    finally:
+        shell.close()
+
+    if "remote-editor-ok" not in output:
+        pytest.skip("当前环境的测试服务端没有可用的 shell（非 POSIX 或 PTY 不可用）")
+    assert shell.closed  # close() 之后读取线程与本标志都要停掉
+
+
+def test_shell_channel_resize_reaches_the_remote(
+    ssh_client: SSHClient, ssh_server: InProcessSSHServer
+) -> None:
+    """终端窗口大小变化要真的送到远端（vim / htop 靠它重排）。"""
+    shell = ShellChannel(ssh_client, cols=80, rows=24)
+    shell.open()
+    try:
+        shell.resize(120, 40)
+        deadline = time.time() + 5
+        arrived = False
+        while time.time() < deadline:
+            arrived = any(
+                (120, 40) in iface.window_changes for iface in ssh_server.interfaces
+            )
+            if arrived:
+                break
+            time.sleep(0.05)
+    finally:
+        shell.close()
+
+    if not arrived:
+        pytest.skip("当前环境的测试服务端没有可用的 shell（非 POSIX 或 PTY 不可用）")
+    assert (shell.cols, shell.rows) == (120, 40)
+
+
+def test_shell_channel_write_after_close_is_ignored(ssh_client: SSHClient) -> None:
+    shell = ShellChannel(ssh_client, cols=80, rows=24)
+    shell.open()
+    shell.close()
+
+    shell.write("ignored")
+    shell.resize(100, 30)  # 不应抛异常
+
+    assert shell.closed
 
 
 @pytest.fixture

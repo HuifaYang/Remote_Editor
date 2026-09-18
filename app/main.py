@@ -16,8 +16,9 @@ from PySide6.QtWidgets import QApplication
 
 from app.config.hosts import HostStore
 from app.config.settings import SettingsStore
+from app.ui.fonts import load_bundled_fonts
 from app.ui.main_window import MainWindow
-from app.ui.theme import apply_theme, get_theme
+from app.ui.theme import apply_theme, apply_ui_font, get_theme, reload_themes
 from app.utils.logging_setup import configure_logging, install_exception_hook
 from app.utils.paths import APP_NAME, APP_VERSION, resource_path
 
@@ -47,8 +48,13 @@ def build_application(argv: Optional[List[str]] = None) -> Tuple[QApplication, M
     if icon is not None:
         app.setWindowIcon(icon)
 
+    # 内置字体与主题都在启动时注册：程序自带资源，不依赖目标机器装了什么。
+    # 界面字号必须在建控件之前下发（见 apply_ui_font 的说明）。
+    load_bundled_fonts()
+    apply_ui_font(app)
     settings_store = SettingsStore()
     settings = settings_store.load()
+    reload_themes()
     apply_theme(app, get_theme(settings.theme))
 
     window = MainWindow(

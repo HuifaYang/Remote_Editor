@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # =====================================================================
-#  RemoteCodeEditor - Ubuntu 打包脚本（PyInstaller + AppImage）
+#  RemoteCodeEditor - Ubuntu 打包脚本（PyInstaller + AppImage + deb）
 #  依赖: python3-dev / python3-venv、PyInstaller、appimagetool（可自动下载）
-#  产物: dist/RemoteCodeEditor.AppImage（可选 .deb 见脚本末尾提示）
+#  产物: 免安装版 dist/RemoteCodeEditor.AppImage
+#        安装版   dist/RemoteCodeEditor_<版本>_<架构>.deb（用 dpkg -i 安装）
+#  跳过其中一种: SKIP_DEB=1（不做 deb）/ SKIP_APPIMAGE=1（不做 AppImage）
 #  适配: Ubuntu 22.04+
 # =====================================================================
 set -euo pipefail
@@ -16,31 +18,32 @@ APP_ID="remote-code-editor"
 ENTRY="main.py"
 ARCH="$(uname -m)"
 APPDIR="build/${APP_NAME}.AppDir"
+DEB_ROOT="build/deb"
 
 case "${ARCH}" in
-    x86_64|amd64) APPIMAGE_ARCH="x86_64" ;;
-    aarch64|arm64) APPIMAGE_ARCH="aarch64" ;;
-    armv7l) APPIMAGE_ARCH="armhf" ;;
-    *) APPIMAGE_ARCH="${ARCH}" ;;
+    x86_64|amd64) APPIMAGE_ARCH="x86_64"; DEB_ARCH="amd64" ;;
+    aarch64|arm64) APPIMAGE_ARCH="aarch64"; DEB_ARCH="arm64" ;;
+    armv7l) APPIMAGE_ARCH="armhf"; DEB_ARCH="armhf" ;;
+    *) APPIMAGE_ARCH="${ARCH}"; DEB_ARCH="${ARCH}" ;;
 esac
 
-echo "[1/6] 检查 Python 环境..."
+echo "[1/7] 检查 Python 环境..."
 command -v python3 >/dev/null 2>&1 || { echo "[错误] 未找到 python3。"; exit 1; }
 python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,9) else 1)' \
     || { echo "[错误] 需要 Python 3.9 或更高版本。"; exit 1; }
 
 VERSION="$(python3 -c 'import re,pathlib;print(re.search(r"APP_VERSION\s*=\s*\"([^\"]+)\"", pathlib.Path("app/utils/paths.py").read_text()).group(1))')"
 
-echo "[2/6] 检查打包依赖..."
+echo "[2/7] 检查打包依赖..."
 if ! python3 -c 'import PyInstaller' >/dev/null 2>&1; then
     echo "[提示] 未安装 PyInstaller，正在安装打包依赖..."
     python3 -m pip install --user -r requirements.txt
 fi
 
-echo "[3/6] 清理旧构建产物..."
-rm -rf build/"${APP_NAME}" dist "${APPDIR}" "${APP_NAME}.spec"
+echo "[3/7] 清理旧构建产物..."
+rm -rf build/"${APP_NAME}" dist "${APPDIR}" "${DEB_ROOT}" "${APP_NAME}.spec"
 
-echo "[4/6] 生成图标并打包可执行文件..."
+echo "[4/7] 生成图标并打包可执行文件..."
 python3 scripts/make_icon.py
 
 python3 -m PyInstaller \
@@ -54,6 +57,9 @@ python3 -m PyInstaller \
     --paths . \
     --hidden-import paramiko \
     --hidden-import pygments.lexers \
+    --hidden-import PySide6.QtSvg \
+    --hidden-import PySide6.QtOpenGLWidgets \
+    --hidden-import PySide6.QtOpenGL \
     --exclude-module PyQt5 \
     --exclude-module PyQt6 \
     --exclude-module PySide2 \
@@ -91,7 +97,7 @@ python3 -m PyInstaller \
 
 test -x "dist/${APP_NAME}" || { echo "[错误] 未生成 dist/${APP_NAME}"; exit 1; }
 
-echo "[5/6] 组装 AppDir..."
+echo "[5/7] 组装 AppDir..."
 mkdir -p "${APPDIR}/usr/bin" "${APPDIR}/usr/share/applications" \
          "${APPDIR}/usr/share/icons/hicolor/256x256/apps" "${APPDIR}/usr/share/metainfo"
 install -m 0755 "dist/${APP_NAME}" "${APPDIR}/usr/bin/${APP_NAME}"
@@ -137,7 +143,23 @@ cat > "${APPDIR}/usr/share/metainfo/${APP_ID}.appdata.xml" <<METAINFO
 </component>
 METAINFO
 
-echo "[6/6] 生成 AppImage..."
+echo "[6/7] 生成 deb 安装包..."
+if [ "${SKIP_DEB:-0}" = "1" ]; then
+    echo "[跳过] SKIP_DEB=1"
+elif ! command -v dpkg-deb >/dev/null 2>&1; then
+    echo "[提示] 未找到 dpkg-deb（非 Debian 系系统？），跳过 deb 安装包。"
+    echo "        可在 Debian/Ubuntu 上重新执行本脚本，或只用 AppImage。"
+else
+    bash scripts/build_deb.sh
+fi
+
+echo "[7/7] 生成 AppImage..."
+if [ "${SKIP_APPIMAGE:-0}" = "1" ]; then
+    echo "[跳过] SKIP_APPIMAGE=1（AppDir 已就绪: ${APPDIR}）"
+    echo
+    echo "全部完成。上述 dist/ 目录里的产物即为交付件。"
+    exit 0
+fi
 APPIMAGETOOL="$(command -v appimagetool || true)"
 if [ -z "${APPIMAGETOOL}" ] && [ -x "${ROOT_DIR}/tools/appimagetool-${APPIMAGE_ARCH}.AppImage" ]; then
     APPIMAGETOOL="${ROOT_DIR}/tools/appimagetool-${APPIMAGE_ARCH}.AppImage"
@@ -154,6 +176,7 @@ if [ -z "${APPIMAGETOOL}" ]; then
         echo "        可手动下载后放到 tools/ 目录，或 sudo apt install appimagetool。"
         echo "        AppDir 已就绪: ${APPDIR}"
         echo "        手动打包: ARCH=${APPIMAGE_ARCH} appimagetool ${APPDIR} dist/${APP_NAME}.AppImage"
+        echo "        （上面的 deb 安装包已经生成，可以直接用。）"
         exit 0
     fi
 fi
@@ -165,4 +188,7 @@ chmod +x "dist/${APP_NAME}.AppImage"
 echo
 echo "完成: dist/${APP_NAME}.AppImage"
 echo "验证: 在 Ubuntu 22.04+ 上 chmod +x 后双击或 ./dist/${APP_NAME}.AppImage"
-echo "可选 .deb: 可用 linuxdeploy / deb 打包工具基于 ${APPDIR} 生成，或 fpm -s dir -t deb -n ${APP_ID} -v ${VERSION} -C ${APPDIR} ."
+echo
+echo "免安装版: dist/${APP_NAME}.AppImage"
+echo "安装版:   dist/${APP_NAME}_${VERSION}_${DEB_ARCH}.deb"
+echo "资源替换: 主题 / 字体 / 文件图标主题放在 ~/.config/${APP_ID}/{themes,fonts,icon-themes}/ 下（见 docs/packaging.md）"

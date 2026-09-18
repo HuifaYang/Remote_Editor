@@ -142,6 +142,46 @@ def _draw_close(painter: QPainter, color: QColor) -> None:
     painter.drawLine(QPointF(11.4, 4.6), QPointF(4.6, 11.4))
 
 
+def _draw_minimize(painter: QPainter, color: QColor) -> None:
+    """最小化：一条横线。"""
+    painter.drawLine(QPointF(3.6, 8.0), QPointF(12.4, 8.0))
+
+
+def _draw_maximize(painter: QPainter, color: QColor) -> None:
+    """最大化：一个方框。"""
+    painter.drawRoundedRect(QRectF(3.8, 3.8, 8.4, 8.4), 0.8, 0.8)
+
+
+def _draw_restore(painter: QPainter, color: QColor) -> None:
+    """还原：两个叠起来的方框。"""
+    painter.drawRoundedRect(QRectF(3.0, 5.4, 7.6, 7.6), 0.8, 0.8)
+    painter.drawPolyline(_polyline([(5.6, 5.4), (5.6, 3.0), (13.0, 3.0), (13.0, 10.4), (10.6, 10.4)]))
+
+
+def _draw_plus(painter: QPainter, color: QColor) -> None:
+    """新增：一个加号（远程资源管理器里「新增主机」）。"""
+    painter.drawLine(QPointF(8.0, 3.4), QPointF(8.0, 12.6))
+    painter.drawLine(QPointF(3.4, 8.0), QPointF(12.6, 8.0))
+
+
+def _draw_download(painter: QPainter, color: QColor) -> None:
+    """导入：向下的箭头 + 底部托盘（把 ~/.ssh/config 里的主机收进来）。"""
+    painter.drawLine(QPointF(8.0, 3.0), QPointF(8.0, 10.2))
+    painter.drawPolyline(_polyline([(4.8, 7.2), (8.0, 10.4), (11.2, 7.2)]))
+    painter.drawPolyline(_polyline([(3.2, 11.6), (3.2, 13.2), (12.8, 13.2), (12.8, 11.6)]))
+
+
+def _draw_trash(painter: QPainter, color: QColor) -> None:
+    """删除：垃圾桶（右键菜单里删除主机 / 文件）。"""
+    painter.drawLine(QPointF(2.8, 4.6), QPointF(13.2, 4.6))
+    painter.drawPolyline(_polyline([(6.2, 4.4), (6.2, 2.8), (9.8, 2.8), (9.8, 4.4)]))
+    painter.drawPolyline(
+        _polyline([(3.8, 4.8), (4.6, 13.4), (11.4, 13.4), (12.2, 4.8)])
+    )
+    painter.drawLine(QPointF(6.6, 7.0), QPointF(6.9, 11.4))
+    painter.drawLine(QPointF(9.4, 7.0), QPointF(9.1, 11.4))
+
+
 DRAWERS: Dict[str, Callable[[QPainter, QColor], None]] = {
     "host": _draw_host,
     "disconnect": _draw_disconnect,
@@ -157,6 +197,12 @@ DRAWERS: Dict[str, Callable[[QPainter, QColor], None]] = {
     "settings": _draw_settings,
     "history": _draw_history,
     "close": _draw_close,
+    "minimize": _draw_minimize,
+    "maximize": _draw_maximize,
+    "restore": _draw_restore,
+    "plus": _draw_plus,
+    "download": _draw_download,
+    "trash": _draw_trash,
 }
 
 

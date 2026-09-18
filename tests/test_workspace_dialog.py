@@ -89,6 +89,8 @@ def test_picker_keeps_open_for_invalid_typed_path(qtbot, session, monkeypatch) -
     dialog.accept()
     qtbot.waitUntil(lambda: "无法读取" in dialog.status_label.text(), timeout=5000)
     assert dialog.result() != QDialog.DialogCode.Accepted
+    # 报错颜色走主题（severity 属性选择器），不再硬编码红色
+    assert dialog.status_label.property("severity") == "error"
 
 
 def test_picker_reports_listing_failure(qtbot, session, monkeypatch) -> None:

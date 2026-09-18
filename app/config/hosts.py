@@ -36,6 +36,9 @@ class AuthMethod(str, Enum):
 class HostConfig:
     """单台远程主机的连接信息。"""
 
+    #: 每台主机最多记住多少个最近打开的工作目录（远程资源管理器里展开可见）
+    RECENT_WORKSPACE_LIMIT = 8
+
     name: str = ""
     host: str = ""
     port: int = 22
@@ -43,6 +46,8 @@ class HostConfig:
     auth_method: AuthMethod = AuthMethod.PASSWORD
     private_key_path: str = ""
     remote_workspace: str = ""
+    #: 最近打开过的工作目录（新的在前）：侧边栏「远程资源管理器」展开主机时显示
+    recent_workspaces: List[str] = field(default_factory=list)
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
 
     # -- 展示 --------------------------------------------------------------
@@ -53,6 +58,20 @@ class HostConfig:
     @property
     def target(self) -> str:
         return f"{self.username}@{self.host}:{self.port}"
+
+    def remember_workspace(self, path: str, *, limit: int = 0) -> bool:
+        """把 ``path`` 记到最近工作目录的最前面（去重 + 限量），返回是否发生变化。"""
+        text = (path or "").strip()
+        if not text:
+            return False
+        size = limit or self.RECENT_WORKSPACE_LIMIT
+        recent = [item for item in self.recent_workspaces if item != text]
+        recent.insert(0, text)
+        recent = recent[:size]
+        if recent == self.recent_workspaces:
+            return False
+        self.recent_workspaces = recent
+        return True
 
     def validate(self) -> None:
         """基本合法性校验，失败抛 :class:`ConfigError`。"""
@@ -76,6 +95,7 @@ class HostConfig:
             "auth_method": self.auth_method.value,
             "private_key_path": self.private_key_path,
             "remote_workspace": self.remote_workspace,
+            "recent_workspaces": list(self.recent_workspaces),
         }
 
     @classmethod
@@ -111,6 +131,9 @@ class HostConfig:
             auth_method=auth,
             private_key_path=str(data.get("private_key_path", "")),
             remote_workspace=str(data.get("remote_workspace", "")),
+            recent_workspaces=[
+                str(item) for item in data.get("recent_workspaces", []) if str(item).strip()
+            ],
         )
 
 

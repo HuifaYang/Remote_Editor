@@ -2,6 +2,11 @@
 
 徽标是**画出来的图形**而不是文字后缀：一个填色的圆角方块加字母，位置固定在行的
 右端，因此名称再长也不会把它挤掉，滚动时也对齐成一条竖线。
+
+文件名文字本身**交给基类绘制**，本委托只把它的可用宽度收窄到徽标左侧
+（:meth:`subElementRect` 覆写），再补画徽标。原因：基类在带样式表时会按索引数据
+自行取文本，清空 ``option.text`` 并不能阻止它再画一遍，于是就出现「文件名画两遍、
+笔画错位叠加」的花屏。让基类独占文字绘制，样式表下的颜色与选中态也才和未变更行一致。
 """
 
 from __future__ import annotations
@@ -10,7 +15,12 @@ from typing import Optional
 
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPalette
-from PySide6.QtWidgets import QStyledItemDelegate, QStyleOptionViewItem, QWidget
+from PySide6.QtWidgets import (
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
+    QWidget,
+)
 
 #: 徽标字母（``U``/``A``/``M``/``D``/``R``/``!``）
 BADGE_ROLE = Qt.ItemDataRole.UserRole + 40
@@ -42,59 +52,38 @@ class BadgeDelegate(QStyledItemDelegate):
         return QRect(rect.right() - self._size - BADGE_MARGIN, top, self._size, self._size)
 
     def paint(self, painter, option, index) -> None:  # noqa: D102 - Qt 接口
+        # 文件名 / 图标与选中底色全部交给基类（它只在 subElementRect 收窄后的区域内
+        # 排版文字），本委托只额外补画右端的徽标
+        super().paint(painter, option, index)
         letter = index.data(BADGE_ROLE)
         if not letter:
-            super().paint(painter, option, index)
             return
-
-        opt = QStyleOptionViewItem(option)
-        self.initStyleOption(opt, index)
-        text = opt.text
-        # 先让基类只画背景（选中 / 悬停底色），文本与图标由我们自己排版，
-        # 否则长文件名会钻到徽标底下
-        opt.text = ""
-        super().paint(painter, opt, index)
+        background = index.data(BADGE_COLOR_ROLE) or option.palette.color(QPalette.ColorRole.Text)
+        if not isinstance(background, QColor):
+            background = QColor(background)
 
         painter.save()
         badge_rect = self.badge_rect(option)
-        text_left = option.rect.left() + 2
-        if not opt.icon.isNull():
-            icon_size = option.decorationSize
-            opt.icon.paint(
-                painter,
-                QRect(
-                    text_left,
-                    option.rect.center().y() - icon_size.height() // 2,
-                    icon_size.width(),
-                    icon_size.height(),
-                ),
-            )
-            text_left += icon_size.width() + 4
-        text_rect = QRect(
-            text_left,
-            option.rect.top(),
-            max(0, badge_rect.left() - 4 - text_left),
-            option.rect.height(),
-        )
-        colour = opt.palette.color(QPalette.ColorRole.Text)
-        painter.setPen(colour)
-        painter.drawText(
-            text_rect,
-            int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-            option.fontMetrics.elidedText(str(text), Qt.TextElideMode.ElideMiddle, text_rect.width()),
-        )
-
-        background = index.data(BADGE_COLOR_ROLE) or colour
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(background if isinstance(background, QColor) else QColor(background))
+        painter.setBrush(background)
         painter.drawRoundedRect(badge_rect, 3.5, 3.5)
         font = QFont(option.font)
         font.setBold(True)
         font.setPointSizeF(max(6.0, font.pointSizeF() - 1.5))
         painter.setFont(font)
-        painter.setPen(badge_text_color(background if isinstance(background, QColor) else QColor(background)))
+        painter.setPen(badge_text_color(background))
         painter.drawText(badge_rect, int(Qt.AlignmentFlag.AlignCenter), str(letter))
         painter.restore()
+
+    def subElementRect(  # noqa: D102 - Qt 接口
+        self, element: QStyle.SubElement, option: QStyleOptionViewItem, widget: Optional[QWidget] = None
+    ) -> QRect:
+        # 让基类把文件名排在徽标左侧，宽度不够时由基类自己打省略号，
+        # 这样「文字被画两遍」和「长文件名钻到徽标底下」两个问题一起消失
+        rect = super().subElementRect(element, option, widget)
+        if element == QStyle.SubElement.SE_ItemViewItemText and option.index.data(BADGE_ROLE):
+            rect.setRight(max(rect.left(), self.badge_rect(option).left() - 4))
+        return rect
 
     def sizeHint(self, option, index) -> QSize:  # noqa: D102 - Qt 接口
         size = super().sizeHint(option, index)

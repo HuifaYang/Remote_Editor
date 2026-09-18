@@ -31,11 +31,9 @@ from app.remote.session import RemoteSession
 from app.remote.sftp_client import RemoteEntry
 from app.ui import remote_ops
 from app.ui.tasks import TaskRunner
+from app.ui.theme import refresh_style
 
 PATH_ROLE = Qt.ItemDataRole.UserRole
-
-_STATUS_STYLE = "color: gray;"
-_ERROR_STYLE = "color: #c0392b;"
 
 
 class RemoteFolderPickerDialog(QDialog):
@@ -82,7 +80,7 @@ class RemoteFolderPickerDialog(QDialog):
 
         self.status_label = QLabel("", self)
         self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet(_STATUS_STYLE)
+        self.status_label.setProperty("muted", True)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self
@@ -93,6 +91,8 @@ class RemoteFolderPickerDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(10)
         layout.addWidget(intro)
         layout.addLayout(path_row)
         layout.addWidget(self.list_widget, 1)
@@ -207,5 +207,7 @@ class RemoteFolderPickerDialog(QDialog):
         self._set_status(f"无法获取远端家目录：{message}", error=True)
 
     def _set_status(self, text: str, *, error: bool = False) -> None:
-        self.status_label.setStyleSheet(_ERROR_STYLE if error else _STATUS_STYLE)
+        self.status_label.setProperty("muted", not error)
+        self.status_label.setProperty("severity", "error" if error else "")
+        refresh_style(self.status_label)
         self.status_label.setText(text)

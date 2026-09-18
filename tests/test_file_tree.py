@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QColor, QImage
 from app.git.git_client import FileStatus, build_tree_status
 from app.remote.sftp_client import RemoteEntry
 from app.ui.theme import DARK, LIGHT
@@ -14,7 +14,7 @@ from app.ui.widgets.file_tree import (
     ROW_HEIGHT,
     RemoteFileTree,
 )
-from app.ui.widgets.badge import BADGE_COLOR_ROLE, BADGE_ROLE
+from app.ui.widgets.badge import BADGE_COLOR_ROLE, BADGE_MARGIN, BADGE_ROLE, BADGE_SIZE
 
 ROOT = "/home/user/project"
 MAIN_C = f"{ROOT}/src/main.c"
@@ -34,6 +34,26 @@ def make_tree(qtbot, *, width: int = 420, theme=DARK) -> RemoteFileTree:
     tree.show()
     return tree
 
+
+def render_viewport(tree: RemoteFileTree) -> QImage:
+    """把文件树画到离屏图上，用于逐像素检查文字排版。"""
+    image = QImage(tree.viewport().size(), QImage.Format.Format_RGB32)
+    image.fill(QColor(DARK.panel_bg))
+    tree.viewport().render(image)
+    return image
+
+
+def ink_mask(image: QImage, rect: QRect) -> tuple:
+    """rect 内的「画上去的笔画」掩码：只关心有没有落笔，不关心具体颜色。
+
+    着色行与未着色行只差文字颜色，比颜色没意义，比笔画位置才能看出「画了两遍」。
+    """
+    background = QColor(DARK.panel_bg).rgb() & 0xFFFFFF
+    return tuple(
+        1 if (image.pixel(x, y) & 0xFFFFFF) != background else 0
+        for y in range(rect.top(), rect.bottom())
+        for x in range(rect.left(), rect.right())
+    )
 
 def snapshot_with_changes():
     statuses = {
@@ -279,6 +299,32 @@ def test_badge_disappears_when_file_becomes_clean(qtbot) -> None:
 
     assert child(tree, 0).text(0) == "main.c"
     assert child(tree, 0).data(0, BADGE_ROLE) == ""
+
+
+def test_badged_filename_is_drawn_only_once(qtbot, themed_app) -> None:
+    """着色行的文件名只画一遍，且笔画位置与未着色行一致。
+
+    回归用例：徽标委托曾自己画一遍文件名，基类在样式表下又画一遍，两遍笔画错位叠加，
+    看起来就像「有改动的文件名乱码」。
+    """
+    tree = make_tree(qtbot)
+    fill(tree, [make_entry("main.c", MAIN_C)])
+    item = item_for(tree, MAIN_C)
+    row = tree.visualItemRect(item)
+    # 只看徽标左侧的文字区，徽标本身的笔画不参与比较
+    text_rect = QRect(
+        row.left(), row.top(), row.width() - BADGE_SIZE - BADGE_MARGIN - 4, row.height()
+    )
+
+    tree.set_status_snapshot(snapshot_with_changes())
+    assert item.data(0, BADGE_ROLE) == "M"
+    colored = ink_mask(render_viewport(tree), text_rect)
+
+    tree.set_status_snapshot(build_tree_status(ROOT, branch="main"))
+    plain = ink_mask(render_viewport(tree), text_rect)
+
+    assert sum(colored) > 0  # 确实画出了文件名，而不是空白
+    assert colored == plain  # 着色没有让文件名多画一遍 / 挪位置
 
 
 def test_children_are_sorted_directories_first(qtbot) -> None:

@@ -2,7 +2,8 @@
 rem =====================================================================
 rem  RemoteCodeEditor - Windows 打包脚本
 rem  依赖: Python 3.9+ 与 PyInstaller (pip install -r requirements.txt)
-rem  产物: dist\RemoteCodeEditor.exe (单文件、无控制台、免 Python 环境)
+rem  产物: 免安装版 dist\RemoteCodeEditor.exe (单文件、无控制台、免 Python 环境)
+rem        安装版   dist\RemoteCodeEditor_<版本>_setup.exe (装了 NSIS 时自动生成)
 rem =====================================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0.."
@@ -10,7 +11,7 @@ cd /d "%~dp0.."
 set APP_NAME=RemoteCodeEditor
 set ENTRY=main.py
 
-echo [1/5] 检查 Python 环境...
+echo [1/6] 检查 Python 环境...
 where python >nul 2>nul
 if errorlevel 1 (
     echo [错误] 未找到 python，请先安装 Python 3.9+ 并加入 PATH。
@@ -22,19 +23,19 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/5] 检查打包依赖...
+echo [2/6] 检查打包依赖...
 python -c "import PyInstaller" >nul 2>nul
 if errorlevel 1 (
     echo [提示] 未安装 PyInstaller，正在安装打包依赖...
     python -m pip install -r requirements.txt || exit /b 1
 )
 
-echo [3/5] 清理旧构建产物...
+echo [3/6] 清理旧构建产物...
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist "%APP_NAME%.spec" del /q "%APP_NAME%.spec"
 
-echo [4/5] 生成图标与开始打包...
+echo [4/6] 生成图标与开始打包...
 python scripts\make_icon.py
 
 python -m PyInstaller ^
@@ -48,6 +49,9 @@ python -m PyInstaller ^
     --paths . ^
     --hidden-import paramiko ^
     --hidden-import pygments.lexers ^
+    --hidden-import PySide6.QtSvg ^
+    --hidden-import PySide6.QtOpenGLWidgets ^
+    --hidden-import PySide6.QtOpenGL ^
     --exclude-module PyQt5 ^
     --exclude-module PyQt6 ^
     --exclude-module PySide2 ^
@@ -87,13 +91,24 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [5/5] 完成。
+echo [5/6] 完成（免安装版）。
 if exist "dist\%APP_NAME%.exe" (
     echo 产物: dist\%APP_NAME%.exe
     echo 提示: 请在一台未安装 Python 的干净 Win10/Win11 机器上双击验证。
 ) else (
     echo [错误] 未找到 dist\%APP_NAME%.exe
     exit /b 1
+)
+
+echo [6/6] 生成安装包（可选）...
+where makensis >nul 2>nul
+if errorlevel 1 (
+    echo [提示] 未安装 NSIS，跳过安装包。需要时:
+    echo         winget install NSIS.NSIS
+    echo         然后执行 scripts\build_windows_installer.bat
+) else (
+    call "%~dp0build_windows_installer.bat"
+    if errorlevel 1 echo [警告] 安装包生成失败，免安装版不受影响。
 )
 
 endlocal
