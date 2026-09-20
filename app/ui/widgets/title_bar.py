@@ -30,12 +30,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenuBar,
-    QToolButton,
     QWidget,
 )
 
 from app.ui.icons import render_pixmap
 from app.ui.theme import Theme
+from app.ui.widgets.fade_button import FadeButton
 
 TITLE_BAR_HEIGHT = 34
 WINDOW_BUTTON_SIZE = QSize(46, TITLE_BAR_HEIGHT)
@@ -51,15 +51,15 @@ WINDOW_BUTTONS = (
 )
 
 
-def _window_icon(name: str, normal: QColor, active: QColor) -> QIcon:
+def _window_icon(name: str, normal: QColor, active: QColor, size: int = TITLE_ICON_SIZE) -> QIcon:
     """窗口按钮图标：正常态用主题前景灰，悬停（``QIcon.Mode.Active``）用高对比色。
 
     关闭按钮悬停时底色是警示红，所以图标必须能在红底上看得清。
     """
     icon = QIcon()
     for scale in (1, 2):
-        icon.addPixmap(render_pixmap(name, normal, TITLE_ICON_SIZE * scale))
-        icon.addPixmap(render_pixmap(name, active, TITLE_ICON_SIZE * scale), QIcon.Mode.Active)
+        icon.addPixmap(render_pixmap(name, normal, size * scale))
+        icon.addPixmap(render_pixmap(name, active, size * scale), QIcon.Mode.Active)
     return icon
 
 
@@ -78,6 +78,7 @@ class TitleBar(QWidget):
         self._window = window
         self._drag_origin: Optional[QPoint] = None
         self._theme: Optional[Theme] = None
+        self._ui_scale: float = 1.0
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(6, 0, 0, 0)
@@ -98,13 +99,11 @@ class TitleBar(QWidget):
 
         self._buttons = {}
         for object_name, icon_name, tooltip in WINDOW_BUTTONS:
-            button = QToolButton(self)
+            button = FadeButton(QColor("#888888"), radius=0.0, parent=self)
             button.setObjectName(object_name)
             button.setToolTip(tooltip)
             button.setFixedSize(WINDOW_BUTTON_SIZE)
             button.setIconSize(QSize(TITLE_ICON_SIZE, TITLE_ICON_SIZE))
-            button.setAutoRaise(True)
-            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             layout.addWidget(button)
             self._buttons[object_name] = button
 
@@ -114,13 +113,30 @@ class TitleBar(QWidget):
         self.sync_window_state()
 
     # -- 状态同步 ----------------------------------------------------------
-    def apply_theme(self, theme: Theme) -> None:
-        """按主题重建窗口按钮图标（正常态灰、悬停高对比）。"""
+    def apply_theme(self, theme: Theme, *, ui_scale: float = 1.0) -> None:
+        """按主题重建窗口按钮图标，并按全局缩放重算栏高 / 按钮 / 图标尺寸。
+
+        VSCode 的窗口缩放是「整个界面一起变大」，标题栏高度与按钮尺寸也要随字号走。
+        """
         self._theme = theme
+        self._ui_scale = max(0.5, min(3.0, float(ui_scale)))
+        scale = self._ui_scale
+        self.setFixedHeight(round(TITLE_BAR_HEIGHT * scale))
+        icon_size = round(TITLE_ICON_SIZE * scale)
+        button_size = QSize(
+            round(WINDOW_BUTTON_SIZE.width() * scale),
+            round(TITLE_BAR_HEIGHT * scale),
+        )
         normal = theme.color("status_fg")
         active = theme.color("editor_fg")
+        # 三个窗口按钮的悬停底色统一为中性灰（与 VSCode 一致：关闭不再是单独的红块）
+        hover_neutral = theme.color("list_hover")
         for object_name, icon_name, _tooltip in WINDOW_BUTTONS:
-            self._buttons[object_name].setIcon(_window_icon(icon_name, normal, active))
+            button = self._buttons[object_name]
+            button.setFixedSize(button_size)
+            button.setIconSize(QSize(icon_size, icon_size))
+            button.setIcon(_window_icon(icon_name, normal, active, icon_size))
+            button.set_hover_color(hover_neutral)
 
     def set_title(self, text: str) -> None:
         self.title_label.setText(text)
@@ -142,7 +158,10 @@ class TitleBar(QWidget):
         button.setToolTip("还原" if maximized else "最大化")
         color = self._theme.color("status_fg") if self._theme else QColor("#cccccc")
         active = self._theme.color("editor_fg") if self._theme else QColor("#ffffff")
-        button.setIcon(_window_icon("restore" if maximized else "maximize", color, active))
+        icon_size = round(TITLE_ICON_SIZE * self._ui_scale)
+        button.setIcon(
+            _window_icon("restore" if maximized else "maximize", color, active, icon_size)
+        )
 
     # -- 拖动 --------------------------------------------------------------
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: D102 - Qt 接口

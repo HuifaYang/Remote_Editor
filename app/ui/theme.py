@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 from PySide6.QtWidgets import QApplication, QWidget
 
+from app.config.settings import FONT_SIZE_DEFAULT
 from app.ui.fonts import preferred_monospace_family, preferred_ui_family
 from app.utils.paths import config_dir, ensure_dir, resource_path, temp_dir
 
@@ -502,6 +503,19 @@ def reload_themes() -> Tuple[Theme, ...]:
 #: 实际字号 = 该值 × ``ui_scale``（Ctrl+= / Ctrl+- 的全局缩放），见 :func:`apply_theme`。
 UI_FONT_POINT_SIZE = 10.0
 
+#: 界面尺寸比例的基准字号（= 编辑器默认字号）。图标 / 间距按「当前字号 ÷ 基准」缩放。
+UI_FONT_BASE_SIZE = float(FONT_SIZE_DEFAULT)
+
+
+def ui_metric_scale(zoom_level: float, font_size: float) -> float:
+    """界面尺寸（图标 / 间距 / 控件尺寸）的相对比例。
+
+    = 全局缩放 × (字号 ÷ 基准字号)。字号调大时图标与间距同步变大，
+    这样「图标明显大于文字」的比例不会随字号变化而垮掉。
+    """
+    base = UI_FONT_BASE_SIZE if UI_FONT_BASE_SIZE > 0 else 1.0
+    return float(zoom_level) * (float(font_size) / base)
+
 #: 需要统一施加「界面字体 + 字号」的外壳控件。刻意**不含** QPlainTextEdit / QTextEdit：
 #: 编辑器与日志视图有各自的等宽字体，不能被界面字体覆盖。
 _UI_FONT_SELECTORS = (
@@ -597,14 +611,23 @@ def _glyph_urls(theme: Theme) -> Dict[str, str]:
     }
 
 
-def ui_font() -> QFont:
-    """界面字体：沿用系统界面字体族，只把字号调到现代编辑器常用的 10pt。"""
+def ui_font(size: Optional[float] = None) -> QFont:
+    """界面字体：沿用系统界面字体族，字号与编辑器一致（默认取设置的 font_size）。
+
+    显式开抗锯齿与高质量 hinting：Qt 默认只按字体自身标志渲染，
+    在深色底上文字容易发「毛」、偏单薄（与 VSCode 的 Chromium 亚像素渲染差距
+    主要在这）。``PreferFullHinting`` + ``PreferAntialias`` 让边缘平滑得多。
+    """
     font = QFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont))
-    font.setPointSizeF(UI_FONT_POINT_SIZE)
+    font.setPointSizeF(float(size) if size else UI_FONT_POINT_SIZE)
+    font.setStyleStrategy(
+        QFont.StyleStrategy.PreferAntialias | QFont.StyleStrategy.PreferQuality
+    )
+    font.setHintingPreference(QFont.HintingPreference.PreferFullHinting)
     return font
 
 
-def apply_ui_font(app: QApplication) -> None:
+def apply_ui_font(app: QApplication, font_size: Optional[float] = None) -> None:
     """设置界面字号。**必须在建任何控件之前调用**。
 
     Qt/PySide 在本机版本上「控件已经存在之后再改 QApplication 字体」会埋雷：
@@ -612,7 +635,7 @@ def apply_ui_font(app: QApplication) -> None:
     见 tests/test_file_tree.py 的徽标渲染用例）。所以字体只在启动阶段设一次，
     ``apply_theme`` 只管调色板与样式表。
     """
-    app.setFont(ui_font())
+    app.setFont(ui_font(font_size))
 
 
 def refresh_style(widget: QWidget) -> None:
@@ -628,6 +651,7 @@ def apply_theme(
     *,
     ui_scale: float = 1.0,
     ui_family: str = "",
+    ui_font_size: Optional[float] = None,
 ) -> None:
     """把主题应用到 QApplication（调色板 + 样式表 + 界面字体）。
 
@@ -652,13 +676,29 @@ def apply_theme(
     # 界面字体：显式指定字体族与字号（而不是只改 QApplication 字体），
     # 这样 Ctrl+= 缩放只改样式表就能整体生效，不需要在运行时改应用字体。
     scale = max(0.5, min(3.0, float(ui_scale)))
-    font_rules = f"font-size: {UI_FONT_POINT_SIZE * scale:g}pt;"
+    # 界面字号与编辑器字号一致：默认取设置里的 font_size（编辑器字号），
+    # 不再是写死的 UI_FONT_POINT_SIZE —— 这样「设置 → 字号」改一处，
+    # 界面和代码一起变；Ctrl± 缩放也同步。
+    base_size = float(ui_font_size) if ui_font_size else UI_FONT_POINT_SIZE
+    font_rules = f"font-size: {base_size * scale:g}pt;"
+
+    #: 尺寸比例：不仅随缩放变，也随字号按比例变，保证图标 / 间距与文字的比例稳定
+    metric_scale = ui_metric_scale(scale, base_size)
+
+    def px(value: float) -> int:
+        """把基础像素尺寸按「缩放 × 字号比例」换算（对齐 VSCode 的窗口缩放：
+        间距、圆角、控件高度都随字号一起变，不是只放大文字）。1px 分隔线不缩放。"""
+        return max(1, round(value * metric_scale))
     family = ui_family or preferred_ui_family()
     if family:
         font_rules = f'font-family: "{family}"; ' + font_rules
     # 分隔线：深色主题下 border 与底色太接近，边界会「糊」在一起，
-    # 这里向文本色靠一点，保证区域边界看得出来（VSCode 靠区域底色差，我们两者都要）
-    divider = _blend(theme.border, theme.editor_fg, 0.18 if theme.dark else 0.10)
+    # 这里向文本色靠一大步，并保证一个最低亮度（GitHub Dark 的 border 只有 #21262d，
+    # 混 18% 仍是几乎不可见的暗灰，Qt 的 1px 整数像素线根本撑不起来）
+    divider_ratio = 0.34 if theme.dark else 0.10
+    divider = _blend(theme.border, theme.editor_fg, divider_ratio)
+    if theme.dark and QColor(divider).lightness() < 90:
+        divider = _blend("#8b949e", theme.border, 0.42)
     # 滚动条滑块：半透明，能浮在侧边栏 / 编辑器任意底色上（VSCode 同款做法）
     slider = _rgba(theme.editor_fg, 0.20)
     slider_hover = _rgba(theme.editor_fg, 0.32)
@@ -673,46 +713,84 @@ def apply_theme(
     qss = (
         f"""
         QMainWindow, QDialog {{ background: {theme.window_bg}; }}
+        /* 无边框对话框（设置等）：圆角 + 描边，标题栏与主窗口同款。
+           只作用于 objectName=frameless_dialog，避免给仍带系统边框的对话框加圆角露白 */
+        QDialog#frameless_dialog {{ border: 1px solid {divider}; border-radius: {px(8)}px; }}
+        QWidget#dialog_title_bar {{ background: {theme.menu_bg};
+                                    border-bottom: 1px solid {divider};
+                                    border-top-left-radius: {px(8)}px;
+                                    border-top-right-radius: {px(8)}px; }}
+        QLabel#dialog_title_label {{ color: {theme.editor_fg}; font-weight: bold;
+                                      padding: {px(9)}px 0px; }}
+        QLabel#settings_section_title {{ color: {muted}; }}
+
+        /* 源代码管理：提交按钮用主色（VSCode 的「提交」也是实心强调色），
+           有提交信息且有更改时才可点，禁用态退回普通底色 */
+        QPushButton#scm_commit {{ background: {theme.accent}; color: #ffffff;
+                                  border: 0px; border-radius: {px(4)}px;
+                                  padding: {px(6)}px {px(10)}px; }}
+        QPushButton#scm_commit:hover {{ background: {accent_hover}; }}
+        QPushButton#scm_commit:pressed {{ background: {theme.accent}; }}
+        QPushButton#scm_commit:disabled {{ background: {theme.panel_bg};
+                                           color: {muted};
+                                           border: 1px solid {theme.border}; }}
+        QLabel#scm_section_title {{ color: {theme.editor_fg}; font-weight: bold; }}
+
+        /* Gutter 点击弹出的 diff 预览浮层（仿 VSCode peek） */
+        QFrame#peek_diff {{ background: {theme.panel_bg};
+                            border: 1px solid {divider}; border-radius: {px(6)}px; }}
+        QLabel#peek_diff_title {{ color: {muted}; padding: {px(2)}px 0px; }}
+        QFrame#peek_diff QPlainTextEdit {{ background: {theme.editor_bg};
+                                            border: 0px;
+                                            border-bottom-left-radius: {px(6)}px;
+                                            border-bottom-right-radius: {px(6)}px; }}
         {_UI_FONT_SELECTORS} {{ {font_rules} }}
         QWidget#title_bar {{ background: {theme.menu_bg};
                             border-bottom: 1px solid {divider}; }}
         QLabel#title_label {{ color: {theme.status_fg}; }}
         QMenuBar#title_menu_bar {{ background: transparent; padding: 0px; }}
-        QMenuBar#title_menu_bar::item {{ padding: 3px 8px; }}
+        QMenuBar#title_menu_bar::item {{ padding: {px(3)}px {px(8)}px; }}
+        /* 窗口按钮的悬停底色由 FadeButton 自绘（带淡入淡出动画），
+           这里只清掉 QToolButton 自己的背景 / 边框，避免双重绘制 */
         QToolButton#window_minimize, QToolButton#window_maximize, QToolButton#window_close {{
             background: transparent; border: 0px; border-radius: 0px; padding: 0px; }}
-        QToolButton#window_minimize:hover, QToolButton#window_maximize:hover {{
-            background: {theme.list_hover}; }}
-        QToolButton#window_close:hover {{ background: {theme.syntax_error}; }}
-        QWidget#activity_bar {{ background: {theme.panel_bg};
+        /* 活动栏与编辑区同深（editor_bg），侧边栏 panel_bg 更深一档，
+           对齐 VSCode GitHub Dark：activityBar #0d1117 = editor，sideBar #010409 更深 */
+        QWidget#activity_bar {{ background: {theme.editor_bg};
                                border-right: 1px solid {divider}; }}
         QWidget#side_panel {{ border-right: 1px solid {divider}; }}
         QLabel[muted="true"] {{ color: {muted}; }}
         QLabel[severity="error"] {{ color: {theme.syntax_error}; }}
         QToolTip {{ color: {theme.editor_fg}; background: {theme.panel_bg};
-                    border: 1px solid {theme.border}; border-radius: 3px; padding: 3px 6px; }}
+                    border: 1px solid {theme.border}; border-radius: {px(3)}px; padding: {px(3)}px {px(6)}px; }}
 
-        QMenuBar {{ background: {theme.menu_bg}; color: {theme.status_fg}; padding: 2px 4px; }}
-        QMenuBar::item {{ background: transparent; padding: 4px 8px; border-radius: 4px; }}
+        QMenuBar {{ background: {theme.menu_bg}; color: {theme.status_fg}; padding: {px(2)}px {px(4)}px; }}
+        QMenuBar::item {{ background: transparent; padding: {px(4)}px {px(8)}px; border-radius: {px(4)}px; }}
         QMenuBar::item:selected {{ background: {theme.list_hover}; color: {theme.editor_fg}; }}
         QMenu {{ background: {theme.panel_bg}; color: {theme.editor_fg};
-                 border: 1px solid {theme.border}; border-radius: 4px; padding: 4px; }}
-        QMenu::item {{ padding: 5px 28px 5px 20px; border-radius: 4px; }}
+                 border: 1px solid {theme.border}; border-radius: {px(4)}px; padding: {px(4)}px; }}
+        QMenu::item {{ padding: {px(5)}px {px(28)}px {px(5)}px {px(20)}px; border-radius: {px(4)}px; }}
         QMenu::item:selected {{ background: {theme.list_selection}; color: {selection_fg}; }}
-        QMenu::separator {{ height: 1px; background: {theme.border}; margin: 4px 8px; }}
+        QMenu::separator {{ height: 1px; background: {theme.border}; margin: {px(4)}px {px(8)}px; }}
 
-        QToolBar {{ background: {theme.toolbar_bg}; border: 0px; spacing: 2px; padding: 3px 6px; }}
-        QToolBar::separator {{ background: {theme.border}; width: 1px; margin: 5px 6px; }}
+        QToolBar {{ background: {theme.toolbar_bg}; border: 0px; spacing: {px(2)}px; padding: {px(3)}px {px(6)}px; }}
+        QToolBar::separator {{ background: {theme.border}; width: 1px; margin: {px(5)}px {px(6)}px; }}
         QToolButton {{ background: transparent; color: {theme.editor_fg};
-                       border: 1px solid transparent; border-radius: 4px; padding: 4px 6px; }}
+                       border: 1px solid transparent; border-radius: {px(4)}px; padding: {px(4)}px {px(6)}px; }}
         QToolButton:hover {{ background: {theme.list_hover}; }}
         QToolButton:pressed {{ background: {theme.list_selection}; }}
         QToolButton:checked {{ background: {theme.list_selection}; }}
+        QWidget#activity_bar QToolButton:checked {{ background: transparent;
+                              border-left: 2px solid {theme.accent};
+                              padding-left: 0px; }}
+        QWidget#activity_bar QToolButton {{ border-left: 2px solid transparent; }}
         QToolButton:disabled {{ color: {muted}; }}
 
         QStatusBar {{ background: {theme.status_bar_bg}; color: {theme.status_bar_fg};
                       border: 0px; border-top: 1px solid {divider}; }}
-        QStatusBar QLabel {{ color: {theme.status_bar_fg}; padding: 0px 5px; }}
+        QStatusBar QLabel {{ color: {theme.status_bar_fg}; padding: 0px {px(2)}px; }}
+        QStatusBar QLabel[statusItem="true"] {{ border-radius: {px(4)}px; }}
+        QStatusBar QLabel[statusItem="true"]:hover {{ background: {theme.list_hover}; }}
         QStatusBar::item {{ border: 0px; }}
 
         QWidget#terminal_panel {{ background: {theme.editor_bg};
@@ -720,64 +798,86 @@ def apply_theme(
         QWidget#terminal_panel QTabWidget::pane {{ border: 0px; }}
         QDockWidget {{ border: 0px; }}
         QDockWidget::title {{ background: {theme.panel_bg}; color: {theme.status_fg};
-                              padding: 4px 8px; border-bottom: 1px solid {theme.border}; }}
-        QSplitter::handle {{ background: {divider}; }}
-        QSplitter::handle:horizontal {{ width: 1px; }}
-        QSplitter::handle:vertical {{ height: 1px; }}
-        QSplitter::handle:hover {{ background: {theme.accent}; }}
+                              padding: {px(4)}px {px(8)}px; border-bottom: 1px solid {theme.border}; }}
+        /* 面板分隔条：热区放宽到 6px 方便抓握，默认只画中央 1px 细线；
+           悬停 / 拖动时整条淡成 accent 高亮（对齐 VSCode：边界本身可拖，
+           这条高亮就是「这里能拖」的视觉提示）。用 border 画中央线避免布局抖动。 */
+        QSplitter::handle {{ background: transparent; }}
+        QSplitter::handle:horizontal {{
+            width: {px(6)}px; margin: 0px;
+            border-left: 1px solid {divider};
+        }}
+        QSplitter::handle:vertical {{
+            height: {px(6)}px; margin: 0px;
+            border-top: 1px solid {divider};
+        }}
+        QSplitter::handle:hover, QSplitter::handle:pressed {{
+            background: {_rgba(theme.accent, 0.25)};
+        }}
+        QSplitter::handle:horizontal:hover, QSplitter::handle:horizontal:pressed {{
+            border-left: 1px solid {theme.accent};
+        }}
+        QSplitter::handle:vertical:hover, QSplitter::handle:vertical:pressed {{
+            border-top: 1px solid {theme.accent};
+        }}
 
         QTabWidget::pane {{ border: 0px; }}
         QTabBar {{ background: {theme.tab_inactive_bg};
                   border-bottom: 1px solid {divider}; }}
         QTabBar::tab {{ background: {theme.tab_inactive_bg}; color: {muted};
-                        padding: 6px 12px; border: 0px; border-right: 1px solid {divider};
+                        padding: {px(6)}px {px(12)}px; border: 0px; border-right: 1px solid {divider};
                         border-top: 2px solid transparent; }}
         QTabBar::tab:selected {{ background: {theme.tab_active_bg}; color: {theme.editor_fg};
                                  border-top: 2px solid {theme.accent}; }}
         QTabBar::tab:hover:!selected {{ background: {theme.list_hover}; }}
         QToolButton#tab_close {{ background: transparent; border: 0px; padding: 0px; }}
-        QToolButton#tab_close:hover {{ background: {theme.list_hover}; border-radius: 3px; }}
+        QToolButton#tab_close:hover {{ background: {theme.list_hover}; border-radius: {px(3)}px; }}
 
         QHeaderView::section {{ background: {theme.panel_bg}; color: {theme.status_fg};
                                 border: 0px; border-right: 1px solid {theme.border};
-                                border-bottom: 1px solid {theme.border}; padding: 3px 6px; }}
+                                border-bottom: 1px solid {theme.border}; padding: {px(3)}px {px(6)}px; }}
 
         QTreeView, QListView, QTableView {{ background: {theme.panel_bg}; color: {theme.editor_fg};
                                             border: 0px; outline: 0px;
                                             show-decoration-selected: 1; }}
+        /* 树 / 列表行：加内边距与圆角，选中用浅底而不是实心 accent（VSCode 风格），
+           深色主题下 accent 整行填充会显得很「沉」 */
+        QTreeView::item, QListView::item {{ padding: {px(3)}px {px(4)}px; border-radius: {px(4)}px;
+                                            margin: 0px {px(2)}px; }}
         QTreeView::item:hover, QListView::item:hover {{ background: {theme.list_hover}; }}
-        QTreeView::item:selected {{ background: {theme.list_selection}; color: {selection_fg}; }}
+        QTreeView::item:selected {{ background: {theme.list_inactive_selection};
+                                    color: {theme.editor_fg}; }}
         QTreeView::item:selected:!active {{ background: {theme.list_inactive_selection}; }}
-        QListWidget::item {{ padding: 3px 4px; border-radius: 3px; }}
+        QListWidget::item {{ padding: {px(3)}px {px(4)}px; border-radius: {px(3)}px; }}
 
         QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTextEdit {{
             background: {theme.editor_bg}; color: {theme.editor_fg};
-            border: 1px solid {control_border}; border-radius: 4px; padding: 3px 6px;
+            border: 1px solid {control_border}; border-radius: {px(4)}px; padding: {px(3)}px {px(6)}px;
             selection-background-color: {theme.selection}; }}
         QLineEdit:focus, QSpinBox:focus, QComboBox:focus {{
             border: 1px solid {theme.accent}; }}
         QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{
             color: {muted}; background: {theme.panel_bg}; }}
 
-        QComboBox::drop-down {{ border: 0px; width: 20px; }}
+        QComboBox::drop-down {{ border: 0px; width: {px(20)}px; }}
         QComboBox::down-arrow {{ image: {glyphs["arrow_down"]};
-                                 width: 12px; height: 12px; }}
+                                 width: {px(12)}px; height: {px(12)}px; }}
         QComboBox QAbstractItemView {{ background: {theme.panel_bg}; color: {theme.editor_fg};
-                                       border: 1px solid {theme.border}; border-radius: 4px;
-                                       padding: 4px; outline: 0px;
+                                       border: 1px solid {theme.border}; border-radius: {px(4)}px;
+                                       padding: {px(4)}px; outline: 0px;
                                        selection-background-color: {theme.list_selection};
                                        selection-color: {selection_fg}; }}
 
         QSpinBox::up-button, QSpinBox::down-button {{
-            background: transparent; border: 0px; width: 18px; }}
+            background: transparent; border: 0px; width: {px(18)}px; }}
         QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
             background: {theme.list_hover}; }}
-        QSpinBox::up-arrow {{ image: {glyphs["arrow_up"]}; width: 11px; height: 11px; }}
-        QSpinBox::down-arrow {{ image: {glyphs["arrow_down"]}; width: 11px; height: 11px; }}
+        QSpinBox::up-arrow {{ image: {glyphs["arrow_up"]}; width: {px(11)}px; height: {px(11)}px; }}
+        QSpinBox::down-arrow {{ image: {glyphs["arrow_down"]}; width: {px(11)}px; height: {px(11)}px; }}
 
         QPushButton {{ background: {theme.toolbar_bg}; color: {theme.editor_fg};
-                       border: 1px solid {control_border}; border-radius: 4px;
-                       padding: 5px 14px; }}
+                       border: 1px solid {control_border}; border-radius: {px(4)}px;
+                       padding: {px(5)}px {px(14)}px; }}
         QPushButton:hover {{ background: {theme.list_hover}; }}
         QPushButton:pressed {{ background: {theme.list_selection}; }}
         QPushButton:checked {{ background: {theme.list_selection}; color: {selection_fg}; }}
@@ -787,8 +887,8 @@ def apply_theme(
         QPushButton:disabled {{ color: {muted}; background: {theme.panel_bg};
                                 border-color: {theme.border}; }}
 
-        QCheckBox, QRadioButton {{ color: {theme.editor_fg}; spacing: 6px; }}
-        QCheckBox::indicator, QRadioButton::indicator {{ width: 15px; height: 15px; }}
+        QCheckBox, QRadioButton {{ color: {theme.editor_fg}; spacing: {px(6)}px; }}
+        QCheckBox::indicator, QRadioButton::indicator {{ width: {px(15)}px; height: {px(15)}px; }}
         QCheckBox::indicator:unchecked, QRadioButton::indicator:unchecked {{
             border: 1px solid {control_border}; border-radius: 3px;
             background: {theme.editor_bg}; }}

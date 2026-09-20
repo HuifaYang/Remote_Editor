@@ -5,6 +5,127 @@
 
 ---
 
+## 2026-09-20
+
+主题：**界面「去粗糙感」、真正可用的 Markdown 预览、源代码管理能提交**。
+
+用户连续反馈「界面有股复古感 / 不像 VSCode 那么现代 / 图标应该比字大 / 预览字体和
+代码不一致 / 为什么启动没变化」。逐条定位后发现都不是「观感问题」，而是有具体成因的
+技术债，这轮全部按根因修掉。
+
+### 1. 界面显旧的三件事（对照 VSCode 截图逐项比出来的）
+
+| 现象 | 根因 | 修法 |
+| --- | --- | --- |
+| 图标粗糙、没精神 | `icons.py` 是 QPainter 手画的 16px 线条，粗细不匀、视觉不居中 | 换成 VSCode 官方 **Codicons SVG**（`assets/ui-icons/`，CC-BY 4.0）：SVG 里的 `currentColor` 在渲染前替换成主题色，走 PySide6 自带的 `QtSvg`，**不新增依赖**；没有对应 SVG 的图标仍回退手画 |
+| 没有清晰边界、一片糊 | GitHub Dark 的 `border` 只有 `#21262d`，分隔线按 18% 混前景色仍是几乎不可见的暗灰 | 混合比提到 34% 并加**亮度下限**；活动栏改用 `editor_bg`（与编辑区同深），侧边栏 `panel_bg` 更深一档，形成 VSCode 的明度阶梯 |
+| 文字发毛、偏单薄 | 没开字体抗锯齿 / hinting | `ui_font()` 显式 `PreferAntialias | PreferQuality` + `PreferFullHinting` |
+
+### 2. `Ctrl±` 变成「整个界面」缩放（之前只放大文字）
+
+`Ctrl+=` / `Ctrl+-` 的语义早就定为全局缩放，但实现只把系数折进了 `font-size` ——
+图标、间距、活动栏宽度、标题栏高度全是写死像素，所以放大后「字大了、框没大」。
+
+新增 `ui_metric_scale(zoom, font_size) = 缩放 × (字号 ÷ 基准字号)`，QSS 的
+`px()` 与各组件的固定尺寸（活动栏 / 标题栏 / 文件树 / 主机树）全部按它换算。
+
+### 3. 界面字号与代码字号统一
+
+之前界面写死 10pt、编辑器用设置里的 `font_size`（默认 12），两者天生差 2pt；
+用户要求「改成一致大小」。现在界面字号也取 `font_size`：
+`apply_theme(ui_font_size=...)` 决定 QSS 的 `font-size`，`apply_ui_font` 的兜底字体
+同样跟随（`main.py` 里把 settings 加载提到设置字体之前）。
+
+顺带修掉两处**同源问题**：
+- **图标比例**：图标只跟缩放、不跟字号，字号调大后图标反而显小 → 图标 / 间距现在
+  跟 `ui_metric_scale` 走（活动栏图标基准 18 → 24px，按钮 36 → 44，栏宽 44 → 52）；
+- **Markdown 预览字号**：预览文档的默认字体不会跟着 QSS 变，一直停在建控件时的
+  应用字体上 → 现在由 `EditorTabs.apply_settings` 把「设置字号 × 缩放」下发到预览，
+  两边严格同源。
+
+### 4. 悬停动画统一
+
+QSS 不支持 `transition`，`QToolButton` 又默认不产生 hover 进入 / 离开事件，且 style
+会在 hover 时自己画一块瞬时高亮盖住自绘底色。新增
+`FadeButton`（`QVariantAnimation` 对底色 alpha 做 300ms 淡入淡出，**完全自绘**背景与
+图标），三个窗口按钮统一成同一种柔和灰底（关闭按钮不再单独变红），与 VSCode 一致。
+
+### 5. 面板分隔条可视化
+
+`QSplitter::handle` 从 1px 细线改成 6px 热区 + 默认只画中央 1px、悬停 / 拖动时整条
+淡成 accent 高亮（「这里能拖」的提示），用 `border` 画线以免改宽度导致布局抖动。
+
+### 6. 设置对话框去掉系统标题栏
+
+改成无边框 + 自绘标题栏（可拖动），`QGroupBox` 的横线框换成 VSCode 设置页那种
+「弱化加粗小标题 + 内容」。圆角 / 描边只作用于 `objectName=frameless_dialog`，
+不影响仍带系统边框的消息框。
+
+### 7. 点击 gutter 查看「与上一版差异」（仿 VSCode peek）
+
+- `diff_parser` 在解析 hunk 时把丢弃掉的 `+` / `-` 行文本记进新增的
+  `FileDiff.hunks`（`HunkDetail`）——**不增加任何远端请求**，用的还是那一次 `git diff`；
+- 行号槽加点击检测（`LineNumberArea.mousePressEvent` → `changePeekRequested(line)`）；
+- 新增 `PeekDiffView` 浮层：红底旧文本、绿底新文本，定位在点击行下方，Esc /
+  切标签 / 关闭按钮收起。
+
+### 8. Markdown 渲染 + 编辑
+
+`.md` 标签页内是「编辑器 | 预览」可拖动分屏，`Ctrl+Shift+V` 或「视图 → 切换
+Markdown 预览」开关；预览用 Qt 原生 `QTextDocument.setMarkdown`（**零新依赖**），
+颜色随主题注入，编辑后 300ms 节流刷新，打开 .md 时状态栏给一句快捷键提示。
+
+这中间修掉两个真 bug（用户报的「markdown 渲染没做好」「字体差别那么大」）：
+
+1. **预览是 0 宽**：`QSplitter` 不会在隐藏的子控件重新显示时分配尺寸，直接
+   `setVisible(True)` 后预览停在 0 宽，看起来像「没渲染」。切换时显式平分宽度；
+2. **预览字号不同源**：见 §3。
+
+另外 `Ctrl+Shift+V` 与终端粘贴重名：Qt 会先把按键以 `ShortcutOverride` 发给焦点控件，
+所以给终端画布加了 `event()` 处理，把 `Ctrl+Shift+C/V` 抢回来，否则终端里粘贴会变成
+开 Markdown 预览。
+
+### 9. 源代码管理面板重做 + 真正能提交
+
+按 VSCode 的结构重排：提交信息框 + 主色「提交」按钮（回车亦可提交，有信息且有更改时
+才可点）、「更改」分组标题带数量与折叠、每行是**两列**（文件名 + 弱化的父目录，状态
+字母在最右端对齐）—— 之前整行是一长串相对路径，右侧被截断后看不出是哪个文件。
+
+提交走新增的 `GitClient.commit_all()`：`git add -A` + `git commit -m`（信息经
+`shlex.quote` 转义，空白信息直接拒绝），成功后清空输入框并刷新快照与当前文件 diff。
+打开面板依然**零远端请求**（照旧复用文件树那份 `TreeStatus`）。
+
+顺带修掉一个隐藏 bug：`badge.py` 里写的是 `super().subElementRect(...)`，而
+`QStyledItemDelegate` 上**没有**这个方法 —— 异常被 Qt 吞掉，等于「给徽标预留宽度」
+从上一轮起就是死代码。现在改成 `text_rect()` 并向 `QStyle` 取矩形。
+
+### 10. 状态栏重构与中文化
+
+左区（连接 / 当前文件 / 分支与变更）与右区（保存状态 / 编码 / 语言 / 行列号）分区，
+空值自动隐藏（不再出现一排 `-`），各项 hover 有底色；`Ln 1, Col 1` → **行 1，列 1**，
+`Disconnected/Connected` → **未连接 / 已连接**。
+
+### 11. 验证
+
+```
+QT_QPA_PLATFORM=offscreen python -m pytest -q    # 521 passed, 27 skipped
+python -m pyflakes app tests                     # clean
+```
+
+关键回归用例都验证过「把修复去掉就会失败」：Codicons 回退、`ui_metric_scale`、
+预览字号同源、预览宽度、`commit_all` 的暂存顺序与转义、终端 `ShortcutOverride`。
+
+### 12. 遗留 / 下一步
+
+- 暂存区（逐个暂存 / 取消暂存）仍未做，当前是「全部暂存后提交」；
+- 预览里的相对路径图片不会加载（文件在远端，需要按需经 SFTP 取图）；
+- Qt 的 Markdown 不支持任务列表复选框（`- [x]`），`**加粗**` 紧邻中日韩标点的写法
+  按 CommonMark 规则不会解析（GitHub 亦同）；
+- `Ctrl+B` 收起侧边栏仍只由活动栏按钮触发；
+- 插件机制（design.md §7）仍为后续方向。
+
+---
+
 ## 2026-09-18
 
 主题：**修掉「有改动的文件名花屏」，并把外观资源做成自带 + 可切换**。

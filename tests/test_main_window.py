@@ -24,7 +24,7 @@ from app.git.models import ChangeType
 from app.utils.errors import RemoteFileNotFoundError
 from app.ui import main_window as main_window_module
 from app.ui.main_window import MainWindow
-from app.ui.theme import UI_FONT_POINT_SIZE, get_theme
+from app.ui.theme import get_theme
 from app.ui.widgets.file_tree import CHANGE_ROLE, DIR_ROLE, PATH_ROLE
 from tests.fakes import DEFAULT_ROOT, FakeSession
 
@@ -113,7 +113,7 @@ class ExplodingFolderPicker:
 
 def test_window_builds_without_connection(window: MainWindow) -> None:
     assert window.editor_tabs.count() == 0
-    assert "Disconnected" in window.status.connection_cell.text()
+    assert "未连接" in window.status.connection_cell.text()
     assert window.menuBar().actions()
     assert not window.action_save.isEnabled()
 
@@ -469,9 +469,10 @@ def test_zoom_shortcuts_scale_whole_ui(qtbot, wired) -> None:
     assert window.settings.zoom_level == pytest.approx(ZOOM_DEFAULT + ZOOM_STEP)
     # 编辑器：字号按缩放比例放大
     assert window.editor_tabs.current_editor().font().pointSize() > base_font
-    # 界面：样式表里的字号也跟着放大（菜单 / 侧边栏 / 弹窗都吃这条）
+    # 界面：样式表里的字号也跟着放大（菜单 / 侧边栏 / 弹窗都吃这条）。
+    # 界面字号与编辑器字号一致，都是「设置字号 × 缩放」
     qss = QApplication.instance().styleSheet()
-    assert f"font-size: {UI_FONT_POINT_SIZE * window.settings.zoom_level:g}pt" in qss
+    assert f"font-size: {base_font * window.settings.zoom_level:g}pt" in qss
     assert window.settings_store.load().zoom_level == pytest.approx(window.settings.zoom_level)
 
     window.action_zoom_out.trigger()
@@ -1055,3 +1056,33 @@ def test_explorer_shows_a_hint_until_a_folder_is_opened(qtbot, window: MainWindo
 
     assert not window.explorer_hint.isVisibleTo(window)
     assert window.file_tree.isVisibleTo(window)
+
+
+# ---------------------------------------------------------------------------
+# 源代码管理：提交
+# ---------------------------------------------------------------------------
+
+
+def test_scm_commit_sends_message_and_clears_the_box(qtbot, wired) -> None:
+    """面板里填信息点「提交」→ 真的带着这条信息提交，成功后清空输入框。"""
+    window, session = wired
+    session.git.status_lines = {"src/main.c": " M"}
+    window._refresh_tree_status()
+    qtbot.waitUntil(lambda: window.scm_view.changes_count == 1, timeout=5000)
+    assert window.scm_view.commit_button.isEnabled() is False  # 还没写信息
+
+    window.scm_view.commit_edit.setText("feat: 充电对接联调")
+    assert window.scm_view.commit_button.isEnabled()
+
+    window.scm_view.commit_button.click()
+    qtbot.waitUntil(lambda: session.git.commit_calls == ["feat: 充电对接联调"], timeout=5000)
+    qtbot.waitUntil(lambda: window.scm_view.commit_edit.text() == "", timeout=5000)
+    assert "提交完成" in window.status.save_cell.text()
+
+
+def test_scm_commit_without_connection_is_rejected(qtbot, window) -> None:
+    """没连主机时点提交只提示，不发远端请求。"""
+    window.scm_view.commit_edit.setText("feat: 试试")
+    window.scm_view.commitRequested.emit("feat: 试试")
+
+    assert "请先连接主机" in window.status.save_cell.text()

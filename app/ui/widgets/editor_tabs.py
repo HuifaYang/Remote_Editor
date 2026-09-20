@@ -9,8 +9,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtWidgets import QTabBar, QTabWidget, QToolButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtWidgets import (
+    QSplitter,
+    QTabBar,
+    QTabWidget,
+    QToolButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.config.settings import AppSettings
 from app.editor.document import Document
@@ -18,6 +25,7 @@ from app.editor.editor import CodeEditor
 from app.git.models import ChangeType
 from app.ui.icons import make_icon
 from app.ui.theme import Theme
+from app.ui.widgets.markdown_preview import MarkdownPreview
 
 #: 标签页关闭按钮：Qt 自带的图形在深色主题下是红色小方块，自己画一个灰色的叉
 CLOSE_BUTTON_SIZE = 16
@@ -26,10 +34,15 @@ CLOSE_ICON_SIZE = 12
 
 @dataclass
 class EditorTab:
-    """标签页内的文档 + 编辑器组合。"""
+    """标签页内的文档 + 编辑器组合（Markdown 文件额外带一个预览面板）。"""
 
     document: Document
     editor: CodeEditor
+    #: Markdown 预览（仅 .md 文件有；``None`` 表示普通代码文件）
+    preview: Optional["MarkdownPreview"] = None
+    #: 编辑器 / 预览的分屏容器（显示预览时要重新分配宽度，见 toggle_markdown_preview）
+    splitter: Optional[QSplitter] = None
+    _preview_refresh: Optional[QTimer] = None
 
     @property
     def remote_path(self) -> str:
@@ -45,6 +58,8 @@ class EditorTabs(QTabWidget):
     closeDocumentRequested = Signal(object)
     cursorMoved = Signal(int, int)
     markersChanged = Signal(object, object)  # Document, Dict[int, ChangeType]
+    #: 点击 gutter 变更标记：弹出「与上一版差异」预览（Document, 行号）
+    peekRequested = Signal(object, int)
 
     def __init__(
         self,
@@ -66,6 +81,8 @@ class EditorTabs(QTabWidget):
         self._theme = theme
         for tab in self._tabs():
             tab.editor.set_theme(theme)
+            if tab.preview is not None:
+                tab.preview.apply_theme(theme)
         self._refresh_close_buttons()
 
     def _refresh_close_buttons(self) -> None:
@@ -82,6 +99,9 @@ class EditorTabs(QTabWidget):
         self._settings = settings
         for tab in self._tabs():
             tab.editor.apply_settings(settings)
+            if tab.preview is not None:
+                # 预览字号与编辑器同源（设置字号 × 缩放），两边不会一大一小
+                tab.preview.set_base_font_size(settings.font_size)
 
     # -- 查询 --------------------------------------------------------------
     def _tabs(self) -> List[EditorTab]:
@@ -163,12 +183,29 @@ class EditorTabs(QTabWidget):
         editor.set_markers(document.diff.markers)
         editor.setReadOnly(document.read_only)
 
+        tab = EditorTab(document=document, editor=editor)
+
         page = QWidget(self)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(editor)
+        # Markdown 文件：编辑器 + 预览放进一个可拖动分屏（预览默认隐藏）
+        if document.language == "Markdown":
+            preview = MarkdownPreview(self._theme, page)
+            preview.set_base_font_size(self._settings.font_size)
+            preview.set_markdown(editor.text_value())
+            preview.setVisible(False)
+            splitter = QSplitter(Qt.Orientation.Horizontal, page)
+            splitter.addWidget(editor)
+            splitter.addWidget(preview)
+            splitter.setStretchFactor(0, 1)
+            splitter.setStretchFactor(1, 1)
+            layout.addWidget(splitter)
+            tab.preview = preview
+            tab.splitter = splitter
+            tab._preview_refresh = self._make_preview_refresh(editor, preview)
+        else:
+            layout.addWidget(editor)
 
-        tab = EditorTab(document=document, editor=editor)
         page.editor_tab = tab  # type: ignore[attr-defined]
 
         index = self.addTab(page, document.tab_title)
@@ -182,6 +219,9 @@ class EditorTabs(QTabWidget):
             lambda dirty, t=tab, i=index: self._on_modification_changed(t, dirty)
         )
         editor.saveRequested.connect(lambda t=tab: self.saveRequested.emit(t.document))
+        editor.changePeekRequested.connect(
+            lambda line, t=tab: self.peekRequested.emit(t.document, line)
+        )
 
         if activate:
             self.setCurrentIndex(index)
@@ -238,6 +278,56 @@ class EditorTabs(QTabWidget):
             return document.text
         document.text = editor.text_value()
         return document.text
+
+    # -- Markdown 预览 ------------------------------------------------------
+    def _make_preview_refresh(
+        self, editor: CodeEditor, preview: MarkdownPreview
+    ) -> QTimer:
+        """编辑后 300ms 刷新预览（节流，避免敲一个字符就重渲一次）。"""
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(300)
+        timer.timeout.connect(lambda: preview.set_markdown(editor.text_value()))
+        editor.textChanged.connect(lambda: timer.start() or None)
+        return timer
+
+    def toggle_markdown_preview(self, document: Document) -> bool:
+        """切换当前标签页的 Markdown 预览显隐；非 Markdown 文件返回 ``False``。
+
+        可见性用 ``isHidden()`` 判断（``isVisible()`` 在父窗口未 show 时不可靠，
+        离屏测试里尤其明显）。
+        """
+        tab = self.tab_at(self.index_of_path(document.remote_path))
+        if tab is None or tab.preview is None:
+            return False
+        show = tab.preview.isHidden()
+        tab.preview.setVisible(show)
+        if show:
+            tab.preview.set_markdown(tab.editor.text_value())
+            self._split_preview(tab)
+        return show
+
+    @staticmethod
+    def _split_preview(tab: EditorTab) -> None:
+        """把编辑区与预览对半分配宽度。
+
+        ``QSplitter`` 不会在隐藏的 widget 重新显示时自动给它宽度 —— 直接
+        ``setVisible(True)`` 会让预览停在 0 宽（看着像「预览没出来」），
+        必须显式重新分配一次尺寸。
+        """
+        splitter = tab.splitter
+        if splitter is None:
+            return
+        total = splitter.width() or sum(splitter.sizes())
+        if total > 0:
+            half = total // 2
+            splitter.setSizes([half, total - half])
+        else:  # 还没完成布局：交给 stretch factor 平分
+            splitter.setSizes([1, 1])
+
+    def is_markdown_preview_visible(self, document: Document) -> bool:
+        tab = self.tab_at(self.index_of_path(document.remote_path))
+        return bool(tab is not None and tab.preview is not None and not tab.preview.isHidden())
 
     def set_markers(self, document: Document, markers: Dict[int, ChangeType]) -> None:
         document.diff.markers = dict(markers)

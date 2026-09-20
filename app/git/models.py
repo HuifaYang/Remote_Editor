@@ -41,6 +41,19 @@ class LineMarker:
     old_line: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class HunkDetail:
+    """一个变更块的详细内容（供「点击 gutter 查看与上一版差异」使用）。
+
+    ``start_line`` 是该块在当前工作区文件中的起始行号（1-based）；
+    ``removed`` 是被删除 / 被改掉的旧文本，``added`` 是对应的新文本。
+    """
+
+    start_line: int
+    removed: tuple = ()
+    added: tuple = ()
+
+
 @dataclass
 class FileDiff:
     """单个文件的 Diff 解析结果。"""
@@ -52,6 +65,8 @@ class FileDiff:
     is_binary: bool = False
     hunk_count: int = 0
     new_line_count: int = 0
+    #: 各变更块的旧 / 新文本（点击 gutter 查看 diff 用），按 start_line 升序
+    hunks: tuple = ()
 
     # -- 统计 --------------------------------------------------------------
     @property

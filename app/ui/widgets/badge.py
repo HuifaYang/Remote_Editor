@@ -3,10 +3,12 @@
 徽标是**画出来的图形**而不是文字后缀：一个填色的圆角方块加字母，位置固定在行的
 右端，因此名称再长也不会把它挤掉，滚动时也对齐成一条竖线。
 
-文件名文字本身**交给基类绘制**，本委托只把它的可用宽度收窄到徽标左侧
-（:meth:`subElementRect` 覆写），再补画徽标。原因：基类在带样式表时会按索引数据
-自行取文本，清空 ``option.text`` 并不能阻止它再画一遍，于是就出现「文件名画两遍、
-笔画错位叠加」的花屏。让基类独占文字绘制，样式表下的颜色与选中态也才和未变更行一致。
+文件名文字本身**交给基类绘制**（带样式表时基类会按索引数据取文本，清空
+``option.text`` 并不能阻止它再画一遍，于是出现「文件名画两遍、笔画错位叠加」的花屏），
+本委托只补画右端的徽标；徽标是不透明的，长名称会由基类省略在行尾。
+
+需要「文字可用区」时用 :meth:`text_rect`：矩形要向 ``QStyle`` 要
+（``QStyledItemDelegate`` 上并没有 ``subElementRect``），右侧再让开徽标。
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from typing import Optional
 from PySide6.QtCore import QRect, QSize, Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 from PySide6.QtWidgets import (
+    QApplication,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
@@ -52,8 +55,7 @@ class BadgeDelegate(QStyledItemDelegate):
         return QRect(rect.right() - self._size - BADGE_MARGIN, top, self._size, self._size)
 
     def paint(self, painter, option, index) -> None:  # noqa: D102 - Qt 接口
-        # 文件名 / 图标与选中底色全部交给基类（它只在 subElementRect 收窄后的区域内
-        # 排版文字），本委托只额外补画右端的徽标
+        # 文件名 / 图标与选中底色全部交给基类，本委托只额外补画右端的徽标
         super().paint(painter, option, index)
         letter = index.data(BADGE_ROLE)
         if not letter:
@@ -75,13 +77,25 @@ class BadgeDelegate(QStyledItemDelegate):
         painter.drawText(badge_rect, int(Qt.AlignmentFlag.AlignCenter), str(letter))
         painter.restore()
 
-    def subElementRect(  # noqa: D102 - Qt 接口
-        self, element: QStyle.SubElement, option: QStyleOptionViewItem, widget: Optional[QWidget] = None
-    ) -> QRect:
-        # 让基类把文件名排在徽标左侧，宽度不够时由基类自己打省略号，
-        # 这样「文字被画两遍」和「长文件名钻到徽标底下」两个问题一起消失
-        rect = super().subElementRect(element, option, widget)
-        if element == QStyle.SubElement.SE_ItemViewItemText and option.index.data(BADGE_ROLE):
+    def text_rect(self, option: QStyleOptionViewItem, widget: Optional[QWidget] = None) -> QRect:
+        """基类给文字分配的矩形（让开图标），右侧再让开徽标。
+
+        注意：文字矩形必须向 ``QStyle`` 要 —— ``QStyledItemDelegate`` 上没有
+        ``subElementRect``（早先误写成 ``super().subElementRect``，异常被 Qt 吞掉，
+        等于从没生效过）。
+        """
+        target = widget if widget is not None else option.widget
+        style = target.style() if target is not None else None
+        if style is None:
+            app = QApplication.instance()
+            style = app.style() if app is not None else None
+        rect = (
+            style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, option, target)
+            if style is not None
+            else QRect(option.rect)
+        )
+        badge = option.index.data(BADGE_ROLE)
+        if badge:
             rect.setRight(max(rect.left(), self.badge_rect(option).left() - 4))
         return rect
 

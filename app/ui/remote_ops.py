@@ -232,6 +232,18 @@ def load_git_diff(
     return diff
 
 
+def commit_changes(session: RemoteSession, directory: str, message: str) -> str:
+    """把工作目录下的全部更改暂存并提交（源代码管理面板的「提交」按钮）。
+
+    显式用户动作，允许产生远端请求；提交信息为空时由 :class:`GitError` 拦下。
+    """
+    started = time.perf_counter()
+    target = directory or session.workspace or session.repo_info().root or "/"
+    output = session.git.commit_all(message, directory=target)
+    logger.info("提交完成（%.0f ms）", (time.perf_counter() - started) * 1000.0)
+    return output
+
+
 def git_available(session: RemoteSession) -> bool:
     """检查远端是否具备 git（缺失时不应报错崩溃）。"""
     try:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -13,32 +13,42 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
-    QGroupBox,
     QLabel,
     QLineEdit,
     QPushButton,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from app.config.settings import FONT_SIZE_MAX, FONT_SIZE_MIN, AppSettings
 from app.ui.icon_theme import available_icon_themes
+from app.ui.icons import make_icon
 from app.ui.resources import RESOURCE_HINT, open_resource_dir, resource_root
-from app.ui.theme import available_themes, reload_themes
+from app.ui.theme import available_themes, get_theme, reload_themes
 
 #: 资源目录那一行的路径最多显示多宽（放不下就中间省略，完整路径在 Tooltip 里）
 _RESOURCE_PATH_WIDTH = 280
 
 
 class SettingsDialog(QDialog):
-    """应用设置。"""
+    """应用设置（无边框 + 自绘标题栏，与主窗口同一套外壳）。"""
 
     def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        # 无边框：标题栏自己画，和主窗口一致；保留 Dialog 语义 + 模态
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.setModal(True)
+        self.setObjectName("frameless_dialog")
         self.setWindowTitle("设置")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(460)
         self._settings = settings
+        self._drag_origin: Optional[QPoint] = None
 
         # 打开设置时重扫一遍主题目录：用户新放进来的主题文件立刻可选
         reload_themes()
@@ -99,16 +109,14 @@ class SettingsDialog(QDialog):
         self.strict_host_box = QCheckBox("严格校验 known_hosts", self)
         self.strict_host_box.setChecked(settings.ssh_strict_host_key)
 
-        appearance = QGroupBox("外观", self)
-        appearance_form = QFormLayout(appearance)
+        appearance_form = QFormLayout()
         appearance_form.addRow("主题", self.theme_combo)
         appearance_form.addRow("文件图标", self.icon_theme_combo)
         appearance_form.addRow("字体", self.font_family_edit)
         appearance_form.addRow("字号", self.font_size_spin)
         appearance_form.addRow("资源目录", self._build_resource_row())
 
-        editor_group = QGroupBox("编辑器", self)
-        editor_form = QFormLayout(editor_group)
+        editor_form = QFormLayout()
         editor_form.addRow("缩进宽度", self.tab_size_spin)
         editor_form.addRow("", self.use_spaces_box)
         editor_form.addRow("", self.word_wrap_box)
@@ -117,12 +125,10 @@ class SettingsDialog(QDialog):
         editor_form.addRow("", self.auto_save_box)
         editor_form.addRow("自动保存延迟", self.auto_save_spin)
 
-        file_group = QGroupBox("文件", self)
-        file_form = QFormLayout(file_group)
+        file_form = QFormLayout()
         file_form.addRow("最大打开文件", self.max_file_spin)
 
-        ssh_group = QGroupBox("SSH", self)
-        ssh_form = QFormLayout(ssh_group)
+        ssh_form = QFormLayout()
         ssh_form.addRow("连接超时", self.timeout_spin)
         ssh_form.addRow("Keepalive", self.keepalive_spin)
         ssh_form.addRow("", self.strict_host_box)
@@ -134,15 +140,95 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 12)
-        layout.setSpacing(14)
-        for group in (appearance, editor_group, file_group, ssh_group):
-            layout.addWidget(group)
-        layout.addWidget(buttons)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._build_title_bar())
+
+        body = QWidget(self)
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(18, 6, 18, 14)
+        body_layout.setSpacing(4)
+        for title, form in (
+            ("外观", appearance_form),
+            ("编辑器", editor_form),
+            ("文件", file_form),
+            ("SSH", ssh_form),
+        ):
+            body_layout.addWidget(self._section_title(title))
+            body_layout.addLayout(form)
+            body_layout.addSpacing(10)
+        body_layout.addWidget(buttons)
+        layout.addWidget(body, 1)
         for form in (appearance_form, editor_form, file_form, ssh_form):
-            form.setHorizontalSpacing(14)
-            form.setVerticalSpacing(7)
-            form.setContentsMargins(4, 4, 4, 0)
+            form.setHorizontalSpacing(16)
+            form.setVerticalSpacing(8)
+            form.setContentsMargins(0, 0, 0, 0)
+
+    # -- 自绘标题栏 ----------------------------------------------------------
+    def _build_title_bar(self) -> QWidget:
+        """标题栏：左侧「设置」标题，右侧关闭按钮；按住空白处可拖动（无边框窗口）。"""
+        bar = QWidget(self)
+        bar.setObjectName("dialog_title_bar")
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(14, 0, 4, 0)
+        bar_layout.setSpacing(0)
+
+        title = QLabel("设置", bar)
+        title.setObjectName("dialog_title_label")
+        bar_layout.addWidget(title)
+        bar_layout.addStretch(1)
+
+        close = QToolButton(bar)
+        close.setObjectName("window_close")
+        close.setAutoRaise(True)
+        close.setToolTip("关闭")
+        close.setIcon(make_icon("close", self._title_icon_color()))
+        close.setIconSize(close.iconSize())
+        close.clicked.connect(self.reject)
+        bar_layout.addWidget(close)
+        return bar
+
+    @staticmethod
+    def _title_icon_color():
+        """关闭按钮图标的颜色跟随当前主题。"""
+        try:
+            return get_theme("dark").color("status_fg")
+        except Exception:  # pragma: no cover - 主题不可用时给个安全色
+            from PySide6.QtGui import QColor
+
+            return QColor("#cccccc")
+
+    def _section_title(self, text: str) -> QLabel:
+        """分组小标题：muted 加粗，替代原来 QGroupBox 的横线框（VSCode 设置页风格）。"""
+        label = QLabel(text, self)
+        label.setObjectName("settings_section_title")
+        font = label.font()
+        font.setBold(True)
+        font.setPointSizeF(font.pointSizeF() + 0.5)
+        label.setFont(font)
+        label.setContentsMargins(0, 8, 0, 4)
+        return label
+
+    # -- 拖动（无边框窗口）--------------------------------------------------
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 只在标题栏区域拖动（避免在表单里点选文字时误拖窗口）
+            if event.position().y() <= 36:
+                self._drag_origin = event.globalPosition().toPoint() - self.pos()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        if self._drag_origin is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_origin)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt 接口
+        self._drag_origin = None
+        super().mouseReleaseEvent(event)
 
     # -- 用户资源目录 ------------------------------------------------------
     def _build_resource_row(self) -> QWidget:

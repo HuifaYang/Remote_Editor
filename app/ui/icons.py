@@ -1,16 +1,21 @@
-"""矢量图标：用 QPainter 现画 16×16 单色线条图标。
+"""矢量图标：优先用 ``assets/ui-icons/`` 里的 Codicons SVG，加载失败回退 QPainter 手画。
 
-刻意不引入图标字体或 SVG 资源：一来打包时不需要额外的 Qt 模块，二来没有第三方
-图标集的许可问题，三来颜色可以跟随主题即时重建（仿 VSCode Codicon 的风格：
-16px 网格、1.3px 描边、圆角端点，未激活灰、激活亮）。
+Codicons 是 VSCode 官方图标集（CC-BY 4.0），16/24px 网格、描边粗细统一，
+比手画线条工整得多 —— 这是界面「现代感」最直观的一块。所有 SVG 都是
+``fill="currentColor"``，渲染前把 ``currentColor`` 换成主题色再交给 ``QtSvg``，
+颜色因此可以跟随主题即时重建。某个图标没有对应 SVG（或 SVG 损坏 / 目录缺失）
+时回退到下面的 QPainter 手画实现，不会让启动报错。
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Tuple
+from functools import lru_cache
+from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QGuiApplication, QIcon, QPainter, QPainterPath, QPen, QPixmap
+
+from app.utils.paths import resource_path
 
 #: 图标逻辑坐标（所有绘制函数都只用 0..16 这个空间）
 VIEWBOX = 16.0
@@ -206,7 +211,82 @@ DRAWERS: Dict[str, Callable[[QPainter, QColor], None]] = {
 }
 
 
+#: 项目图标名 → ``assets/ui-icons/`` 里的 Codicon SVG 文件名（不含扩展名）。
+#: 没列在这里的名字会回退到 ``DRAWERS`` 的手画实现。
+_CODICON_MAP: Dict[str, str] = {
+    "host": "remote",
+    "disconnect": "debug-disconnect",
+    "folder": "folder",
+    "files": "files",
+    "source-control": "source-control",
+    "search": "search",
+    "save": "save",
+    "refresh": "refresh",
+    "collapse": "collapse-all",
+    "new-file": "new-file",
+    "new-folder": "new-folder",
+    "settings": "settings-gear",
+    "history": "history",
+    "close": "close",
+    "minimize": "chrome-minimize",
+    "maximize": "chrome-maximize",
+    "restore": "chrome-restore",
+    "plus": "add",
+    "download": "cloud-download",
+    "trash": "trash",
+}
+
+#: Codicon SVG 目录（缺失时整体回退手画）
+_UI_ICON_DIR = "ui-icons"
+
+
+@lru_cache(maxsize=1)
+def _svg_dir_available() -> bool:
+    try:
+        return resource_path("assets", _UI_ICON_DIR).is_dir()
+    except Exception:  # pragma: no cover - 打包路径异常时回退手画
+        return False
+
+
+def _render_svg_pixmap(name: str, color: QColor, size: int) -> Optional[QPixmap]:
+    """用 ``QtSvg`` 渲染 Codicon SVG 并按 ``color`` 染色；失败返回 ``None``。
+
+    把 SVG 文本里的 ``currentColor`` 换成目标色再渲染 —— QtSvg 不会把
+    ``currentColor`` 解析成画笔颜色，直接染是最可靠的做法。
+    """
+    svg_name = _CODICON_MAP.get(name)
+    if not svg_name or not _svg_dir_available():
+        return None
+    # QtSvg / QPixmap 在没有 QApplication 时会 abort，先判空
+    if QGuiApplication.instance() is None:
+        return None
+    try:
+        from PySide6.QtSvg import QSvgRenderer
+    except Exception:  # pragma: no cover - 极少数环境缺 QtSvg 模块
+        return None
+    svg_path = resource_path("assets", _UI_ICON_DIR, f"{svg_name}.svg")
+    try:
+        raw = svg_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    tinted = raw.replace("currentColor", color.name())
+    renderer = QSvgRenderer(tinted.encode("utf-8"))
+    if not renderer.isValid():
+        return None
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    renderer.render(painter)
+    painter.end()
+    return pixmap
+
+
 def render_pixmap(name: str, color: QColor, size: int) -> QPixmap:
+    # 优先用 Codicons SVG（工整），加载不到再回退 QPainter 手画
+    svg = _render_svg_pixmap(name, color, size)
+    if svg is not None:
+        return svg
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     drawer = DRAWERS.get(name)

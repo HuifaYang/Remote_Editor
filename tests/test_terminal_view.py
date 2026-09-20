@@ -430,3 +430,29 @@ def test_font_change_updates_the_cell_size(qtbot) -> None:
     view.set_font(monospace_font(20))
 
     assert view.canvas.cell_size() != before
+
+
+def shortcut_override(key: Qt.Key, modifiers) -> QKeyEvent:
+    return QKeyEvent(QKeyEvent.Type.ShortcutOverride, key, modifiers)
+
+
+def test_terminal_claims_ctrl_shift_shortcuts_from_the_window(qtbot) -> None:
+    """终端的 Ctrl+Shift+C/V 必须挡住窗口级同名快捷键。
+
+    窗口上「切换 Markdown 预览」绑了 Ctrl+Shift+V，而 Qt 会先把按键以
+    ``ShortcutOverride`` 发给焦点控件：终端不接受的话，粘贴会变成开 Markdown 预览。
+    """
+    canvas, _screen = make_canvas_widget(qtbot)
+    ctrl_shift = Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+
+    paste = shortcut_override(Qt.Key.Key_V, ctrl_shift)
+    assert canvas.event(paste) is True
+    assert paste.isAccepted()
+
+    copy = shortcut_override(Qt.Key.Key_C, ctrl_shift)
+    assert canvas.event(copy) is True
+
+    # 其它组合不抢（例如 Ctrl+V 不是终端的快捷键）：事件不被接受，交给窗口快捷键
+    other = shortcut_override(Qt.Key.Key_V, Qt.KeyboardModifier.ControlModifier)
+    canvas.event(other)
+    assert not other.isAccepted()

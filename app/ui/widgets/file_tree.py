@@ -90,9 +90,13 @@ class RemoteFileTree(QTreeWidget):
         self._icon_file = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
 
     # -- 主题 / Git 状态 ----------------------------------------------------
-    def apply_theme(self, theme: Theme) -> None:
-        """切换主题后重新着色（颜色只来自 :mod:`app.ui.theme`）。"""
+    def apply_theme(self, theme: Theme, *, ui_scale: float = 1.0) -> None:
+        """切换主题后重新着色，并按全局缩放重算缩进与图标尺寸（颜色只来自
+        :mod:`app.ui.theme`）。行高由 QSS 的 ``::item`` padding 承担，随缩放变。"""
         self._theme = theme
+        scale = max(0.5, min(3.0, float(ui_scale)))
+        self.setIndentation(round(14 * scale))
+        self.setIconSize(QSize(round(16 * scale), round(16 * scale)))
         self._recolor_items()
 
     def set_icon_theme(self, icon_theme: Optional[FileIconTheme]) -> None:

@@ -12,9 +12,11 @@ from PySide6.QtWidgets import QToolButton, QVBoxLayout, QWidget
 from app.ui.icons import render_pixmap
 from app.ui.theme import Theme
 
-ACTIVITY_BAR_WIDTH = 44
-BUTTON_SIZE = 36
-ICON_SIZE = 18
+# 对齐 VSCode：活动栏图标明显大于文字（图标约 24px、按钮 44px、栏宽 52px），
+# 视觉重心在图标上。上一轮把界面字号统一到代码字号后，图标若仍 18px 会显得偏小。
+ACTIVITY_BAR_WIDTH = 52
+BUTTON_SIZE = 44
+ICON_SIZE = 24
 
 
 @dataclass(frozen=True)
@@ -76,22 +78,32 @@ class ActivityBar(QWidget):
         self.apply_theme(theme)
 
     # -- 主题 / 选中状态 ---------------------------------------------------
-    def apply_theme(self, theme: Theme) -> None:
-        """按主题重建图标：未激活灰、激活亮（VSCode 也是这么切的）。"""
+    def apply_theme(self, theme: Theme, *, ui_scale: float = 1.0) -> None:
+        """按主题重建图标，并按全局缩放重算栏宽 / 按钮 / 图标尺寸。
+
+        VSCode 的窗口缩放（Ctrl+=）是「整个界面一起变大」，不是只放大文字，
+        所以这里的固定像素都要乘 ``ui_scale``。
+        """
         self._theme = theme
+        scale = max(0.5, min(3.0, float(ui_scale)))
+        self.setFixedWidth(round(ACTIVITY_BAR_WIDTH * scale))
+        button_size = round(BUTTON_SIZE * scale)
+        icon_size = round(ICON_SIZE * scale)
         normal = theme.color("gutter_fg")
         active = theme.color("editor_fg")
         for item in self._items:
             button = self._buttons[item.key]
-            button.setIcon(self._build_icon(item.icon, normal, active))
+            button.setFixedSize(button_size, button_size)
+            button.setIconSize(QSize(icon_size, icon_size))
+            button.setIcon(self._build_icon(item.icon, normal, active, icon_size))
 
     @staticmethod
-    def _build_icon(name: str, normal, active) -> QIcon:
+    def _build_icon(name: str, normal, active, size: int = ICON_SIZE) -> QIcon:
         icon = QIcon()
         for scale in (1, 2):
-            icon.addPixmap(render_pixmap(name, normal, ICON_SIZE * scale))
+            icon.addPixmap(render_pixmap(name, normal, size * scale))
             icon.addPixmap(
-                render_pixmap(name, active, ICON_SIZE * scale),
+                render_pixmap(name, active, size * scale),
                 QIcon.Mode.Normal,
                 QIcon.State.On,
             )

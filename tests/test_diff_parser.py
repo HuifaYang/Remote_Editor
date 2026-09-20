@@ -283,3 +283,52 @@ def test_parse_empty_diff_returns_empty_result() -> None:
 
 def markers_of(diff: FileDiff) -> Dict[int, str]:
     return {line: change.value for line, change in sorted(diff.markers.items())}
+
+
+# ---------------------------------------------------------------------------
+# 变更块文本（点击 gutter 查看 diff 用）
+# ---------------------------------------------------------------------------
+
+
+def test_hunks_capture_removed_and_added_text() -> None:
+    """修改行的 hunk 同时记下旧文本与新文本。"""
+    old = "abc\ndef\nghi\n"
+    new = "abc\nDEF\nghi\n"
+    diff = build_file_diff(make_diff(old, new), path=PATH, new_line_count=line_count(new))
+    assert len(diff.hunks) == 1
+    hunk = diff.hunks[0]
+    assert hunk.start_line == 2
+    assert hunk.removed == ("def",)
+    assert hunk.added == ("DEF",)
+
+
+def test_hunks_pure_addition_has_empty_removed() -> None:
+    """纯新增：removed 为空，added 是新行。"""
+    old = "a\nb\n"
+    new = "a\nX\nY\nb\n"
+    diff = build_file_diff(make_diff(old, new), path=PATH, new_line_count=line_count(new))
+    hunk = diff.hunks[0]
+    assert hunk.removed == ()
+    assert hunk.added == ("X", "Y")
+
+
+def test_hunks_pure_deletion_has_empty_added() -> None:
+    """纯删除：added 为空，removed 是被删掉的旧行。"""
+    old = "a\nX\nY\nb\n"
+    new = "a\nb\n"
+    diff = build_file_diff(make_diff(old, new), path=PATH, new_line_count=line_count(new))
+    hunk = diff.hunks[0]
+    assert hunk.removed == ("X", "Y")
+    assert hunk.added == ()
+
+
+def test_hunks_multiple_blocks_are_ordered() -> None:
+    """多个变更块按新文件行号升序排列。"""
+    old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n"
+    new = "L1\nl2\nl3\nl4\nl5\nl6\nl7\nL8\n"
+    diff = build_file_diff(
+        make_diff(old, new, context=1), path=PATH, new_line_count=line_count(new)
+    )
+    starts = [hunk.start_line for hunk in diff.hunks]
+    assert starts == sorted(starts)
+    assert len(diff.hunks) == 2

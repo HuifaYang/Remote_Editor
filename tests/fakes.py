@@ -320,6 +320,12 @@ class FakeGitClient:
         self.status_calls: List[Tuple[Optional[str], Optional[str]]] = []
         #: ``git status --porcelain`` 结果（相对仓库根路径 → 状态码），供快照测试使用
         self.status_lines: Dict[str, str] = {}
+        #: ``commit_all`` 收到的提交信息（断言「点提交真的提交了」）
+        self.commit_calls: List[str] = []
+
+    def commit_all(self, message: str, *, directory: Optional[str] = None) -> str:
+        self.commit_calls.append(message)
+        return f"[main abc1234] {message}"
 
     def repo_info(self, directory: str) -> RepoInfo:  # noqa: D401
         return self.repo

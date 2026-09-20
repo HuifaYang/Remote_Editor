@@ -65,6 +65,7 @@ from app.ui.theme import (
     get_theme,
     monospace_font,
     refresh_style,
+    ui_metric_scale,
 )
 from app.ui.icon_theme import get_icon_theme
 from app.ui.widgets.activity_bar import ActivityBar, ActivityItem
@@ -74,6 +75,7 @@ from app.ui.widgets.hosts_view import HostsView
 from app.ui.widgets.log_view import LogView
 from app.ui.widgets.scm_view import SourceControlView
 from app.ui.widgets.search_bar import SearchBar
+from app.ui.widgets.peek_diff import PeekDiffView
 from app.ui.widgets.status_bar import StatusBar
 from app.ui.widgets.terminal_panel import TerminalPanel
 from app.ui.widgets.title_bar import TitleBar, WindowResizeFilter
@@ -93,6 +95,9 @@ DIR_CACHE_TTL_SECONDS = 120.0
 PREFETCH_LIMIT = 3
 #: 缓存目录数上限，防止长时间浏览后内存无限增长
 DIR_CACHE_MAX_ENTRIES = 200
+
+#: 侧边栏顶部操作图标的基础尺寸（比文字略大，缩放 / 字号变化时按比例跟随）
+EXPLORER_ICON_SIZE = 18
 
 #: 活动栏条目：``files`` / ``source-control`` 切换侧边栏视图，其余是命令
 ACTIVITY_ITEMS = (
@@ -218,8 +223,10 @@ class MainWindow(QMainWindow):
             ("collapse", "全部折叠", self.file_tree.collapseAll),
         ):
             button = QToolButton(header)
-            button.setIcon(make_icon(icon, self.theme.color("gutter_fg")))
-            button.setIconSize(QSize(16, 16))
+            button.setIcon(
+                make_icon(icon, self.theme.color("gutter_fg"), size=EXPLORER_ICON_SIZE)
+            )
+            button.setIconSize(QSize(EXPLORER_ICON_SIZE, EXPLORER_ICON_SIZE))
             button.setToolTip(tooltip)
             button.setAutoRaise(True)
             button.clicked.connect(slot)
@@ -240,6 +247,8 @@ class MainWindow(QMainWindow):
         self._build_window_shell()
         self.file_tree = RemoteFileTree(self, theme=self.theme)
         self.editor_tabs = EditorTabs(self.theme, self.settings, self)
+        #: gutter 点击弹出的 diff 预览浮层（同一时间只显示一个）
+        self._peek_view: Optional[PeekDiffView] = None
         self.search_bar = SearchBar(self)
 
         # 活动栏（仿 VSCode 最左侧的一列图标）：切换侧边栏视图 / 触发常用命令
@@ -366,6 +375,7 @@ class MainWindow(QMainWindow):
         self.editor_tabs.closeDocumentRequested.connect(self._close_document)
         self.editor_tabs.cursorMoved.connect(self.status.set_cursor)
         self.editor_tabs.saveRequested.connect(self._save_document)
+        self.editor_tabs.peekRequested.connect(self._on_peek_requested)
 
         self.search_bar.searchRequested.connect(self._on_search)
         self.search_bar.replaceRequested.connect(self._on_replace)
@@ -373,6 +383,7 @@ class MainWindow(QMainWindow):
 
         self.scm_view.fileActivated.connect(self.open_remote_file)
         self.scm_view.refreshRequested.connect(self._refresh_tree_status)
+        self.scm_view.commitRequested.connect(self._commit_changes)
         self.welcome.connectRequested.connect(self._on_connect)
         self.welcome.openFolderRequested.connect(self._on_open_folder)
 
@@ -494,6 +505,10 @@ class MainWindow(QMainWindow):
         # Ctrl+= 在很多键盘布局上要配合 Shift，两个都绑上
         self.action_zoom_in.setShortcuts([QKeySequence("Ctrl+="), QKeySequence("Ctrl++")])
         self.action_zoom_out.setShortcuts([QKeySequence("Ctrl+-"), QKeySequence("Ctrl+_")])
+        # Markdown 预览（对齐 VSCode 的 Ctrl+Shift+V），只对 .md 标签页生效
+        self.action_toggle_md_preview = action(
+            "切换 Markdown 预览", "Ctrl+Shift+V", self._toggle_markdown_preview
+        )
         self.action_clear_cache = action("清空本地缓存", None, self._clear_cache)
         self.action_about = action("关于", None, self._show_about)
 
@@ -558,6 +573,8 @@ class MainWindow(QMainWindow):
         self.theme_menu = view_menu.addMenu("主题")
         self._populate_theme_menu()
         view_menu.addSeparator()
+        view_menu.addAction(self.action_toggle_md_preview)
+        view_menu.addSeparator()
         view_menu.addAction(self.action_zoom_in)
         view_menu.addAction(self.action_zoom_out)
         view_menu.addAction(self.action_zoom_reset)
@@ -603,6 +620,17 @@ class MainWindow(QMainWindow):
         """Ctrl+= / Ctrl+-：全局缩放（界面 + 编辑器一起，对齐 VSCode 的窗口缩放）。"""
         self._set_zoom(self.settings.zoom_level + delta * ZOOM_STEP)
 
+    def _toggle_markdown_preview(self) -> None:
+        """切换当前标签页的 Markdown 预览；非 Markdown 文件提示一下。"""
+        document = self._current_document()
+        if document is None:
+            return
+        visible = self.editor_tabs.toggle_markdown_preview(document)
+        if document.language != "Markdown":
+            self.status.set_save_status("只有 Markdown 文件支持预览")
+        else:
+            self.status.set_save_status("Markdown 预览已" + ("打开" if visible else "关闭"))
+
     def _reset_zoom(self) -> None:
         """Ctrl+0：恢复默认缩放（界面字号回默认，编辑器回到设置里的字号）。"""
         self._set_zoom(ZOOM_DEFAULT)
@@ -638,13 +666,18 @@ class MainWindow(QMainWindow):
             QApplication.instance(),
             self.theme,
             ui_scale=self.settings.zoom_level,
+            ui_font_size=self.settings.font_size,
         )
+        # 组件尺寸（图标 / 间距 / 栏宽）跟随「缩放 × 字号比例」，
+        # 这样把字号调大时图标不会相对变小（「图标大于文字」的比例始终成立）
+        scale = ui_metric_scale(self.settings.zoom_level, self.settings.font_size)
         self.editor_tabs.apply_theme(self.theme)
-        self.file_tree.apply_theme(self.theme)
-        self.title_bar.apply_theme(self.theme)
+        self.file_tree.apply_theme(self.theme, ui_scale=scale)
+        self.title_bar.apply_theme(self.theme, ui_scale=scale)
         self.icon_theme = get_icon_theme(self.settings.icon_theme)
         self.file_tree.set_icon_theme(self.icon_theme)
-        self.activity_bar.apply_theme(self.theme)
+        self.activity_bar.apply_theme(self.theme, ui_scale=scale)
+        self.hosts_view.apply_theme(self.theme, ui_scale=scale)
         self.scm_view.apply_theme(self.theme)
         self.welcome.apply_theme(self.theme)
         self.terminal_panel.apply_theme(self.theme)
@@ -653,8 +686,10 @@ class MainWindow(QMainWindow):
         icon_color = self.theme.color("gutter_fg")
         self.explorer_hint.setProperty("muted", True)
         refresh_style(self.explorer_hint)
+        header_icon = max(12, round(EXPLORER_ICON_SIZE * scale))
         for button, icon in self.explorer_buttons:
-            button.setIcon(make_icon(icon, icon_color))
+            button.setIcon(make_icon(icon, icon_color, size=header_icon))
+            button.setIconSize(QSize(header_icon, header_icon))
         for action, icon in self._action_icons:
             action.setIcon(make_icon(icon, icon_color))
         self.editor_tabs.apply_settings(self._effective_settings())
@@ -1411,7 +1446,12 @@ class MainWindow(QMainWindow):
         tab.editor.go_to_line(document.cursor_line)
         self.cache.store(document.host_id, document.remote_path, loaded.text.encode("utf-8"))
         self.cache.add_recent(document.host_id, document.remote_path)
-        self.status.set_save_status("已加载")
+        # Markdown 文件的预览入口不显眼（只在视图菜单 / 快捷键里），
+        # 打开时顺带给一句提示，免得用户以为「Markdown 不渲染」。
+        if document.language == "Markdown":
+            self.status.set_save_status("已加载 · 按 Ctrl+Shift+V 预览 Markdown")
+        else:
+            self.status.set_save_status("已加载")
         logger.info("已打开 %s（%s，%s）", loaded.path, loaded.encoding, loaded.language)
         # 先让编辑器完成首次绘制，再拉取 Git diff，避免打开大文件时界面顿一下
         QTimer.singleShot(0, lambda: self._refresh_git(document))
@@ -1661,6 +1701,36 @@ class MainWindow(QMainWindow):
             on_error=lambda _message: self.status.set_git("Git: unavailable"),
         )
 
+    # -- 源代码管理：提交 ----------------------------------------------------
+    def _commit_changes(self, message: str) -> None:
+        """暂存全部更改并提交（源代码管理面板的「提交」按钮）。"""
+        session = self.session
+        if session is None:
+            self.status.set_save_status("请先连接主机，再提交")
+            return
+        directory = self.workspace or session.workspace
+        self.status.set_save_status("正在提交…")
+        self.scm_view.commit_button.setEnabled(False)
+        self.runner.submit(
+            remote_ops.commit_changes,
+            args=(session, directory, message),
+            on_success=self._on_commit_done,
+            on_error=self._on_commit_failed,
+        )
+
+    def _on_commit_done(self, _output: str) -> None:
+        self.scm_view.clear_message()
+        self.status.set_save_status("提交完成")
+        logger.info("Git 提交完成")
+        # 提交后工作区变干净：刷新快照与当前文件的 Diff 标记
+        self._refresh_tree_status()
+        self._refresh_git_for_current()
+
+    def _on_commit_failed(self, message: str) -> None:
+        self.scm_view.sync_commit_state()
+        self.status.set_save_status(f"提交失败：{message}")
+        logger.warning("Git 提交失败：%s", message)
+
     def _on_tree_status_loaded(self, status) -> None:
         self.file_tree.set_status_snapshot(status)
         self.scm_view.set_snapshot(status)
@@ -1689,10 +1759,56 @@ class MainWindow(QMainWindow):
         logger.warning("获取 Git diff 失败 %s：%s", document.remote_path, message)
         self.status.set_git("Git: unavailable")
 
+    # -- Gutter 点击：与上一版差异预览 --------------------------------------
+    def _on_peek_requested(self, document: Document, line: int) -> None:
+        """点 gutter 的变更标记 → 在该行下方弹出 diff 预览（数据已在 document.diff 里）。"""
+        self._dismiss_peek()
+        hunk = self._hunk_at_line(document, line)
+        editor = self.editor_tabs.editor_for_path(document.remote_path)
+        if hunk is None or editor is None:
+            return
+        anchor_y = editor.line_viewport_y(line)
+        if anchor_y is None:
+            return
+        peek = PeekDiffView(self.theme, editor.font(), editor)
+        peek.closeRequested.connect(self._dismiss_peek)
+        peek.show_hunk(hunk, document.remote_path)
+        # 定位到该行下方，横向留出 gutter，宽度不超出编辑器视口
+        gutter = editor.gutter_width()
+        viewport_width = editor.viewport().width()
+        width = min(max(peek.width(), 320), max(viewport_width - gutter - 16, 200))
+        peek.setFixedWidth(width)
+        peek.move(gutter + 8, anchor_y + 2)
+        peek.raise_()
+        self._peek_view = peek
+
+    @staticmethod
+    def _hunk_at_line(document: Document, line: int):
+        """找覆盖 ``line`` 的变更块；删除块的 start_line 是「之后那一行」，向前兼容。"""
+        hunks = document.diff.hunks
+        if not hunks:
+            return None
+        for hunk in hunks:
+            end = hunk.start_line + max(len(hunk.added), 1) - 1
+            if hunk.start_line <= line <= end:
+                return hunk
+        # 点到的是某块边界（纯删除时标记落在块后一行），就近取
+        for hunk in hunks:
+            if hunk.start_line >= line:
+                return hunk
+        return hunks[-1]
+
+    def _dismiss_peek(self) -> None:
+        if self._peek_view is not None:
+            self._peek_view.close()
+            self._peek_view.deleteLater()
+            self._peek_view = None
+
     # ------------------------------------------------------------------
     # 文档 / 编辑器事件
     # ------------------------------------------------------------------
     def _on_document_activated(self, document: Optional[Document]) -> None:
+        self._dismiss_peek()
         self._update_editor_stack()
         self._update_window_title()
         if document is None:

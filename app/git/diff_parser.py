@@ -21,7 +21,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from app.git.models import ChangeType, FileDiff, priority_merge
+from app.git.models import ChangeType, FileDiff, HunkDetail, priority_merge
 
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -45,11 +45,13 @@ _NO_NEWLINE_MARKER = "\\ No newline at end of file"
 
 @dataclass
 class _PendingBlock:
-    """一个连续的变更块。"""
+    """一个连续的变更块（含每行的旧 / 新文本，供点击查看 diff 用）。"""
 
     start_line: int  # 新增侧起始行号（1-based）
     deletions: int = 0
     additions: int = 0
+    removed: List[str] = field(default_factory=list)
+    added: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -143,12 +145,14 @@ def parse_unified_diff(
                 if pending is None:
                     pending = _PendingBlock(start_line=hunk_new_line)
                 pending.additions += 1
+                pending.added.append(raw[1:])
                 hunk_new_line += 1
                 new_remaining -= 1
             elif raw[:1] == "-":
                 if pending is None:
                     pending = _PendingBlock(start_line=hunk_new_line)
                 pending.deletions += 1
+                pending.removed.append(raw[1:])
                 old_remaining -= 1
             else:
                 # 上下文行（正常情况下以空格开头）
@@ -243,6 +247,8 @@ class _FileDiffBuilder:
         self.is_binary = False
         self.hunk_count = 0
         self.last_hunk_end = 0
+        #: 变更块的旧 / 新文本（点击 gutter 查看 diff 用）
+        self.hunks: List[HunkDetail] = []
 
     # -- 记录 --------------------------------------------------------------
     def note_hunk_end(self, new_end: int) -> None:
@@ -256,6 +262,15 @@ class _FileDiffBuilder:
     def apply_block(self, block: _PendingBlock) -> None:
         if block.additions == 0 and block.deletions == 0:
             return
+        # 记录这个变更块的旧 / 新文本（start_line 是新增侧起始行号）
+        if block.removed or block.added:
+            self.hunks.append(
+                HunkDetail(
+                    start_line=max(block.start_line, 1),
+                    removed=tuple(block.removed),
+                    added=tuple(block.added),
+                )
+            )
         if block.deletions == 0:
             for offset in range(block.additions):
                 self.mark(block.start_line + offset, ChangeType.ADDED)
@@ -301,6 +316,7 @@ class _FileDiffBuilder:
             is_binary=self.is_binary,
             hunk_count=self.hunk_count,
             new_line_count=self.last_hunk_end,
+            hunks=tuple(sorted(self.hunks, key=lambda hunk: hunk.start_line)),
         )
 
 

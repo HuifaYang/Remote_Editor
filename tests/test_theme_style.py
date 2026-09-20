@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QLabel
 
@@ -13,11 +15,13 @@ from app.ui import theme as theme_module
 from app.ui.theme import (
     DARK,
     LIGHT,
+    UI_FONT_BASE_SIZE,
     UI_FONT_POINT_SIZE,
     apply_theme,
     apply_ui_font,
     refresh_style,
     ui_font,
+    ui_metric_scale,
 )
 
 
@@ -111,3 +115,28 @@ def test_muted_and_error_labels_follow_theme(themed_app) -> None:
     assert text_color() == LIGHT.editor_fg
     assert text_color(muted=True) == LIGHT.gutter_fg
     assert text_color(severity="error") == LIGHT.syntax_error
+
+
+def test_ui_metric_scale_tracks_zoom_and_font_size() -> None:
+    """尺寸比例 = 缩放 × (字号 ÷ 基准字号)。
+
+    字号调大时图标 / 间距要同步变大，否则「图标比文字大」的比例会垮掉
+    （用户反馈过：字号调到 14 后图标显得比字小）。
+    """
+    assert ui_metric_scale(1.0, UI_FONT_BASE_SIZE) == pytest.approx(1.0)
+    assert ui_metric_scale(1.1, UI_FONT_BASE_SIZE) == pytest.approx(1.1)
+    assert ui_metric_scale(1.0, 14) == pytest.approx(14 / UI_FONT_BASE_SIZE)
+    assert ui_metric_scale(1.0, 14) > 1.0
+
+
+def test_theme_pixel_metrics_follow_font_size(themed_app) -> None:
+    """字体变大的同时，QSS 里的间距 / 控件尺寸也跟着变大（不是只放大文字）。"""
+    apply_theme(themed_app, DARK, ui_font_size=12)
+    small = themed_app.styleSheet()
+    apply_theme(themed_app, DARK, ui_font_size=24)
+    large = themed_app.styleSheet()
+
+    assert "font-size: 12pt" in small
+    assert "font-size: 24pt" in large
+    # 行高 / 内边距这类尺寸也变了（否则界面会「字大框小」）
+    assert small != large

@@ -639,6 +639,24 @@ class GitClient:
             counts[change] += 1
         return counts
 
+    # -- 提交 --------------------------------------------------------------
+    def commit_all(self, message: str, *, directory: Optional[str] = None) -> str:
+        """把工作区全部更改暂存并提交（对齐 VSCode 的「全部暂存 + 提交」）。
+
+        返回 ``git commit`` 的输出，供状态栏展示。这是**显式的用户动作**，
+        允许产生远端请求（与「打开源代码管理面板零请求」的性能预算互不影响）。
+        """
+        text = (message or "").strip()
+        if not text:
+            raise GitError("提交信息不能为空")
+        self.run_checked(["add", "-A"], directory=directory, message="暂存更改失败")
+        result = self.run_checked(
+            ["commit", "-m", shlex.quote(text)],
+            directory=directory,
+            message="提交失败",
+        )
+        return (result.stdout or "").strip()
+
 
 def relative_to(root: str, path: str) -> str:
     """把绝对路径转换成相对仓库根的路径（用于 git 命令参数）。"""

@@ -51,9 +51,10 @@ def build_application(argv: Optional[List[str]] = None) -> Tuple[QApplication, M
     # 内置字体与主题都在启动时注册：程序自带资源，不依赖目标机器装了什么。
     # 界面字号必须在建控件之前下发（见 apply_ui_font 的说明）。
     load_bundled_fonts()
-    apply_ui_font(app)
     settings_store = SettingsStore()
     settings = settings_store.load()
+    # 界面字号跟随设置里的编辑器字号（界面与代码一致），且必须在建控件之前下发
+    apply_ui_font(app, settings.font_size)
     reload_themes()
     apply_theme(app, get_theme(settings.theme))
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+
 import pytest
 
 from app.git.git_client import (
@@ -14,6 +16,7 @@ from app.git.git_client import (
 from app.git.models import ChangeType
 from tests.fakes import DEFAULT_ROOT, FakeSSHServer
 from app.remote.ssh_client import CommandResult
+from app.utils.errors import GitError
 
 
 @pytest.fixture
@@ -581,3 +584,39 @@ def test_relative_to() -> None:
     assert relative_to("/home/u/proj/", "/home/u/proj/src/main.c") == "src/main.c"
     assert relative_to("/home/u/proj", "/home/u/proj") == "."
     assert relative_to("/home/u/proj", "/etc/hosts") == "hosts"
+
+
+# ---------------------------------------------------------------------------
+# 提交（源代码管理面板的「提交」按钮）
+# ---------------------------------------------------------------------------
+
+
+def test_commit_all_stages_everything_then_commits(client: GitClient, server: FakeSSHServer) -> None:
+    """提交 = 先 ``git add -A``（暂存全部更改）再 ``git commit -m``。"""
+    client.commit_all("feat: 新增充电对接", directory=DEFAULT_ROOT)
+
+    assert any("add -A" in command for command in server.commands)
+    commit = [c for c in server.commands if "commit -m" in c][-1]
+    assert "feat: 新增充电对接" in commit
+
+
+def test_commit_all_quotes_the_message(client: GitClient, server: FakeSSHServer) -> None:
+    """提交信息经过 shell 引号包裹，特殊字符不会破坏命令。"""
+    client.commit_all("fix: it's broken; rm -rf /", directory=DEFAULT_ROOT)
+
+    commit = [c for c in server.commands if "commit -m" in c][-1]
+    assert shlex.quote("fix: it's broken; rm -rf /") in commit
+
+
+def test_commit_all_rejects_blank_message(client: GitClient, server: FakeSSHServer) -> None:
+    """空白提交信息直接拒绝，不产生任何远端命令。"""
+    with pytest.raises(GitError):
+        client.commit_all("   ", directory=DEFAULT_ROOT)
+    assert not [c for c in server.commands if "commit -m" in c]
+
+
+def test_commit_all_reports_git_failure(client: GitClient, server: FakeSSHServer) -> None:
+    """git 报错时抛出带原因的错误（例如没配 user.name）。"""
+    server.fail_commands = True
+    with pytest.raises(GitError):
+        client.commit_all("chore: 试试", directory=DEFAULT_ROOT)

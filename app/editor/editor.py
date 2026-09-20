@@ -47,12 +47,22 @@ class LineNumberArea(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802
         self._editor.paint_gutter(event)
 
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        """点击 gutter 的变更标记 → 让编辑器弹出「与上一版差异」预览。"""
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._editor.handle_gutter_click(int(event.position().y()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 
 class CodeEditor(QPlainTextEdit):
     """QPlainTextEdit 的增强版。"""
 
     cursorMoved = Signal(int, int)
     saveRequested = Signal()
+    #: 点击 gutter 的变更标记（行号，1-based）
+    changePeekRequested = Signal(int)
 
     def __init__(
         self,
@@ -344,7 +354,45 @@ class CodeEditor(QPlainTextEdit):
         cursor.endEditBlock()
         return count
 
-    # -- 行号区绘制 --------------------------------------------------------
+    # -- Gutter 点击（查看与上一版差异）--------------------------------------
+    def handle_gutter_click(self, y: int) -> None:
+        """把 gutter 里的 y 坐标换算成行号；该行有变更标记就发 ``changePeekRequested``。"""
+        line = self._line_at_y(y)
+        if line is not None and self._decorator.change_for_line(line) is not None:
+            self.changePeekRequested.emit(line)
+
+    def _line_at_y(self, y: int) -> Optional[int]:
+        """gutter / 视口 y 坐标 → 1-based 行号；不在任何行上返回 ``None``。"""
+        block = self.firstVisibleBlock()
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        bottom = top + int(self.blockBoundingRect(block).height())
+        number = block.blockNumber()
+        while block.isValid():
+            if block.isVisible() and top <= y < bottom:
+                return number + 1
+            block = block.next()
+            top = bottom
+            bottom = top + int(self.blockBoundingRect(block).height())
+            number += 1
+        return None
+
+    def line_viewport_y(self, line: int) -> Optional[int]:
+        """1-based 行号 → 该行底部在编辑器 viewport 里的 y 坐标（peek 浮层定位用）。
+
+        行不可见（滚动出视口）时返回 ``None``。
+        """
+        block = self.document().findBlockByNumber(line - 1)
+        if not block.isValid():
+            return None
+        top = int(self.blockBoundingGeometry(block).translated(self.contentOffset()).top())
+        height = int(self.blockBoundingRect(block).height())
+        viewport_top = 0
+        viewport_bottom = self.viewport().height()
+        if top + height < viewport_top or top > viewport_bottom:
+            return None
+        return top + height
+
+        # -- 行号区绘制 --------------------------------------------------------
     def gutter_width(self) -> int:
         digits = max(len(str(self.blockCount())), 3)
         return MARKER_COLUMN + GUTTER_PADDING + self.fontMetrics().horizontalAdvance("9") * digits

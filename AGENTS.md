@@ -27,7 +27,7 @@ SKIP_DEB=1 bash scripts/build_linux.sh             # 只要 AppImage
 #          scripts\build_windows_installer.bat（只要安装包，需要 makensis）
 ```
 
-基线：**488 passed, 27 skipped**（27 个 skip 是需要真实网络/端口的 SSH 端到端用例，
+基线：**521 passed, 27 skipped**（27 个 skip 是需要真实网络/端口的 SSH 端到端用例，
 沙箱里 socket 被禁所以全跳过；在外面跑这 27 个是真的会用真实 paramiko 服务端验证）。
 `tests/test_ssh_end_to_end.py` 会在进程内起真实 SSH/SFTP 服务，沙箱里通常监听不了端口而自动跳过 ——
 **不要用 require_escalated 反复重试它**，会卡住。
@@ -57,15 +57,15 @@ SKIP_DEB=1 bash scripts/build_linux.sh             # 只要 AppImage
 | `app/ui/fonts.py` | 内置字体注册（`assets/fonts/`），等宽字体优先选内置的 |
 | `app/ui/icon_theme.py` | 文件图标主题（`assets/icon-themes/`，VSCode 图标主题规范，SVG 走自带的 `QtSvg`） |
 | `app/ui/resources.py` | **用户可替换资源目录**（`<配置目录>/{themes,fonts,icon-themes}`）+ `open_resource_dir()`；设置对话框「外观 → 资源目录」用 |
-| `app/ui/icons.py` | `QPainter` 现画的 16px 单色线条图标（无图标字体 / SVG 资源，带 2 倍图） |
-| `app/ui/widgets/` | `activity_bar`（活动栏）· `welcome`（起始页）· `file_tree`（文件树）· `scm_view`（源代码管理）· `badge`（变更徽标 Delegate）· `editor_tabs` · `search_bar` · `status_bar` · `log_view` · `hosts_view`（远程资源管理器）· `title_bar`（自绘标题栏 + 边缘缩放过滤器）· `terminal_canvas` / `terminal_view` / `terminal_panel`（终端） |
+| `app/ui/icons.py` | 优先用 `assets/ui-icons/` 里的 **Codicons SVG**（VSCode 官方图标集，`currentColor` 换成主题色后交给 `QtSvg`），没有对应 SVG 时回退 `QPainter` 手画 |
+| `app/ui/widgets/` | `fade_button`（悬停淡入淡出按钮）· `peek_diff`（gutter 点击弹出的差异浮层）· `markdown_preview`（Markdown 渲染）· `activity_bar`（活动栏）· `welcome`（起始页）· `file_tree`（文件树）· `scm_view`（源代码管理）· `badge`（变更徽标 Delegate）· `editor_tabs` · `search_bar` · `status_bar` · `log_view` · `hosts_view`（远程资源管理器）· `title_bar`（自绘标题栏 + 边缘缩放过滤器）· `terminal_canvas` / `terminal_view` / `terminal_panel`（终端） |
 | `app/terminal/` | `screen`（VT100/xterm 子集的屏幕模型，纯 Python）· `keys`（按键 → 转义序列，纯函数） |
 | `app/remote/` | `ssh_client`（会话 + 锁）· `sftp_client`（列目录 / 上下行 / 原子写）· `remote_fs`（门面 + 指纹 + 路径规范化）· `session` · `shell_channel`（交互式 shell + PTY，终端用） |
 | `app/git/` | `git_client`（远端 git 命令 + `TreeStatus` 快照）· `diff_parser`（纯函数）· `models` |
 | `app/editor/` | `editor`（CodeEditor：行号 / Gutter / 搜索替换）· `document`（文档模型）· `syntax` · `git_decorations` |
 | `app/config/` | `settings`（含版本迁移）· `hosts`（不存密码） |
 | `app/utils/` | `errors` · `paths` · `encoding` · `ssh_keys`（本机 `~/.ssh` 识别 / config 导入） |
-| `assets/` | 随程序分发的资源：`icon.png/.ico` · `fonts/`（内置字体）· `themes/`（VSCode 主题 JSON）· `icon-themes/`（VSCode 文件图标主题）；打包脚本已 `--add-data assets` |
+| `assets/` | 随程序分发的资源：`ui-icons/`（Codicons，CC-BY 4.0）· `icon.png/.ico` · `fonts/`（内置字体）· `themes/`（VSCode 主题 JSON）· `icon-themes/`（VSCode 文件图标主题）；打包脚本已 `--add-data assets` |
 
 打包后 `assets/` 在临时目录里改不了，所以外观资源**用户可放「配置目录」下新增**（详见
 [docs/packaging.md](docs/packaging.md)）：`themes/` · `fonts/` · `icon-themes/`。
@@ -143,11 +143,16 @@ SKIP_DEB=1 bash scripts/build_linux.sh             # 只要 AppImage
   双形态打包（免安装 AppImage/exe + 安装版 .deb/NSIS）、**自绘标题栏**（`widgets/title_bar.py`）、
   连接入口改侧边栏**「远程资源管理器」**（`widgets/hosts_view.py`，主机 + 历史工作目录 + 底部凭据行）、
   **底部集成终端**（`app/terminal/` + `app/remote/shell_channel.py` + `widgets/terminal_*`，
-  自绘字符网格、GPU / 软渲染双路径）。
+  自绘字符网格、GPU / 软渲染双路径）、**界面现代化**（Codicons 图标 / 底色层次 / 字体抗锯齿 /
+  悬停淡入淡出 / 真正的全局缩放 / 界面与代码字号统一）、**gutter 点击查看与上一版差异**、
+  **Markdown 渲染预览**（`widgets/markdown_preview.py`）、**源代码管理可提交**
+  （`GitClient.commit_all` = 全部暂存后提交）。
 - 已知限制：不调用 `ssh-agent`；`~/.ssh/config` 只识别 `Host/HostName/Port/User/IdentityFile`；
   单文件默认上限 32MB；远端零服务；终端是「够用子集」（无鼠标上报 / DEC 字符集重映射），
   GPU 渲染路径在无显示器的环境没法实测（离屏平台自动走软渲染）。详见 design.md §6。
-- 未做：`Ctrl+B` 快捷键收起侧边栏、SCM 的暂存区 / 分组、**插件机制**（方向见 design.md §7，本版本明确不实现）。
+- 未做：`Ctrl+B` 快捷键收起侧边栏、SCM 的**暂存区**（当前只有「全部暂存后提交」）、
+  Markdown 预览里的远端图片（相对路径的图片不会加载）、**插件机制**（方向见 design.md §7，
+  本版本明确不实现）。
 - `assets/` 已入库 JetBrains Mono（5 个 TTF）、GitHub Dark/Light 全系 9 套主题、
   Material Icon Theme（1251 个 SVG，保持上游 `dist/` 布局）：**换主题/字体/图标不要改代码**，
   按各目录的 README 放文件即可；新增资源记得带上许可文件。

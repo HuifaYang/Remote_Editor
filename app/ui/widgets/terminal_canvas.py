@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -442,6 +442,36 @@ class TerminalCanvasMixin:
             painter.drawText(QPointF(col * self._cell_w, row * self._cell_h + self._ascent), cell.char)
 
     # -- 键盘 --------------------------------------------------------------
+    #: 终端自己消费的快捷键（``(ctrl, shift, 键名)``）：窗口 / 菜单上绑定同名
+    #: 快捷键时（例如「切换 Markdown 预览」用 Ctrl+Shift+V）必须把它们抢回来，
+    #: 否则终端粘贴会被窗口快捷键截走。
+    _OWN_SHORTCUTS = {(True, True, "Key_C"), (True, True, "Key_V")}
+
+    def event(self, event) -> bool:  # noqa: D102 - Qt 接口
+        """用 ShortcutOverride 声明终端的快捷键归属。
+
+        Qt 先把按键以 ``ShortcutOverride`` 发给焦点控件：控件接受了，窗口级
+        QAction 就不会触发。没有这一步，终端里的 Ctrl+Shift+V 粘贴会变成
+        「切换 Markdown 预览」。
+        """
+        if event.type() == QEvent.Type.ShortcutOverride:
+            if self._owns_shortcut(event):
+                event.accept()
+                return True
+        return super().event(event)
+
+    def _owns_shortcut(self, event) -> bool:
+        modifiers = event.modifiers()
+        try:
+            name = Qt.Key(event.key()).name
+        except ValueError:  # pragma: no cover - 未知键位
+            return False
+        return (
+            bool(modifiers & Qt.KeyboardModifier.ControlModifier),
+            bool(modifiers & Qt.KeyboardModifier.ShiftModifier),
+            name,
+        ) in self._OWN_SHORTCUTS
+
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: D102 - Qt 接口
         modifiers = event.modifiers()
         ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)

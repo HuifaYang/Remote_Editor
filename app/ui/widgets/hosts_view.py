@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QObject, QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -70,6 +70,7 @@ class HostsView(QWidget):
         self._theme = theme
         self._connected_id = ""
         self._secret_host: Optional[HostConfig] = None
+        self._ui_scale: float = 1.0
         self._buttons = []
         # 最近一次按下的位置（视口坐标）：判断点的是不是展开箭头。
         # 不能用 QCursor.pos()：那是全局位置，程序化触发 / 离屏测试时完全不可靠。
@@ -119,7 +120,8 @@ class HostsView(QWidget):
         self.tree.setHeaderHidden(True)
         self.tree.setRootIsDecorated(True)
         self.tree.setUniformRowHeights(True)
-        self.tree.setIndentation(14)
+        self.tree.setIndentation(16)
+        self.tree.setIconSize(QSize(16, 16))
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_context_menu)
         self.tree.itemClicked.connect(self._on_item_clicked)
@@ -169,6 +171,10 @@ class HostsView(QWidget):
         group = QTreeWidgetItem([GROUP_TITLE])
         group.setFlags(Qt.ItemFlag.ItemIsEnabled)
         group.setData(0, KIND_ROLE, "")
+        group.setForeground(0, self._theme.color("gutter_fg"))
+        group_font = group.font(0)
+        group_font.setPointSizeF(max(7.5, group_font.pointSizeF() - 1.0))
+        group.setFont(0, group_font)
         self.tree.addTopLevelItem(group)
         for host in hosts:
             group.addChild(self._make_host_item(host))
@@ -187,16 +193,30 @@ class HostsView(QWidget):
         item.setData(0, KIND_ROLE, HOST_KIND)
         item.setData(0, HOST_ID_ROLE, host.id)
         item.setToolTip(0, f"{host.target}\n单击连接；展开可看到最近打开过的目录")
+        item.setIcon(0, self._host_icon(host.id))
         for path in host.recent_workspaces:
             child = QTreeWidgetItem([path])
             child.setData(0, KIND_ROLE, WORKSPACE_KIND)
             child.setData(0, HOST_ID_ROLE, host.id)
             child.setData(0, WORKSPACE_ROLE, path)
             child.setToolTip(0, f"连接 {host.display_name} 并打开 {path}")
+            child.setIcon(0, make_icon("history", self._theme.color("gutter_fg"), size=self._icon_px()))
             item.addChild(child)
         if host.recent_workspaces:
             item.setToolTip(0, f"{host.target}\n单击连接；展开可看到最近打开过的目录")
         return item
+
+    def _icon_px(self) -> int:
+        return max(8, round(16 * self._ui_scale))
+
+    def _host_icon(self, host_id: str):
+        """主机图标：连接中的点亮 accent，其余用低对比度色。"""
+        color = (
+            self._theme.color("accent")
+            if host_id == self._connected_id
+            else self._theme.color("gutter_fg")
+        )
+        return make_icon("host", color, size=self._icon_px())
 
     def host_item(self, host_id: str) -> Optional[QTreeWidgetItem]:
         for item in self._host_items():
@@ -240,10 +260,12 @@ class HostsView(QWidget):
 
     def _sync_connected_item(self) -> None:
         for item in self._host_items():
-            connected = item.data(0, HOST_ID_ROLE) == self._connected_id
+            host_id = str(item.data(0, HOST_ID_ROLE) or "")
+            connected = host_id == self._connected_id
             font = item.font(0)
             font.setBold(connected)
             item.setFont(0, font)
+            item.setIcon(0, self._host_icon(host_id))
 
     def collapse_all(self) -> None:
         self.tree.collapseAll()
@@ -251,11 +273,17 @@ class HostsView(QWidget):
         if group is not None:
             group.setExpanded(True)
 
-    def apply_theme(self, theme: Theme) -> None:
+    def apply_theme(self, theme: Theme, *, ui_scale: float = 1.0) -> None:
         self._theme = theme
+        scale = max(0.5, min(3.0, float(ui_scale)))
+        self._ui_scale = scale
+        self.tree.setIndentation(round(16 * scale))
+        self.tree.setIconSize(QSize(round(16 * scale), round(16 * scale)))
         color = theme.color("gutter_fg")
         for button, icon in self._buttons:
-            button.setIcon(make_icon(icon, color))
+            button.setIcon(make_icon(icon, color, size=round(16 * scale)))
+        # 树里的主机 / 历史图标颜色与尺寸也随主题、缩放重建
+        self.reload()
 
     # -- 凭据 --------------------------------------------------------------
     def request_secret(self, host: HostConfig, label: str, *, hint: str = "") -> None:
