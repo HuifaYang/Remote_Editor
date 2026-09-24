@@ -1,0 +1,73 @@
+/* 外壳布局（总纲 §6.1 像素级结构） */
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-window);
+  color: var(--fg);
+  font-family: var(--ui-font);
+  font-size: var(--font-size);
+  user-select: none;
+}
+
+#app { display: flex; flex-direction: column; }
+
+.workbench {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.activity-bar {
+  width: var(--activitybar-w);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+}
+
+.sidebar { /* 可拖 200~480px */
+  width: var(--sidebar-w);
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-panel);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+.sidebar.hidden { display: none; }
+
+.editor-area {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-editor);
+}
+
+.editor-container {
+  flex: 1;
+  min-height: 0;
+}
+
+/* 可拖分隔条（U1：热区 6px，默认 1px 中线，悬停变强调色） */
+.divider { flex: none; position: relative; z-index: 30; }
+.sidebar-divider { width: 6px; cursor: ew-resize; border-left: 1px solid var(--border); }
+.sidebar-divider:hover { border-left-color: var(--accent); }
+.panel-divider { height: 6px; cursor: ns-resize; border-top: 1px solid var(--border); }
+.panel-divider:hover { border-top-color: var(--accent); }
+
+/* 边缘缩放的 8px 透明热区（总纲 §13 坑 12） */
+.resize-zone { position: fixed; z-index: 9999; }
+.resize-zone.top    { top: 0; left: 8px; right: 8px; height: 8px; cursor: ns-resize; }
+.resize-zone.bottom { bottom: 0; left: 8px; right: 8px; height: 8px; cursor: ns-resize; }
+.resize-zone.left   { left: 0; top: 8px; bottom: 8px; width: 8px; cursor: ew-resize; }
+.resize-zone.right  { right: 0; top: 8px; bottom: 8px; width: 8px; cursor: ew-resize; }
+.resize-zone.top-left     { top: 0; left: 0; width: 8px; height: 8px; cursor: nwse-resize; }
+.resize-zone.top-right    { top: 0; right: 0; width: 8px; height: 8px; cursor: nesw-resize; }
+.resize-zone.bottom-left  { bottom: 0; left: 0; width: 8px; height: 8px; cursor: nesw-resize; }
+.resize-zone.bottom-right { bottom: 0; right: 0; width: 8px; height: 8px; cursor: nwse-resize; }

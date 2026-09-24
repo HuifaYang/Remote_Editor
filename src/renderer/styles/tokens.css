@@ -1,0 +1,121 @@
+/* 唯一颜色来源（总纲 §6.2）：禁止在别处写死颜色 */
+:root {
+  /* 基础背景 / 前景 */
+  --bg-window: #1f1f1f;
+  --bg-panel: #181818;
+  --bg-editor: #1f1f1f;
+  --bg-input: #313131;
+  --bg-input-hover: #383838;
+  --bg-hover: #2a2d2e;
+  --bg-selected: #04395e;
+  --bg-selected-inactive: #37373d;
+  --bg-elevated: #242424;
+  --fg: #cccccc;
+  --fg-muted: #9d9d9d;
+  --fg-subtle: #767676;
+  --fg-inverse: #ffffff;
+  --border: #3c3c3c;
+  --border-strong: #5a5a5a;
+  --divider: #454545;
+
+  /* 操作与状态 */
+  --accent: #0078d4;
+  --accent-hover: #1c8ae0;
+  --accent-active: #0060aa;
+  --accent-fg: #ffffff;
+  --focus-ring: #0090f1;
+  --success: #3fb950;
+  --warning: #e3b341;
+  --error: #f85149;
+  --info: #58a6ff;
+
+  /* 控件 */
+  --button-bg: #313131;
+  --button-bg-hover: #3c3c3c;
+  --button-bg-active: #454545;
+  --button-border: #464646;
+  --disabled-bg: #2b2b2b;
+  --disabled-fg: #777777;
+  --switch-off: #4a4a4a;
+  --switch-on: #0078d4;
+  --input-border: #464646;
+  --input-error: #f85149;
+
+  /* Git / 提交 */
+  --commit-green: #238636;
+  --commit-green-hover: #2ea043;
+  --git-added: #3fb950;
+  --git-modified: #e3b341;
+  --git-deleted: #f85149;
+
+  /* 浮层与阴影（仍是颜色 token，不在业务 CSS 中写死） */
+  --bg-overlay: rgb(0 0 0 / 58%);
+  --shadow-menu: 0 8px 24px rgb(0 0 0 / 42%);
+  --shadow-dialog: 0 18px 56px rgb(0 0 0 / 48%);
+  --shadow-popover: 0 6px 20px rgb(0 0 0 / 38%);
+
+  /* 尺寸 / 字体 */
+  --titlebar-h: 32px;
+  --statusbar-h: 24px;
+  --activitybar-w: 44px;
+  --sidebar-w: 260px;
+  --control-h: 28px;
+  --control-h-sm: 24px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --ui-font: system-ui, -apple-system, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif;
+  --mono-font: "JetBrains Mono", Consolas, monospace;
+  --font-size: 12px;
+}
+
+[data-theme="light"] {
+  --bg-window: #f3f3f3;
+  --bg-panel: #ffffff;
+  --bg-editor: #ffffff;
+  --bg-input: #ffffff;
+  --bg-input-hover: #f5f5f5;
+  --bg-hover: #e8e8e8;
+  --bg-selected: #add6ff;
+  --bg-selected-inactive: #e4e6f1;
+  --bg-elevated: #ffffff;
+  --fg: #3b3b3b;
+  --fg-muted: #6e6e6e;
+  --fg-subtle: #8a8a8a;
+  --fg-inverse: #ffffff;
+  --border: #d4d4d4;
+  --border-strong: #b8b8b8;
+  --divider: #c8c8c8;
+
+  --accent: #005fb8;
+  --accent-hover: #006fbf;
+  --accent-active: #005a9e;
+  --accent-fg: #ffffff;
+  --focus-ring: #0078d4;
+  --success: #1a7f37;
+  --warning: #9a6700;
+  --error: #d1242f;
+  --info: #0550ae;
+
+  --button-bg: #f0f0f0;
+  --button-bg-hover: #e5e5e5;
+  --button-bg-active: #dcdcdc;
+  --button-border: #c8c8c8;
+  --disabled-bg: #f1f1f1;
+  --disabled-fg: #9b9b9b;
+  --switch-off: #9c9c9c;
+  --switch-on: #005fb8;
+  --input-border: #c8c8c8;
+  --input-error: #d1242f;
+
+  --commit-green: #1a7f37;
+  --commit-green-hover: #2da44e;
+  --git-added: #1a7f37;
+  --git-modified: #9a6700;
+  --git-deleted: #d1242f;
+
+  --bg-overlay: rgb(0 0 0 / 30%);
+  --shadow-menu: 0 8px 24px rgb(0 0 0 / 18%);
+  --shadow-dialog: 0 18px 56px rgb(0 0 0 / 24%);
+  --shadow-popover: 0 6px 20px rgb(0 0 0 / 16%);
+}

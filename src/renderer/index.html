@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <!-- CSP：Monaco 走 'self' 的 AMD loader；样式注入与 blob worker 需要 unsafe-inline / blob: -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; worker-src 'self' blob:">
+  <title>RemoteCodeEditor</title>
+  <link rel="stylesheet" href="./styles/tokens.css">
+  <link rel="stylesheet" href="./styles/shell.css">
+  <link rel="stylesheet" href="./styles/components.css">
+</head>
+<body>
+  <div id="app"></div>
+  <!-- Monaco AMD loader（总纲 §13 坑 1：不引打包器，直接 file:// 加载 node_modules 里的 min/vs） -->
+  <!-- xterm 的 UMD 会检查 AMD：必须排在 Monaco loader 之前，否则两者抢 define -->
+  <script src="../../node_modules/xterm/lib/xterm.js"></script>
+  <script src="../../node_modules/xterm-addon-fit/lib/xterm-addon-fit.js"></script>
+  <script src="../../node_modules/monaco-editor/min/vs/loader.js"></script>
+  <script type="module" src="./renderer/app/main.js"></script>
+</body>
+</html>

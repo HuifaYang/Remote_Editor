@@ -1,0 +1,46 @@
+{
+  "name": "remote-code-editor",
+  "productName": "RemoteCodeEditor",
+  "version": "2.0.0-alpha.0",
+  "description": "轻量级 SSH 远程代码编辑器（远端零部署）",
+  "private": true,
+  "license": "MIT",
+  "author": "yon",
+  "main": "dist/main/main/index.js",
+  "scripts": {
+    "compile": "tsc -b tsconfig.json",
+    "copy-assets": "node scripts/copy-assets.mjs",
+    "start": "npm run compile && npm run copy-assets && electron .",
+    "typecheck": "tsc -b tsconfig.json --force",
+    "lint": "eslint . --ext .ts,.mjs",
+    "test": "vitest run",
+    "build": "npm run compile && npm run copy-assets && electron-builder",
+    "build:dir": "npm run compile && npm run copy-assets && electron-builder --dir",
+    "smoke": "npm run compile && npm run copy-assets && electron scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "monaco-editor": "^0.52.0",
+    "ssh2": "^1.16.0",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/ssh2": "^1.15.0",
+    "@typescript-eslint/eslint-plugin": "^8.15.0",
+    "@typescript-eslint/parser": "^8.15.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.0",
+    "eslint": "^8.57.0",
+    "happy-dom": "^15.11.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.0"
+  },
+  "allowScripts": {
+    "electron@33.4.11": true,
+    "esbuild@0.21.5": true,
+    "cpu-features": false,
+    "ssh2@1.17.0": true
+  }
+}

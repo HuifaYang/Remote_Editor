@@ -1,0 +1,35 @@
+appId: com.remote-code-editor
+productName: RemoteCodeEditor
+asar: true
+# 无必装原生模块（ssh2 的 cpu-features 是可选加速项），跳过 electron-rebuild，
+# 否则 builder 会对 cpu-features 跑 node-gyp 并因环境缺头文件失败
+npmRebuild: false
+directories:
+  output: release
+files:
+  - dist/**
+  - resources/**
+  - package.json
+# 生产依赖（monaco-editor / ssh2 / xterm*）由 electron-builder 自动随 node_modules 打入
+extraResources:
+  # 内置 clangd（总纲 §5.5 第 0 条）；M1 阶段目录为占位，M3 放入真实二进制
+  - from: resources/clangd/${os}
+    to: clangd
+win:
+  icon: resources/icon.ico
+  target:
+    - nsis
+    - portable
+linux:
+  icon: resources/icon.png
+  # deb 必须有 maintainer，否则 electron-builder 直接报错退出
+  maintainer: yon <yon@localhost>
+  category: Development
+  target:
+    - AppImage
+    - deb
+# macOS 暂缓出包（总纲 §1.4）：配置保留，CI 不构建
+mac:
+  icon: resources/icon.png
+  target:
+    - dmg

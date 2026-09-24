@@ -1,0 +1,12 @@
+{
+  "//": "渲染进程：ESM 输出给浏览器直接加载；无 Node 类型，禁止 import Node 模块",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist/renderer",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "types": []
+  },
+  "include": ["src/renderer/**/*", "src/shared/**/*"]
+}

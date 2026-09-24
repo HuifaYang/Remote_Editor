@@ -1,0 +1,9 @@
+{
+  "//": "根配置：references 分层（shared 被各层各自编译进自己的 outDir，运行时相对路径一致）",
+  "files": [],
+  "references": [
+    { "path": "tsconfig.main.json" },
+    { "path": "tsconfig.preload.json" },
+    { "path": "tsconfig.renderer.json" }
+  ]
+}
