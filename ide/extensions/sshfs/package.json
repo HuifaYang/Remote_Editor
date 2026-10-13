@@ -1,7 +1,7 @@
 {
   "name": "rce-remote",
-  "displayName": "RemoteCodeEditor 远程 SSH",
-  "description": "用我们自己的 SSH/SFTP 层替代 Remote-SSH：远端文件系统、终端、搜索、源代码管理、语言服务（clangd/pylsp 走本地镜像）",
+  "displayName": "织码 WeaveCode 远程 SSH",
+  "description": "织码 WeaveCode 的 SSH/SFTP 远端层：远端文件、终端、搜索、SCM、任务和本机影子语言服务",
   "version": "0.2.0",
   "publisher": "remote-code-editor",
   "private": true,
@@ -44,68 +44,68 @@
       {
         "command": "rce.connect",
         "title": "连接到远程主机…",
-        "category": "RemoteCodeEditor"
+        "category": "织码 WeaveCode"
       },
       {
         "command": "rce.disconnect",
         "title": "断开远程连接",
-        "category": "RemoteCodeEditor"
+        "category": "织码 WeaveCode"
       },
       {
         "command": "rce.newRemoteTerminal",
         "title": "新建远程终端",
-        "category": "RemoteCodeEditor"
+        "category": "织码 WeaveCode"
       },
       {
         "command": "rce.showLog",
         "title": "显示日志",
-        "category": "RemoteCodeEditor"
+        "category": "织码 WeaveCode"
       },
       {
         "command": "rce.scm.refresh",
         "title": "刷新远端仓库",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(refresh)"
       },
       {
         "command": "rce.scm.stage",
         "title": "暂存更改",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(add)"
       },
       {
         "command": "rce.scm.unstage",
         "title": "取消暂存",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(remove)"
       },
       {
         "command": "rce.scm.discard",
         "title": "放弃更改",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(discard)"
       },
       {
         "command": "rce.scm.commit",
         "title": "提交",
-        "category": "RemoteCodeEditor"
+        "category": "织码 WeaveCode"
       },
       {
         "command": "rce.lsp.syncMirror",
         "title": "重新同步远端镜像",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(cloud-download)"
       },
       {
         "command": "rce.lsp.restart",
         "title": "重启语言服务",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(debug-restart)"
       },
       {
         "command": "rce.cache.cleanup",
         "title": "清理本机语言服务缓存",
-        "category": "RemoteCodeEditor",
+        "category": "织码 WeaveCode",
         "icon": "$(trash)"
       },
       {
@@ -300,7 +300,7 @@
       ]
     },
     "configuration": {
-      "title": "RemoteCodeEditor",
+      "title": "织码 WeaveCode",
       "properties": {
         "rce.watch.pollMs": {
           "type": "number",
@@ -386,15 +386,15 @@
       }
     },
     "configurationDefaults": {
-      "terminal.integrated.defaultProfile.linux": "RemoteCodeEditor",
-      "terminal.integrated.defaultProfile.osx": "RemoteCodeEditor",
+      "terminal.integrated.defaultProfile.linux": "织码 WeaveCode",
+      "terminal.integrated.defaultProfile.osx": "织码 WeaveCode",
       "window.confirmSaveUntitledWorkspace": false
     },
     "terminal": {
       "profiles": [
         {
           "id": "rceRemote",
-          "title": "RemoteCodeEditor",
+          "title": "织码 WeaveCode",
           "icon": "remote"
         }
       ]

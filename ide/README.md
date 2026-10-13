@@ -1,6 +1,6 @@
 # ide —— CodeOSS 产品层
 
-`ide/` 是 RemoteCodeEditor 的 CodeOSS 产品层：
+`ide/` 是织码 WeaveCode 的 CodeOSS 产品层：
 
 ```text
 ide/
@@ -20,6 +20,11 @@ ide/
 └── tools/                  # 构建、启动、E2E、VSIX 安装、上游补丁
 ```
 
+## 品牌资产
+
+品牌名为 **织码 WeaveCode**。真源在仓库根 `resources/brand/`，由
+`ide/tools/generate-brand-assets.py` 生成；`apply-branding.mjs` 负责同步到上游 CodeOSS 打包路径。
+
 ## 上游 CodeOSS
 
 `ide/vscode` 是 `microsoft/vscode` 的 git submodule，不包含在普通文件提交里，也不提交
@@ -33,7 +38,7 @@ node ide/tools/apply-branding.mjs
 `apply-branding.mjs` 是唯一的品牌/集成补丁入口，幂等；升级上游后只需拉新子模块提交并重跑它。
 它会：
 
-- 写入 RemoteCodeEditor 品牌和 Open VSX 配置；
+- 写入织码 WeaveCode 品牌和 Open VSX 配置；
 - 保留上游 Copilot / Chat 所需的 proposed API 白名单，并追加我们的 `rce-remote` 白名单；
 - 移除不随本仓库发布的专有 Copilot 源码目录，避免打包缺失 SDK；
 - 修复 Electron 本地缓存打包；

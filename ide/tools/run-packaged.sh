@@ -4,7 +4,7 @@
 set -euo pipefail
 
 TOOLS="$(cd "$(dirname "$0")" && pwd)"
-APP="$TOOLS/../VSCode-linux-x64/remote-code-editor"
+APP="$TOOLS/../VSCode-linux-x64/weavecode"
 [ -x "$APP" ] || { echo "还没有打包产物：先跑 npm run gulp vscode-linux-x64"; exit 1; }
 
 mkdir -p "$TOOLS/udd-pkg" "$TOOLS/ext-pkg" "$TOOLS/shots"

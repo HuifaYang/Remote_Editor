@@ -1,6 +1,12 @@
-# RemoteCodeEditor
+#织码 WeaveCode
 
-RemoteCodeEditor 是一个面向嵌入式 ARM 板卡的远程 IDE。它不是重新画一个编辑器壳，而是以
+<p align="left">
+  <img src="resources/brand/weavecode-lockup-light.png" alt="织码 WeaveCode" width="520">
+</p>
+
+**织码 WeaveCode** = 把远端、源码、语言服务和 AI 补全织在一起。
+
+织码 WeaveCode 是一个面向嵌入式 ARM 板卡的远程 IDE。它不是重新画一个编辑器壳，而是以
 **CodeOSS 为界面和工作台底座**，用我们自己的 SSH/SFTP 层替换 VS Code Remote-SSH，并在本机维护
 源码影子缓存，让 clangd / pylsp / GitHub Copilot 这类本机能力可以直接工作。
 
@@ -39,6 +45,17 @@ RemoteCodeEditor 是一个面向嵌入式 ARM 板卡的远程 IDE。它不是重
 
 旧 V2（Electron + Monaco 自绘外壳）已经从主线删除。保留的 `src/` 只是 CodeOSS 扩展复用的
 SSH/SFTP/Git/搜索/终端/镜像/LSP 核心，不再是独立应用程序。
+
+## 品牌资产
+
+品牌名为 **织码 WeaveCode**，视觉资产在 `resources/brand/`：
+
+- `weavecode-mark.svg`：主标记
+- `weavecode-lockup-light.svg` / `weavecode-lockup-dark.svg`：明暗字标
+- `weavecode-icon-1024.png`、`weavecode.icns`、`resources/icon.ico`：应用图标
+- `ide/tools/generate-brand-assets.py`：可重复生成全部资产
+
+`apply-branding.mjs` 会在构建时把这些图标同步到 CodeOSS 的 Linux / Windows / macOS / Server 图标路径。
 
 ## 快速开始
 
@@ -114,7 +131,7 @@ sshfs://user@host:port/项目/src/main.c
 # 把 VS Code 里的 GitHub Copilot VSIX 安装到开发版扩展目录
 bash ide/tools/install-vsix.sh /path/to/GitHub.copilot.vsix
 
-# 然后重启 RemoteCodeEditor，在编辑器里登录 GitHub Copilot
+# 然后重启织码 WeaveCode，在编辑器里登录 GitHub Copilot
 ```
 
 说明：

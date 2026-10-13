@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 410">
+  <g transform="translate(24 24) scale(.707)"><defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080f20"/>
+      <stop offset="1" stop-color="#142f56"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#46dcff"/>
+      <stop offset="1" stop-color="#2aa9e8"/>
+    </linearGradient>
+    <linearGradient id="mint" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#70f2ae"/>
+      <stop offset="1" stop-color="#2ecf9d"/>
+    </linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#bg)" stroke="#ffffff22" stroke-width="2"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" filter="url(#glow)">
+    <path d="M112 202 L82 256 L112 310" stroke="#cdeBff" stroke-opacity=".45" stroke-width="7"/>
+    <path d="M400 202 L430 256 L400 310" stroke="#cdeBff" stroke-opacity=".45" stroke-width="7"/>
+    <path d="M150 166 L214 354 L256 246" stroke="url(#cyan)" stroke-width="36"/>
+    <path d="M362 166 L298 354 L256 246" stroke="url(#mint)" stroke-width="36"/>
+  </g>
+  <circle cx="256" cy="246" r="21" fill="#09162a"/>
+  <circle cx="256" cy="246" r="8" fill="#f0fffc"/>
+</svg></g>
+  <text x="292" y="182" fill="#f4faff" font-family="Noto Sans CJK SC, sans-serif" font-size="126" font-weight="900">织码</text>
+  <text x="302" y="260" fill="#aae1f5" font-family="DejaVu Sans, sans-serif" font-size="38" font-weight="700" letter-spacing="10">WEAVECODE</text>
+  <text x="304" y="312" fill="#aae1f5" font-family="Noto Sans CJK SC, sans-serif" font-size="22">远端 · 本地 · 智能</text>
+</svg>

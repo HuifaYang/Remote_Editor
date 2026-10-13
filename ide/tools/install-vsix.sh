@@ -12,7 +12,7 @@ DEST="${2:-$TOOLS/ext-oss}"
 [ -f "$VSIX" ] || { echo "找不到 VSIX：$VSIX" >&2; exit 1; }
 mkdir -p "$DEST"
 
-APP_CLI="$TOOLS/../VSCode-linux-x64/bin/remote-code-editor"
+APP_CLI="$TOOLS/../VSCode-linux-x64/bin/weavecode"
 if [ -x "$APP_CLI" ] && [ "${RCE_VSIX_MANUAL:-0}" != "1" ]; then
   # 优先走 CodeOSS 自己的 CLI：它会正确更新 extensions.json，不会再把手装目录标成 obsolete。
   for v in ELECTRON_RUN_AS_NODE ELECTRON_NO_ATTACH_CONSOLE VSCODE_ESM_ENTRYPOINT \
@@ -22,7 +22,7 @@ if [ -x "$APP_CLI" ] && [ "${RCE_VSIX_MANUAL:-0}" != "1" ]; then
   export ELECTRON_DISABLE_SANDBOX=1
   "$APP_CLI" --install-extension "$VSIX" --extensions-dir "$DEST" \
     --user-data-dir "$TOOLS/udd-vsix" --no-sandbox
-  echo "重启 RemoteCodeEditor 后生效。Copilot 仍需要在你自己的账号里登录授权。"
+  echo "重启 织码 WeaveCode 后生效。Copilot 仍需要在你自己的账号里登录授权。"
   exit 0
 fi
 
@@ -49,4 +49,4 @@ with tempfile.TemporaryDirectory(prefix="rce-vsix-") as tmp:
     print(f"目录：{target}")
 PY
 
-echo "重启 RemoteCodeEditor 后生效。Copilot 仍需要在你自己的账号里登录授权。"
+echo "重启 织码 WeaveCode 后生效。Copilot 仍需要在你自己的账号里登录授权。"

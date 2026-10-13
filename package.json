@@ -1,8 +1,8 @@
 {
-  "name": "remote-code-editor",
-  "productName": "RemoteCodeEditor",
+  "name": "weavecode",
+  "productName": "WeaveCode",
   "version": "3.0.0-alpha.0",
-  "description": "基于 CodeOSS 外壳、自研 SSH/SFTP 远端层和本机影子语言服务的远程代码编辑器",
+  "description": "织码 WeaveCode：基于 CodeOSS、面向嵌入式 ARM 的远程 IDE",
   "private": true,
   "license": "MIT",
   "author": "yon",

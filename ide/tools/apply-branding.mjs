@@ -14,20 +14,20 @@ const dryRun = process.argv.includes("--dry-run");
 
 // ---- 品牌（改这里就能换名字） ----
 const BRAND = {
-  nameShort: "RemoteCodeEditor",
-  nameLong: "RemoteCodeEditor",
-  applicationName: "remote-code-editor",
-  dataFolderName: ".remote-code-editor",
-  win32DirName: "RemoteCodeEditor",
-  win32MutexName: "remotecodeeditor",
-  win32RegValueName: "RemoteCodeEditor",
-  win32AppUserModelId: "RemoteCodeEditor.RemoteCodeEditor",
-  darwinBundleIdentifier: "com.remotecodeeditor.app",
-  linuxIconName: "remote-code-editor",
-  urlProtocol: "remote-code-editor",
-  serverApplicationName: "remote-code-editor-server",
-  serverDataFolderName: ".remote-code-editor-server",
-  tunnelApplicationName: "remote-code-editor-tunnel",
+  nameShort: "织码",
+  nameLong: "织码 WeaveCode",
+  applicationName: "weavecode",
+  dataFolderName: ".weavecode",
+  win32DirName: "WeaveCode",
+  win32MutexName: "weavecode",
+  win32RegValueName: "WeaveCode",
+  win32AppUserModelId: "WeaveCode.WeaveCode",
+  darwinBundleIdentifier: "com.weavecode.app",
+  linuxIconName: "weavecode",
+  urlProtocol: "weavecode",
+  serverApplicationName: "weavecode-server",
+  serverDataFolderName: ".weavecode-server",
+  tunnelApplicationName: "weavecode-tunnel",
 };
 
 // ---- 行为开关 ----
@@ -35,7 +35,7 @@ const behavior = {
   enableTelemetry: false,          // 不发遥测
   // 源码版的 product.json 没有 commit；语言包缓存路径 nlsMetadataHash ?? commit 会拼到 undefined，
   // 导致简体中文语言包被静默回退成英文。给一个稳定的构建标识，打包时应由正式 CI 的 hash 覆盖。
-  nlsMetadataHash: "remote-code-editor-i18n-v1",
+  nlsMetadataHash: "weavecode-i18n-v1",
   builtInExtensions: [],           // 不再从微软市场内置扩展（许可干净 + 构建不依赖外网）
   // 正式版（isBuilt）里 proposed API 必须在这里放行，否则我们的远端搜索注册不上
   // （extensionsProposedApi.ts：出源码跑时全放开，打包后只认这份白名单）
@@ -81,6 +81,43 @@ for (const k of Object.keys(target)) {
 // ---------------------------------------------------------------------------
 
 const VSCODE_DIR = path.dirname(PRODUCT);
+const BRAND_DIR = path.resolve(import.meta.dirname, "..", "..", "resources", "brand");
+const APP_ICON = path.resolve(import.meta.dirname, "..", "..", "resources", "icon.ico");
+
+// 把仓库里的品牌资产同步到上游 CodeOSS 打包路径。上游升级后重跑本脚本即可。
+const brandAssets = [
+  ["weavecode-icon-512.png", "resources/linux/code.png"],
+  ["weavecode-icon-512.png", "resources/server/code-512.png"],
+  ["weavecode-icon-192.png", "resources/server/code-192.png"],
+  ["weavecode-icon-150.png", "resources/win32/code_150x150.png"],
+  ["weavecode-icon-70.png", "resources/win32/code_70x70.png"],
+  ["weavecode.icns", "resources/darwin/code.icns"],
+];
+for (const [from, to] of brandAssets) {
+  const source = path.join(BRAND_DIR, from);
+  const target = path.join(VSCODE_DIR, to);
+  if (!fs.existsSync(source)) {
+    console.warn(`[brand] ⚠️ 找不到品牌资产：${source}`);
+    continue;
+  }
+  if (!dryRun) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(source, target);
+  }
+  console.log(`[brand] 已同步图标 ${from} → ${to}`);
+}
+for (const targetRel of ["resources/win32/code.ico", "resources/server/favicon.ico"]) {
+  const target = path.join(VSCODE_DIR, targetRel);
+  if (!fs.existsSync(APP_ICON)) {
+    console.warn(`[brand] ⚠️ 找不到品牌资产：${APP_ICON}`);
+    continue;
+  }
+  if (!dryRun) {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.copyFileSync(APP_ICON, target);
+  }
+  console.log(`[brand] 已同步图标 icon.ico → ${targetRel}`);
+}
 
 // 2) 删掉内置的 copilot 扩展源码目录（不然打包会连它一起塞进产物）
 const copilotDir = path.join(VSCODE_DIR, "extensions", "copilot");
@@ -117,7 +154,7 @@ if (fs.existsSync(gulpfile)) {
 // 三、开发版启动器要能找到 Electron 二进制
 // ---------------------------------------------------------------------------
 // scripts/code.sh 按 product.applicationName 找 .build/electron/<applicationName>，
-// 改完品牌名之后原来下好的 code-oss 就对不上了（症状：`.build/electron/remote-code-editor: 没有那个文件或目录`）。
+// 改完品牌名之后原来下好的 code-oss 就对不上了（症状：`.build/electron/weavecode: 没有那个文件或目录`）。
 // 这里给旧名字做一条相对软链，省掉再下一次 220MB（仅 Linux；mac/win 的产物名不同，另行处理）。
 {
   const electronDir = path.join(VSCODE_DIR, ".build", "electron");
@@ -267,7 +304,7 @@ for (const p of PATCHES) {
       const importAnchor = "import { IJSONSchema } from '../../../../base/common/jsonSchema.js';\n";
       const oldCall = "\t\t\tconst value = await this._fileService.exists(snippetFolder);\n";
       const helper =
-        "\t/** [RemoteCodeEditor 补丁] 带上限的存在性探测（虚拟工作区下的健壮性，见 docs/ssh-vs-remotessh.md §5.4）。 */\n" +
+        "\t/** [织码 WeaveCode 补丁] 带上限的存在性探测（虚拟工作区下的健壮性，见 docs/ssh-vs-remotessh.md §5.4）。 */\n" +
         "\tprivate _existsBounded(resource: URI, ms = 5000): Promise<boolean> {\n" +
         "\t\treturn Promise.race([\n" +
         "\t\t\tthis._fileService.exists(resource),\n" +
@@ -406,7 +443,7 @@ for (const p of PATCHES) {
     const newBlock = `				} else if (this.virtualWorkspaceLocation) {
 					items.push({
 						type: 'item',
-						// [RemoteCodeEditor] 先释放我们自己的 SSH 会话，再关闭远端工作区。
+						// [织码 WeaveCode] 先释放我们自己的 SSH 会话，再关闭远端工作区。
 						id: 'rce.disconnect',
 						label: nls.localize('closeRemoteConnection.title', 'Close Remote Connection')
 					});
@@ -435,7 +472,7 @@ for (const p of PATCHES) {
     console.warn(`[workspace] ⚠️ 找不到 ${f}`);
   } else {
     const oldBlock = `\tget name(): string | undefined {\n\t\treturn this._workspaceName;\n\t}`;
-    const newBlock = `\tget name(): string | undefined {\n\t\t// [RemoteCodeEditor] transient 单文件夹工作区显示文件夹名，而不是“无标题（工作区）”。\n\t\treturn this._workspaceName || (this.folders.length === 1 ? this.folders[0].name : undefined);\n\t}`;
+    const newBlock = `\tget name(): string | undefined {\n\t\t// [织码 WeaveCode] transient 单文件夹工作区显示文件夹名，而不是“无标题（工作区）”。\n\t\treturn this._workspaceName || (this.folders.length === 1 ? this.folders[0].name : undefined);\n\t}`;
     let text = fs.readFileSync(f, 'utf8');
     if (text.includes('this.folders.length === 1 ? this.folders[0].name')) {
       console.log('[workspace] 单文件夹 transient workspace 已使用文件夹名');

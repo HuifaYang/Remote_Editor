@@ -22,7 +22,7 @@
 const { shellQuote } = require("./fs-provider.js");
 
 const TASK_TYPE = "rce-remote";
-const SOURCE = "RemoteCodeEditor";
+const SOURCE = "织码 WeaveCode";
 
 /** ${workspaceFolder} 之类的变量在远端语境下自己替换（工作台不会替 CustomExecution 的任务展开变量） */
 function expand(text, folder) {

@@ -1,8 +1,8 @@
-# AGENTS.md —— RemoteCodeEditor 项目记忆
+# AGENTS.md ——织码 WeaveCode 项目记忆
 
 ## 一句话路线
 
-RemoteCodeEditor 以 **CodeOSS 为工作台底座**，用我们自己的 SSH/SFTP 层替代 VS Code Remote-SSH。
+织码 WeaveCode 以 **CodeOSS 为工作台底座**，用我们自己的 SSH/SFTP 层替代 VS Code Remote-SSH。
 目标机零部署、零常驻 VS Code Server；语言服务默认在开发机运行，指向按项目同步下来的源码影子缓存。
 
 旧 V2（Electron + Monaco 自绘外壳）已停止维护，规格文档归档在 `docs/legacy/`。不要再把 V2

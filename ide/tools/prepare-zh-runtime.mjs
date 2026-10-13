@@ -39,7 +39,7 @@ function setLink(name, relativeTarget) {
 }
 
 if (!fs.existsSync(path.join(SOURCE_OUT, "main.js")) || !fs.existsSync(path.join(SOURCE_OUT, "nls.messages.json"))) {
-	throw new Error("缺少带 NLS 的 out-vscode，请先运行：RCE_REBUILD_ZH=1 bash tools/run-app.sh");
+	throw new Error("缺少带 NLS 的 out-vscode，请先运行：RCE_REBUILD_ZH=1 bash ide/tools/run-app.sh");
 }
 
 fs.mkdirSync(APP, { recursive: true });
@@ -54,7 +54,7 @@ setLink("node_modules", "../../vscode/node_modules");
 setLink("node_modules.asar", "../../vscode/node_modules");
 
 fs.writeFileSync(path.join(APP, "package.json"), `${JSON.stringify({
-	name: "remote-code-editor-zh",
+	name: "weavecode-zh",
 	version: JSON.parse(fs.readFileSync(path.join(VSCODE, "package.json"), "utf8")).version,
 	type: "module",
 	main: "./out/main.js",

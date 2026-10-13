@@ -7,7 +7,7 @@
 
 const os = require("node:os");
 
-const REMOTE_PROFILE_NAME = "RemoteCodeEditor";
+const REMOTE_PROFILE_NAME = "织码 WeaveCode";
 
 class SshPseudoterminal {
   constructor(vscode, session, log, name) {
@@ -45,7 +45,7 @@ class SshPseudoterminal {
       this.closeEmitter.fire(0);
     });
     // 名称必须固定成 REMOTE_PROFILE_NAME，否则 terminal.integrated.defaultProfile.* 匹配不上
-    this.writeEmitter.fire(`\x1b[2m已连接 ${this.session.authority}（RemoteCodeEditor 远端 shell）\x1b[0m\r\n`);
+    this.writeEmitter.fire(`\x1b[2m已连接 ${this.session.authority}（织码 WeaveCode 远端 shell）\x1b[0m\r\n`);
     for (const data of this.pendingInput) this.channel.write(data);
     this.pendingInput = [];
   }

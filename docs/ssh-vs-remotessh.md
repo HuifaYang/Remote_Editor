@@ -85,7 +85,7 @@
 
 | 项 | 影响 | 处置 |
 |---|---|---|
-| 默认行为 | 🔴 内置终端在虚拟工作区开**本机** shell（cwd 还指向远端路径，等于在错的地方开了个本地 shell） | ✅ 已解决：扩展提供 `TerminalProfileProvider`（`src/terminal.js`，PTY 走 `TerminalChannel` → SSH `shell`），并用 `contributes.terminal.profiles` + `configurationDefaults.terminal.integrated.defaultProfile.linux = "RemoteCodeEditor"` 把它设为默认；实测 `当前终端=[RemoteCodeEditor]`，终端里真的是远端 bash（截图 `ide/tools/shots/e2e-*.png`） |
+| 默认行为 | 🔴 内置终端在虚拟工作区开**本机** shell（cwd 还指向远端路径，等于在错的地方开了个本地 shell） | ✅ 已解决：扩展提供 `TerminalProfileProvider`（`src/terminal.js`，PTY 走 `TerminalChannel` → SSH `shell`），并用 `contributes.terminal.profiles` + `configurationDefaults.terminal.integrated.defaultProfile.linux = "织码 WeaveCode"` 把它设为默认；实测 `当前终端=[织码 WeaveCode]`，终端里真的是远端 bash（截图 `ide/tools/shots/e2e-*.png`） |
 | 断开重连 | 终端会一起死 | 🟡 待做：终端项做"重启会话" |
 | 远端环境变量/`$PATH` | 由 sshd 决定，和我们无关 | ✅ |
 
@@ -198,7 +198,7 @@ bash ide/tools/run-e2e.sh
 |---|---|
 | 打开远端 `README.md` | ✅ 4 行，语言 = markdown |
 | 远端集成终端（SSH PTY） | ✅ 已发送 `ls`/`git` 命令，终端里真的是远端 bash |
-| 终端默认 profile | ✅ `defaultProfile.linux=RemoteCodeEditor`，新建终端名 = `RemoteCodeEditor` |
+| 终端默认 profile | ✅ `defaultProfile.linux=织码 WeaveCode`，新建终端名 = `织码 WeaveCode` |
 | 远端全文搜索（grep） | ✅ 命中远端 `README.md:3` |
 | 远端文件搜索（proposed API） | ✅ `findFiles("**/main.c") → /ws/src/main.c` |
 | 远端 `.vscode/settings.json` 生效 | ✅ `editor.tabSize=7`（Remote-SSH 对等的关键一条：工作区配置真的从远端读） |

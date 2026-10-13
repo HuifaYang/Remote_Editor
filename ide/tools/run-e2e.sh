@@ -75,5 +75,5 @@ xvfb-run -a -s "-screen 0 1600x1000x24" bash -c '
 echo "== 5/5 结果"
 echo "截图：$SHOT"
 if [ -f "$REPORT" ]; then cat "$REPORT"; else echo "没有报告：扩展没激活或连接失败"; fi
-echo "=== 扩展日志（RemoteCodeEditor 通道不进 stdout，这里看异常）==="
+echo "=== 扩展日志（织码 WeaveCode 通道不进 stdout，这里看异常）==="
 grep -iE "rce-|sshfs|error|fail" "$LOG" | tail -20 || true

@@ -675,7 +675,7 @@ async function runE2E() {
 
 async function activate(context) {
   extensionContext = context;
-  channel = vscode.window.createOutputChannel("RemoteCodeEditor");
+  channel = vscode.window.createOutputChannel("织码 WeaveCode");
   sessions = new SessionManager(log);
   remoteExplorer = createRemoteExplorer(vscode, {
     context,

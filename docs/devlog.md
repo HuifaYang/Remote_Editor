@@ -314,7 +314,7 @@ S06/S07 尾项、N07 快速输入复用到重命名/转到行。
 | 集成（沙箱外实跑） | `npx vitest run tests/integration` | **5/5 passed** —— SSH 连接→列目录→读→原子写、Git、搜索、镜像 tar 解包 + manifest 差集、假 LSP 全链路 |
 | 真实语言服务 | `node scripts/verify-lsp.mjs --verbose` | **6/6 passed** —— clangd 18.1.3 对真实 C++ 工程给出补全（moveForward/speed）、F12 跳到 `robot.hpp` 第 4 行、诊断 `Expected ';' after return statement`、诊断→Monaco marker、Hover |
 | 离屏 UI | `npx electron scripts/shots.mjs` | 欢迎页 / 设置对话框 / 终端面板 / 搜索面板 / 资源管理器 五张截图（`/tmp/rce-shots/`），`SMOKE: monaco ready`，无渲染进程报错 |
-| 打包 | `npm run build` | `release/RemoteCodeEditor-2.0.0-alpha.0.AppImage`（286 MB）、`release/remote-code-editor_2.0.0-alpha.0_amd64.deb`（228 MB）；解包检查包内 `resources/clangd/clangd` 可执行且版本正确 |
+| 打包 | `npm run build` | `release/织码 WeaveCode-2.0.0-alpha.0.AppImage`（286 MB）、`release/remote-code-editor_2.0.0-alpha.0_amd64.deb`（228 MB）；解包检查包内 `resources/clangd/clangd` 可执行且版本正确 |
 | 启动 | AppImage 离屏运行 20s | 常驻无崩溃（超时结束） |
 
 **集成测试抓到的真 bug**：`SSHConnection.execStream().wait()` 有竞态 —— 命令很快结束时 `close`
@@ -529,7 +529,7 @@ npm test            # 116 passed, 5 skipped（15 个文件）
 - Monaco 走 AMD loader 直读 `node_modules/min/vs`（不引打包器），深色/浅色双主题色值
   运行时读 CSS 变量（tokens.css 保持唯一颜色来源），示例 C++ 代码可编辑、小地图正常。
 - 打包：`npm run build:dir` 出 `release/linux-unpacked` 并实测能启动（日志落
-  `~/.config/RemoteCodeEditor/logs/`）；CI workflow（Windows/Linux matrix）已写，
+  `~/.config/织码 WeaveCode/logs/`）；CI workflow（Windows/Linux matrix）已写，
   AppImage/deb/nsis 的完整出包留到 CI 验证（本机网络下 GitHub 发布页下载超时）。
 
 踩坑记录：
@@ -631,7 +631,7 @@ Ctrl+PageUp/Down、Ctrl+Shift+T、Ctrl+Shift+S 语义修正、标签右键菜单
 - **S01 横向菜单栏**：废除 ≡ 双层页签菜单，改 文件/编辑/查看/转到/终端/帮助 横向常驻；
   点击展开、已展开时悬停即切换（VSCode 行为）、←→ 切分组、↑↓ 循环、Esc/外点关闭；
   "转到"分组新增 转到文件（Ctrl+P）；"查看"顶部加 命令面板入口。
-- **S02 动态窗口标题**：`[●] 文件名 - 工作目录名 - 主机名 - RemoteCodeEditor`，
+- **S02 动态窗口标题**：`[●] 文件名 - 工作目录名 - 主机名 - 织码 WeaveCode`，
   AppState 增 currentFile 切片，关最后一个标签自动清空。
 - **尺寸 token 对齐 VSCode**：标题栏 32→30、状态栏 24→22、活动栏 44→48（图标 22→24）、
   侧栏默认 260→300、编辑器/终端页签条 32→35、活动标签顶部 1px 强调线。
@@ -1028,7 +1028,7 @@ CodeOSS 自带的“关闭远程连接”也通过 `deactivate()` 补写抑制�
 - 用户明确要求切换主机不要新开窗口：已改成“旧连接存在时先关闭旧会话，再 `vscode.openFolder` 在当前窗口切到新 URI”；新宿主按新 authority 重连。
 - 终端 profile 注册 id 从错误的 `rce.remoteTerminal` 对齐为 `contributes.terminal.profiles.id = rceRemote`，修复 `No terminal profile provider registered for id "rceRemote"`。
 - 语言服务项目镜像前先按同一套源码过滤计数；项目过大时自动降级为当前文件目录，不再要求用户点状态栏强制。源码 tar 传输增加 120s 上限和 4MB 粒度进度显示，避免无限“同步中”。
-- 品牌补丁会修改 `workbench.desktop.main.js` 等内置文件，导致 CodeOSS integrity service 拿旧 checksum 报“RemoteCodeEditor 安装似乎损坏”。`build-extension.mjs` 现在按 `product.json.checksums`（路径相对 `resources/app/out/`）重算 SHA-256，启动不再出现假损坏告警。
+- 品牌补丁会修改 `workbench.desktop.main.js` 等内置文件，导致 CodeOSS integrity service 拿旧 checksum 报“织码 WeaveCode 安装似乎损坏”。`build-extension.mjs` 现在按 `product.json.checksums`（路径相对 `resources/app/out/`）重算 SHA-256，启动不再出现假损坏告警。
 - 工作区打开不再使用 `updateWorkspaceFolders` 建无标题多根工作区；统一 `vscode.openFolder` 打开正式单目录工作区，并默认关闭 `window.confirmSaveUntitledWorkspace`，不再弹“是否保存工作区配置”。
 - 语言服务状态栏文案从内部代号 `RCE 语言服务` 改成 `本机语言服务`，明确它是工作机上的 clangd/pylsp 桥，不是远端常驻服务。
 - 工作区打开不再预同步；每个项目自己的 manifest、镜像目录和 LSP 进程按需创建、缓存、复用。
@@ -1071,3 +1071,14 @@ CodeOSS 自带的“关闭远程连接”也通过 `deactivate()` 补写抑制�
 当前剩余的真实外部验证是：在你的 VS Code/Copilot 账号下安装官方 VSIX，确认 Copilot 补全在
 `sshfs://` 虚拟工作区和真实项目里可用。如果该 VSIX 不支持虚拟工作区，下一步才需要切换到
 “本地影子工作区 + 保存回写”模式。
+
+## 2026-10-13 晚：品牌与产品图标
+
+- 项目命名：**织码 WeaveCode**，含义是“把远端、源码、语言服务和 AI 补全织在一起”。
+- 新增品牌资产：`resources/brand/weavecode-mark.svg`、明暗字标、1024/512/256 PNG、Windows ICO、
+  macOS ICNS；根 `resources/icon.png` / `icon.ico` 也已替换。
+- 新增 `ide/tools/generate-brand-assets.py`，可重复生成全部品牌资产。
+- `apply-branding.mjs` 会把图标同步到 CodeOSS 的 Linux / Windows / macOS / Server / favicon 路径。
+- 可见品牌名统一为“织码 WeaveCode”，内部 extension ID 继续保留
+  `remote-code-editor.rce-remote`，避免破坏已有 proposed API 和配置兼容性。
+- CodeOSS 已按新 applicationName `weavecode` 重新编译、打包并通过 xvfb 冒烟。

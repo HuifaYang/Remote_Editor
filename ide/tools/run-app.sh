@@ -20,17 +20,17 @@ export PATH="$HOME/.nvm/versions/node/v24.18.0/bin:$PATH"
 export TMPDIR="$TOOLS/tmp"
 export TOOLS
 mkdir -p "$TOOLS/build" "$TOOLS/tmp" "$TOOLS/ext-oss" "$TOOLS/shots"
-APP="$TOOLS/../VSCode-linux-x64/remote-code-editor"
+APP="$TOOLS/../VSCode-linux-x64/weavecode"
 
 # 同一时刻只允许一个本程序实例。默认不吵醒/覆盖已有窗口，也不抢焦点；
 # 确实要强制重开时用 RCE_FORCE_RESTART=1。
 if pgrep -f "$APP" >/dev/null 2>&1; then
   if [ "${RCE_FORCE_RESTART:-0}" = "1" ]; then
-    echo "== 关闭上一次的 RemoteCodeEditor 窗口 =="
+    echo "== 关闭上一次的 织码 WeaveCode 窗口 =="
     pkill -f "$APP" 2>/dev/null || true
     sleep 1
   else
-    echo "RemoteCodeEditor 已在运行；不重复开窗，也不会抢到最前面。"
+    echo "织码 WeaveCode 已在运行；不重复开窗，也不会抢到最前面。"
     exit 0
   fi
 fi
