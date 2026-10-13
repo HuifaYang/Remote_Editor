@@ -12,6 +12,21 @@ DEST="${2:-$TOOLS/ext-oss}"
 [ -f "$VSIX" ] || { echo "找不到 VSIX：$VSIX" >&2; exit 1; }
 mkdir -p "$DEST"
 
+APP_CLI="$TOOLS/../VSCode-linux-x64/bin/remote-code-editor"
+if [ -x "$APP_CLI" ] && [ "${RCE_VSIX_MANUAL:-0}" != "1" ]; then
+  # 优先走 CodeOSS 自己的 CLI：它会正确更新 extensions.json，不会再把手装目录标成 obsolete。
+  for v in ELECTRON_RUN_AS_NODE ELECTRON_NO_ATTACH_CONSOLE VSCODE_ESM_ENTRYPOINT \
+           VSCODE_IPC_HOOK VSCODE_PID VSCODE_CWD VSCODE_CLI VSCODE_HANDLES_UNCAUGHT_ERRORS \
+           VSCODE_NLS_CONFIG VSCODE_CODE_CACHE_PATH VSCODE_CRASH_REPORTER_PROCESS_TYPE \
+           VSCODE_DEV CODEX_INTERNAL_ORIGINATOR_OVERRIDE; do unset "$v" 2>/dev/null || true; done
+  export ELECTRON_DISABLE_SANDBOX=1
+  "$APP_CLI" --install-extension "$VSIX" --extensions-dir "$DEST" \
+    --user-data-dir "$TOOLS/udd-vsix" --no-sandbox
+  echo "重启 RemoteCodeEditor 后生效。Copilot 仍需要在你自己的账号里登录授权。"
+  exit 0
+fi
+
+
 python3 - "$VSIX" "$DEST" <<'PY'
 import json, os, pathlib, shutil, sys, tempfile, zipfile
 
