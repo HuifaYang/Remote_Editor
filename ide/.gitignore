@@ -1,0 +1,15 @@
+# 上游 CodeOSS 源码以 git submodule 固定在 ide/vscode。
+
+# 开发/运行产物，目录名会随测试实例变化，统一按前缀排除。
+tools/build/
+tools/tmp/
+tools/udd*/
+tools/ext*/
+tools/fresh-*/
+VSCode-linux-x64/
+tools/app-out-vscode/
+tools/shots/
+tools/*.log
+
+# 扩展构建产物（真源在 extensions/sshfs/src）
+extensions/sshfs/out/

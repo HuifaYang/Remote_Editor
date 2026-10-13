@@ -8,7 +8,7 @@ import { normalizeRemotePath, shellQuote } from "../../shared/paths.js";
 import type { MirrorEntry, MirrorProgress, MirrorResult } from "../../shared/types.js";
 import { log } from "../log.js";
 import { buildCompileCommandsFindCommand, buildDirExistsCommand, collectFromParsedData, type CompileCollection } from "../lsp/clangd-config.js";
-import type { SSHConnection } from "../session/connection.js";
+import type { ExecStreamHandle, SSHConnection } from "../session/connection.js";
 import {
   createManifest, diffManifest, mirrorRelativePath, parseFindListing, parseManifest,
   serializeManifest, toEntryMap, type MirrorManifest,
@@ -29,40 +29,118 @@ function excludeArgs(): string {
   ].join(" ");
 }
 
-/** 文件清单命令（A8b：清单走 stderr，别混进 gzip 流） */
-export function buildListingCommand(): string {
-  return `find . -type f ${excludeArgs()} -printf '%p %s %T@\\n' 1>&2`;
+// 语言服务镜像只服务于 C/C++/Python：把日志、缓存、扩展目录、二进制等挡在 tar 之前。
+// 这样 /home/<user> 这类大目录不会因为无关文件而把首次同步拖到几分钟。
+const MIRROR_SOURCE_NAMES = [
+  "compile_commands.json", "compile_flags.txt", "CMakeLists.txt", "Makefile", "Kbuild", "Kconfig",
+  "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile", "tox.ini", ".clangd",
+];
+const MIRROR_SOURCE_GLOBS = [
+  "*.c", "*.h", "*.cc", "*.cpp", "*.cxx", "*.hpp", "*.hh", "*.hxx", "*.inl", "*.inc",
+  "*.m", "*.mm", "*.S", "*.s", "*.asm", "*.ld", "*.lds", "*.py", "*.pyi",
+];
+
+function sourceFileArgs(): string {
+  const tests = [
+    ...MIRROR_SOURCE_NAMES.map((name) => `-name '${name}'`),
+    ...MIRROR_SOURCE_GLOBS.map((glob) => `-name '${glob}'`),
+  ];
+  return `\\( ${tests.join(" -o ")} \\)`;
 }
 
-/** 分段头（同一条复合命令里把不同用途的输出区隔开） */
-const SECTION = "__RCE_SECTION__";
-export function buildCapabilitiesCommand(): string {
-  return `${SECTION}__CAP__ 1>&2; tar --version 2>&1 || true; gcc -dumpmachine 2>/dev/null || true; gcc -print-file-name=include 2>/dev/null || true`;
+/** 文件清单命令（A8b：清单走 stderr，别混进 gzip 流） */
+export function buildListingCommand(): string {
+  return `find . -type f ${excludeArgs()} ${sourceFileArgs()} -printf '%p %s %T@\\n' 1>&2`;
 }
+
+/** 自动镜像闸门用的文件数：必须和 tar 使用同一套源码过滤，别把日志/扩展目录算进来。 */
+export function buildMirrorFileCountCommand(workspace: string): string {
+  return `cd ${shellQuote(workspace)} && find . -type f ${excludeArgs()} ${sourceFileArgs()} 2>/dev/null | wc -l`;
+}
+
+/**
+ * 分段头（同一条复合命令里把不同用途的输出区隔开）。
+ * 必须**真的打印**这一行到 stderr：早先的写法是把标记当命令名用（`__RCE_SECTION____CAP__ 1>&2`），
+ * 靠 shell 报 "command not found" 顺带把标记打到 stderr —— 那样带参数的分段（`__FILE__ <路径>`）
+ * 拼不出来（报错文本变成 `__FILE__: <路径>: command not found`，parseSections 只认 `__FILE__ ` 带空格开头的表头），
+ * 而且把「命令找不到」的噪声混进 stderr。别改回那种写法。
+ */
+const SECTION = "__RCE_SECTION__";
+function sectionHeader(name: string, extraExpr = ""): string {
+  return extraExpr
+    ? `printf '%s\\n' "${SECTION}${name} ${extraExpr}" 1>&2`
+    : `printf '%s\\n' ${shellQuote(`${SECTION}${name}`)} 1>&2`;
+}
+export function buildCapabilitiesCommand(): string {
+  // 整段必须打到 **stderr**：stdout 是 tar 的 gzip 流，混进任何字符都会毁掉解包
+  return `${sectionHeader("__CAP__")}; { tar --version 2>&1 || true; gcc -dumpmachine 2>/dev/null || true; gcc -print-file-name=include 2>/dev/null || true; } 1>&2`;
+}
+/** compile_commands 的 find 结果存进 shell 变量 `__rce_cc`：后面 dump 内容、算 sysroot 候选目录都复用它，只 find 一次 */
 export function buildCompileFindSection(workspace: string): string {
-  return `${SECTION}__FIND__ 1>&2; ${buildCompileCommandsFindCommand(workspace)} 1>&2`;
+  return [
+    `${sectionHeader("__FIND__")};`,
+    `__rce_cc=$( ${buildCompileCommandsFindCommand(workspace)} );`,
+    `printf '%s\\n' "$__rce_cc" 1>&2`,
+  ].join("\n");
 }
 export function buildCompileDumpSection(findOutput: string): string {
   const files = findOutput.split("\n").map((l) => l.trim()).filter(Boolean);
   if (files.length === 0) return "";
-  return files.map((f) => `${SECTION}__FILE__ ${shellQuote(f)} 1>&2; cat ${shellQuote(f)} 1>&2`).join("; ");
+  return files.map((f) => `${sectionHeader("__FILE__", shellQuote(f))}; cat ${shellQuote(f)} 1>&2`).join("; ");
+}
+/** 同一条命令里 dump compile_commands：find 结果只有远端 shell 自己知道，所以就地循环 */
+export function buildCompileDumpShellSection(): string {
+  return [
+    `printf '%s\\n' "$__rce_cc" | while IFS= read -r __rce_f; do`,
+    `  [ -n "$__rce_f" ] || continue;`,
+    `  ${sectionHeader("__FILE__", "$__rce_f")};`,
+    `  cat "$__rce_f" 1>&2;`,
+    "done; true",
+  ].join("\n");
 }
 export function buildProbeSection(dirs: string[]): string {
   if (dirs.length === 0) return "";
-  return `${SECTION}__PROBE__ 1>&2; ${buildDirExistsCommand(dirs)} 1>&2`;
+  return `${sectionHeader("__PROBE__")}; ${buildDirExistsCommand(dirs)} 1>&2`;
+}
+/**
+ * sysroot 目录探测（A9.3 / §5.3.8）：候选 = compile_commands 里的绝对 -I/-isystem/-iquote + 默认系统头目录。
+ * 候选要读完 compile_commands 才知道，但预算要求**同一条命令**（§7：首次镜像同步 1 条命令），
+ * 所以在远端 shell 里就地算候选、就地探测（`[ -d ]` 天然把源码文件之类的非目录过滤掉）。
+ * 结果是「JS 侧候选集合的超集」，JS 侧再取交集：宁可多探几个，也不能漏（漏一个就静默丢一份 sysroot）。
+ */
+export function buildProbeAutoSection(): string {
+  return [
+    `__rce_raw=$(cat $__rce_cc 2>/dev/null | tr ' ",' '\\n\\n\\n');`,
+    `__rce_cands=$(printf '%s\\n' "$__rce_raw" | sed -n -e 's|^-I||p' -e 's|^-isystem||p' -e 's|^-iquote||p' -e '/^\\//p' | sort -u);`,
+    `${sectionHeader("__PROBE__")};`,
+    `for __rce_d in /usr/include "/usr/include/$(gcc -dumpmachine 2>/dev/null)" "$(gcc -print-file-name=include 2>/dev/null)" $__rce_cands; do`,
+    `  [ -n "$__rce_d" ] && [ -d "$__rce_d" ] && printf '%s\\n' "$__rce_d" 1>&2;`,
+    "done; true",
+  ].join("\n");
 }
 export function buildPythonSysPathSection(): string {
-  return `${SECTION}__PYPATH__ 1>&2; python3 -c "import sys,json;print(json.dumps(sys.path))" 2>/dev/null || true`;
+  // 同上：sys.path 走 stderr 分段，stdout 留给 tar
+  return `${sectionHeader("__PYPATH__")}; python3 -c "import sys,json;print(json.dumps(sys.path))" 2>/dev/null 1>&2 || true`;
 }
 
-/** 全量同步：1 条命令；能力探测 + compile_commands find + 文件 dump + 目录探测 + sys.path 都塞进 stderr 分段 */
+/** 全量同步（§5.3.1 / A8b / A9）：**1 条命令**；tar 单流走 stdout，清单与各分段走 stderr，中间不留空分段 */
 export function buildFullSyncCommand(workspace: string): string {
-  return `cd ${shellQuote(workspace)} && { date +%s 1>&2; ${buildCapabilitiesCommand()}; find . -type f ${excludeArgs()} -print0 | tar --null -czf - -T - && ${buildListingCommand()}; ${buildCompileFindSection(workspace)}; ${buildCompileDumpSection("")}; ${buildProbeSection([])}; ${buildPythonSysPathSection()}; }`;
+  const parts = [
+    "date +%s 1>&2",
+    // tar 流 + 文件清单：清单必须排在第一个分段头**之前**（parseSections 就是按"第一个分段头之前全是清单"切的）
+    `find . -type f ${excludeArgs()} ${sourceFileArgs()} -print0 | tar --null -czf - -T - && ${buildListingCommand()}`,
+    buildCapabilitiesCommand(),
+    buildCompileFindSection(workspace),
+    buildCompileDumpShellSection(),
+    buildProbeAutoSection(),
+    buildPythonSysPathSection(),
+  ].filter((p) => p.trim().length > 0);
+  return `cd ${shellQuote(workspace)} && { ${parts.join("; ")}; }`;
 }
 
 /** 增量同步（A8b，源码与 sysroot 通用）：仍是 1 条命令；增量场景保留原有格式 */
 export function buildIncrementalSyncCommand(workspace: string, sinceEpoch: number): string {
-  return `cd ${shellQuote(workspace)} && { date +%s 1>&2; find . -type f -newermt '@${Math.floor(sinceEpoch)}' ${excludeArgs()} -print0 | tar --null -czf - -T - && ${buildListingCommand()}; }`;
+  return `cd ${shellQuote(workspace)} && { date +%s 1>&2; find . -type f -newermt '@${Math.floor(sinceEpoch)}' ${excludeArgs()} ${sourceFileArgs()} -print0 | tar --null -czf - -T - && ${buildListingCommand()}; }`;
 }
 
 /** sysroot：只留头文件（排除 *.a / *.so*），保留原绝对路径层级（提取到 _sysroot/ 下） */
@@ -116,6 +194,9 @@ export class MirrorManager {
   private tarChecked = false;
   private compile: CompileCollection | null = null;
   private lastSections: { cap?: string; find?: string; fileTexts?: Record<string, string>; probe?: string; pyPath?: string; listing?: string } | null = null;
+  /** 取消（ui-parity N02）：置位后关闭当前 SSH 流，同步以「已取消」失败收尾 */
+  private aborting = false;
+  private activeHandle: ExecStreamHandle | null = null;
 
   constructor(
     private readonly conn: SSHConnection,
@@ -178,17 +259,26 @@ export class MirrorManager {
   /**
    * 同步镜像（§5.3.1 / A8b）：源码 tar 单流 + 清单差集 + compile_commands 重写 + sysroot + Python 环境。
    */
-  async sync(workspace: string, onProgress?: (p: MirrorProgress) => void): Promise<MirrorResult> {
+  async sync(workspace: string, onProgress?: (p: MirrorProgress) => void, opts: { full?: boolean } = {}): Promise<MirrorResult> {
     const ws = normalizeRemotePath(workspace, "/");
+    this.aborting = false;
     await this.ensureCapabilities();
     if (this.workspace && this.workspace !== ws) this.resetState();
     const sameWorkspace = this.workspace === ws;
-    const since = sameWorkspace ? this.syncedAt : 0;
+    // full = 用户点了「重新同步镜像」：强制走全量命令，好把 compile_commands / sysroot 重新收一遍
+    const since = sameWorkspace && !opts.full ? this.syncedAt : 0;
     const oldEntries = sameWorkspace ? new Map(this.entries) : new Map<string, MirrorEntry>();
 
     log("info", `镜像同步开始：${ws}（${since > 0 ? "增量" : "全量"}）`);
     onProgress?.({ done: 0, total: 5, current: since > 0 ? "增量同步源码…" : "全量同步源码…" });
-    const source = await this.pullSource(ws, since);
+    let source: { listing: string; syncedAt: number; full: boolean };
+    try {
+      source = await this.pullSource(ws, since, onProgress);
+    } catch (err) {
+      if (this.aborting) throw new AppError("mirror", "镜像同步已取消");
+      throw err;
+    }
+    this.checkAbort();
     const nextEntries = parseFindListing(source.listing);
     const diff = diffManifest(oldEntries, nextEntries);
     for (const removed of diff.removed) this.removeLocal(removed);
@@ -208,26 +298,35 @@ export class MirrorManager {
     };
     onProgress?.({ done: 1, total: 5, current: `源码已同步（${nextEntries.length} 个文件）` });
 
-    // compile_commands.json 收集与重写（A9）：从同一条复合命令的分段数据构建，0 额外往返
-    try {
-      this.compile = collectFromParsedData(ws, {
-        findOutput: this.lastSections?.find ?? "",
-        fileTexts: this.lastSections?.fileTexts ?? {},
-        probeOutput: this.lastSections?.probe ?? "",
-      }, {
-        mirrorRoot: this.mirrorRoot,
-        triplet: this.targetTriplet,
-        gccIncludeDir: this.gccIncludeDir,
-      });
-      log("info", `compile_commands 来源 ${this.compile.sourceFiles.length} 个，条目 ${this.compile.entryCount} 个`);
-    } catch (err) {
-      log("warn", `compile_commands 收集失败：${String(err)}`);
-      this.compile = null;
+    // compile_commands.json 收集与重写（A9）：从同一条复合命令的分段数据构建，0 额外往返。
+    // **只有全量同步才有这些分段**（增量命令只带 tar + 清单）——增量时若照旧重建，会把上一次收好的
+    // compile_commands.json 覆盖成 compile_flags.txt 兜底（clangd 直接失去编译数据库）。
+    if (source.full) {
+      try {
+        this.compile = collectFromParsedData(ws, {
+          findOutput: this.lastSections?.find ?? "",
+          fileTexts: this.lastSections?.fileTexts ?? {},
+          probeOutput: this.lastSections?.probe ?? "",
+        }, {
+          mirrorRoot: this.mirrorRoot,
+          triplet: this.targetTriplet,
+          gccIncludeDir: this.gccIncludeDir,
+        });
+        log("info", `compile_commands 来源 ${this.compile.sourceFiles.length} 个，条目 ${this.compile.entryCount} 个`);
+      } catch (err) {
+        log("warn", `compile_commands 收集失败：${String(err)}`);
+        this.compile = null;
+      }
+      onProgress?.({ done: 2, total: 5, current: "已重写 compile_commands.json" });
+    } else {
+      // 增量：沿用上一次的编译数据库与 sysroot 目录集合
+      onProgress?.({ done: 2, total: 5, current: "沿用已有 compile_commands.json（增量）" });
     }
-    onProgress?.({ done: 2, total: 5, current: "已重写 compile_commands.json" });
+    this.checkAbort();
 
-    // 头文件 / sysroot（§5.3.8）：目录集合变了就全量，没变才走时间戳增量
-    const dirs = this.compile?.sysrootRoots ?? [];
+    // 头文件 / sysroot（§5.3.8）：目录集合变了就全量，没变才走时间戳增量；
+    // 增量同步拿不到 compile_commands 分段 → 沿用上次收集的集合（否则头文件镜像会被悄悄丢掉）
+    const dirs = source.full ? (this.compile?.sysrootRoots ?? []) : this.sysrootRoots;
     this.sysrootRoots = dirs;
     if (dirs.length > 0) {
       const sameSet = this.lastSysrootRoots !== null && sameList(this.lastSysrootRoots, dirs);
@@ -240,6 +339,7 @@ export class MirrorManager {
       }
     }
     onProgress?.({ done: 3, total: 5, current: `已同步头文件（${dirs.length} 个目录）` });
+    this.checkAbort();
 
     try {
       await this.pullPythonEnv();
@@ -247,9 +347,20 @@ export class MirrorManager {
       log("warn", `Python 环境同步失败（不用 Python 可忽略）：${String(err)}`);
     }
     onProgress?.({ done: 4, total: 5, current: "已同步 Python 环境" });
+    this.checkAbort();
     onProgress?.({ done: 5, total: 5, current: "镜像就绪" });
     log("info", `镜像同步完成：${nextEntries.length} 个文件，变更 ${diff.changed.length}，删除 ${diff.removed.length}`);
     return baseResult;
+  }
+
+  /** 取消正在进行的同步（ui-parity N02）：关闭当前 SSH 流，同步以「已取消」收尾 */
+  cancel(): void {
+    this.aborting = true;
+    this.activeHandle?.close();
+  }
+
+  private checkAbort(): void {
+    if (this.aborting) throw new AppError("mirror", "镜像同步已取消");
   }
 
   /** 保存文件后同步写镜像副本（§5.3.5），并本地更新清单 */
@@ -315,9 +426,9 @@ export class MirrorManager {
   }
 
   /** 拉源码 tar 流并解包；返回远端时间戳与文件清单 */
-  private async pullSource(workspace: string, since: number): Promise<{ listing: string; syncedAt: number }> {
+  private async pullSource(workspace: string, since: number, onProgress?: (p: MirrorProgress) => void): Promise<{ listing: string; syncedAt: number; full: boolean }> {
     const incremental = since > 0;
-    const runOnce = async (useSince: number): Promise<{ listing: string; syncedAt: number }> => {
+    const runOnce = async (useSince: number): Promise<{ listing: string; syncedAt: number; full: boolean }> => {
       const tarPath = `${this.mirrorRoot}.sync.tar.gz`;
       const staging = `${this.mirrorRoot}.staging`;
       fs.mkdirSync(path.dirname(this.mirrorRoot), { recursive: true });
@@ -327,15 +438,27 @@ export class MirrorManager {
       const command = useSince > 0
         ? buildIncrementalSyncCommand(workspace, useSince)
         : buildFullSyncCommand(workspace);
-      const handle = await this.conn.execStream(command, { timeoutMs: 0 });
+      const handle = await this.conn.execStream(command, { timeoutMs: 120000 });
+      this.activeHandle = handle;
+      let received = 0;
+      let lastReported = 0;
+      handle.stdout.on("data", (chunk: Buffer) => {
+        received += chunk.length;
+        // 4MB 报一次，避免大项目状态栏看着像卡死；不影响 tar 管道本身。
+        if (received - lastReported >= 4 * 1024 * 1024) {
+          lastReported = received;
+          onProgress?.({ done: 1, total: 5, current: `传输源码 ${Math.round(received / 1024 / 1024)}MB…` });
+        }
+      });
       try {
         await pipeline(handle.stdout, fs.createWriteStream(tarPath));
         const { code, stderr } = await handle.wait();
         if (code !== 0) throw new AppError("mirror", "镜像同步命令失败", stderr.trim());
         const sections = parseSections(stderr);
-        this.lastSections = sections;
+        // 增量命令没有分段（parseSections 会把整段 stderr 当清单）：别用空分段覆盖掉全量同步的探测结果
+        if (useSince === 0) this.lastSections = sections;
         const { listing, syncedAt } = splitStderr(sections.listing ?? "");
-        this.applyCapabilitiesFromSections(sections.cap ?? "");
+        if (useSince === 0) this.applyCapabilitiesFromSections(sections.cap ?? "");
 
 
         if (useSince > 0) {
@@ -346,8 +469,9 @@ export class MirrorManager {
           removeDir(this.mirrorRoot);
           fs.renameSync(staging, this.mirrorRoot);
         }
-        return { listing, syncedAt };
+        return { listing, syncedAt, full: useSince === 0 };
       } finally {
+        this.activeHandle = null;
         fs.rmSync(tarPath, { force: true });
         if (!fs.existsSync(this.mirrorRoot) && fs.existsSync(staging)) fs.renameSync(staging, this.mirrorRoot);
         else removeDir(staging);
@@ -358,6 +482,7 @@ export class MirrorManager {
     try {
       return await runOnce(since);
     } catch (err) {
+      if (this.aborting) throw new AppError("mirror", "镜像同步已取消");
       log("warn", `增量同步失败，退化为全量重传：${String(err)}`);
       return runOnce(0);
     }
@@ -368,7 +493,8 @@ export class MirrorManager {
     if (!command) return;
     const tarPath = `${destDir}.sync.tar.gz`;
     fs.mkdirSync(path.dirname(destDir), { recursive: true });
-    const handle = await this.conn.execStream(command, { timeoutMs: 0 });
+    const handle = await this.conn.execStream(command, { timeoutMs: 120000 });
+    this.activeHandle = handle;
     try {
       await pipeline(handle.stdout, fs.createWriteStream(tarPath));
       const { code, stderr } = await handle.wait();
@@ -376,19 +502,25 @@ export class MirrorManager {
       fs.mkdirSync(destDir, { recursive: true });
       await this.extract(tarPath, destDir);
     } finally {
+      this.activeHandle = null;
       fs.rmSync(tarPath, { force: true });
     }
   }
 
   private async pullPythonEnv(): Promise<void> {
-    const r = await this.conn.exec(`python3 -c "import sys,json;print(json.dumps(sys.path))"`);
-    if (r.code !== 0) {
-      log("warn", "远端没有 python3，跳过 Python 环境同步");
-      return;
+    // 首选同一条同步命令里带回来的 __PYPATH__ 分段（§7 预算：0 额外往返）；拿不到才补一次 exec
+    let raw = (this.lastSections?.pyPath ?? "").trim();
+    if (!raw) {
+      const r = await this.conn.exec(`python3 -c "import sys,json;print(json.dumps(sys.path))"`);
+      if (r.code !== 0) {
+        log("warn", "远端没有 python3，跳过 Python 环境同步");
+        return;
+      }
+      raw = r.stdout.trim();
     }
     let dirs: string[] = [];
     try {
-      const parsed: unknown = JSON.parse(r.stdout.trim());
+      const parsed: unknown = JSON.parse(raw);
       if (Array.isArray(parsed)) dirs = parsed.filter((d): d is string => typeof d === "string" && d.startsWith("/"));
     } catch (err) {
       log("warn", `解析远端 sys.path 失败：${String(err)}`);

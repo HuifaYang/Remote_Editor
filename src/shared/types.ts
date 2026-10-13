@@ -91,10 +91,65 @@ export interface LspCompletionItem {
 }
 export interface LspCompletionList { items: LspCompletionItem[]; isIncomplete: boolean }
 
+/** 文档符号（textDocument/documentSymbol 子集，ui-parity E08 面包屑符号段用）：
+ *  层级 DocumentSymbol 与扁平 SymbolInformation 归一化后都落到这个形状 */
+export interface LspDocumentSymbol {
+  name: string;
+  detail?: string;
+  kind: number;                  // LSP SymbolKind 1~26
+  range: LspRange;               // 符号整体范围（判断光标是否在其内）
+  selectionRange: LspRange;      // 符号名范围（跳转落点）
+  children?: LspDocumentSymbol[];
+}
+
+export interface LspTextEdit { range: LspRange; newText: string }
+export interface LspWorkspaceEdit { changes: Record<string, LspTextEdit[]> }
+
+export interface LspSignatureParameter {
+  label: string | [number, number];
+  documentation?: string;
+}
+export interface LspSignatureInformation {
+  label: string;
+  documentation?: string;
+  parameters?: LspSignatureParameter[];
+  activeParameter?: number;
+}
+export interface LspSignatureHelp {
+  signatures: LspSignatureInformation[];
+  activeSignature?: number;
+  activeParameter?: number;
+}
+
+export interface LspDocumentHighlight { range: LspRange; kind?: number }
+export interface LspCodeAction {
+  title: string;
+  kind?: string;
+  diagnostics?: LspDiagnostic[];
+  edit?: LspWorkspaceEdit;
+  command?: { title: string; command: string; arguments?: unknown[] };
+  isPreferred?: boolean;
+  disabled?: { reason: string };
+}
+export interface LspFoldingRange {
+  startLine: number;
+  startCharacter?: number;
+  endLine: number;
+  endCharacter?: number;
+  kind?: string;
+  collapsedText?: string;
+}
+
 /** 语言服务位置（U9）：默认本机；板子上是唯一远端例外；disabled=完全关闭 */
 export type LspTransportMode = "local" | "remote" | "disabled";
 
 export type AppErrorCode =
   | "auth" | "auth-passphrase-required" | "timeout" | "network"
-  | "host-key" | "ssh" | "sftp" | "git" | "mirror" | "lsp" | "invalid-input" | "unsupported" | "unknown";
-export interface AppErrorShape { code: AppErrorCode; message: string; detail?: string }
+  | "host-key" | "ssh" | "sftp" | "not-found" | "git" | "mirror" | "lsp" | "invalid-input" | "unsupported" | "unknown";
+export interface AppErrorShape {
+  code: AppErrorCode;
+  message: string;
+  detail?: string;
+  /** 底层 SFTP 状态码（1/2/3/4…）：宿主 FileSystemProvider 靠它精确映射「不存在 / 无权限 / 已存在」 */
+  sftpCode?: number;
+}

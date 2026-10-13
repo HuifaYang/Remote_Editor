@@ -1,6 +1,6 @@
 // 分册 4 T8：JSON-RPC 分帧（半包/粘包/字节数）、握手顺序、报文转换、诊断转发
 import { describe, expect, it } from "vitest";
-import { LspClient, MessageBuffer, encodeMessage, hoverToMarkdown, type LspTransport } from "../../src/main/lsp/client";
+import { LspClient, MessageBuffer, encodeMessage, hoverToMarkdown, normalizeDocumentSymbols, type LspTransport } from "../../src/main/lsp/client";
 import { toMonacoCompletion, toMonacoLocation, toMonacoMarker, toMonacoRange } from "../../src/shared/lsp-map";
 
 interface SentMessage {
@@ -185,5 +185,37 @@ describe("T8.3 报文转换", () => {
     expect(toMonacoMarker(events[0].diagnostics[0] as never)).toMatchObject({
       severity: 8, message: "expected ';'", startLineNumber: 1, startColumn: 5, source: "clang",
     });
+  });
+
+  it("test_document_symbol_normalizes_hierarchical_and_flat", async () => {
+    // Given 层级 DocumentSymbol When documentSymbol Then 请求方法正确、children 保留
+    const { client, transport } = await startedClient();
+    const pending = client.documentSymbol("file:///mirror/x/a.cpp");
+    const request = transport.last();
+    expect(request.method).toBe("textDocument/documentSymbol");
+    transport.push({
+      jsonrpc: "2.0", id: request.id,
+      result: [
+        {
+          name: "main", kind: 12, detail: "int",
+          range: { start: { line: 0, character: 0 }, end: { line: 20, character: 0 } },
+          selectionRange: { start: { line: 0, character: 5 }, end: { line: 0, character: 9 } },
+          children: [{ name: "loop", kind: 12, range: { start: { line: 5, character: 0 }, end: { line: 9, character: 0 } }, selectionRange: { start: { line: 5, character: 6 }, end: { line: 5, character: 10 } } }],
+        },
+      ],
+    });
+    const symbols = await pending;
+    expect(symbols[0]).toMatchObject({ name: "main", kind: 12, detail: "int" });
+    expect(symbols[0].selectionRange.start.line).toBe(0);
+    expect(symbols[0].children?.[0].name).toBe("loop");
+
+    // 扁平 SymbolInformation（location.range + selectionRange 缺省回落到 range）
+    const flat = normalizeDocumentSymbols([
+      { name: "foo", kind: 6, location: { uri: "file:///x/a.cpp", range: { start: { line: 3, character: 1 }, end: { line: 3, character: 4 } } } },
+    ]);
+    expect(flat[0]).toMatchObject({ name: "foo", kind: 6 });
+    expect(flat[0].selectionRange).toEqual(flat[0].range);
+    expect(normalizeDocumentSymbols(null)).toEqual([]);
+    expect(normalizeDocumentSymbols([{ kind: 1 }])).toEqual([]);   // 无 name/range 丢弃
   });
 });

@@ -64,6 +64,18 @@ function writeAll(sftp: SFTPWrapper, p: string, data: Buffer): Promise<void> {
   });
 }
 
+/** SFTP 失败 → AppError（§9）：把「不存在」提升成一等错误码，并带上原始状态码供宿主精确映射。
+ *  ssh2 把 SFTP 状态码塞在 err.code（2=NO_SUCH_FILE、3=PERMISSION_DENIED…）。 */
+export function classifySftpError(err: unknown, target: string): AppError {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === "number") {
+    if (code === 2) return new AppError("not-found", "远端路径不存在", target, code);
+    if (code === 3) return new AppError("sftp", "权限不足", target, code);
+    return new AppError("sftp", err instanceof Error ? err.message : String(err), target, code);
+  }
+  return toAppError(err, "sftp");
+}
+
 export class RemoteFs {
   constructor(private readonly conn: SSHConnection) {}
 
@@ -75,7 +87,7 @@ export class RemoteFs {
       try {
         list = await readdirAsync(sftp, target);
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
       const entries: RemoteEntry[] = [];
       for (const item of list) {
@@ -123,7 +135,7 @@ export class RemoteFs {
           mode: st.mode,
         };
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
     });
   }
@@ -138,7 +150,7 @@ export class RemoteFs {
       try {
         st = await statAsync(sftp, target);
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
       if (st.size > maxBytes) {
         throw new AppError("invalid-input", "文件过大", `${target}（${st.size} 字节，上限 ${maxBytes}）`);
@@ -147,7 +159,7 @@ export class RemoteFs {
       try {
         buf = await readAll(sftp, target, maxBytes);
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
       let encoding: "utf8" | "utf8-bom" = "utf8";
       if (buf.subarray(0, 3).equals(UTF8_BOM)) {
@@ -180,13 +192,13 @@ export class RemoteFs {
         await renameAsync(sftp, tmp, target);
       } catch (err) {
         await unlinkAsync(sftp, tmp).catch(() => { /* 清理失败不掩盖原始错误 */ });
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
       try {
         const st = await statAsync(sftp, target);
         return { path: target, size: st.size, mtime: st.mtime };
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
     });
   }
@@ -197,7 +209,7 @@ export class RemoteFs {
       try {
         await writeAll(sftp, target, Buffer.alloc(0));
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
     });
   }
@@ -208,7 +220,7 @@ export class RemoteFs {
       try {
         await mkdirAsync(sftp, target);
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
     });
   }
@@ -220,7 +232,7 @@ export class RemoteFs {
       try {
         await renameAsync(sftp, src, dst);
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, src);
       }
     });
   }
@@ -238,7 +250,7 @@ export class RemoteFs {
       try {
         await unlinkAsync(sftp, target);
       } catch (err) {
-        throw toAppError(err, "sftp");
+        throw classifySftpError(err, target);
       }
     });
   }

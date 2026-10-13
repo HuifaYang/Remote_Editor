@@ -27,6 +27,8 @@ export interface LspManagerDeps {
   platform?: NodeJS.Platform;
   /** 设置项：C++ / Python 服务器路径（U9；默认值由调用方传入） */
   serverPaths?: () => ({ cpp: string; python: string });
+  /** 输出面板 LSP 日志通道（ui-parity S07）：启动/停止/失败等生命周期事件 */
+  onLog?: (line: string) => void;
 }
 
 interface Started {
@@ -69,8 +71,14 @@ export class LspManager {
     });
     await client.start();
     this.started.set(language, { client, mode, root });
-    log("info", `语言服务已启动：${language}（${mode}，root=${root}）`);
+    this.emitLog(`语言服务已启动：${language}（${mode}，root=${root}）`);
     return client;
+  }
+
+  /** 双写：主进程日志文件 + 输出面板 LSP 通道（ui-parity S07） */
+  private emitLog(message: string): void {
+    log("info", message);
+    this.deps.onLog?.(message);
   }
 
   /** 诊断订阅（publishDiagnostics → 渲染进程 setModelMarkers） */
@@ -91,7 +99,7 @@ export class LspManager {
     try {
       await started.client.dispose();
     } catch (err) {
-      log("warn", `关闭语言服务失败：${String(err)}`);
+      this.emitLog(`关闭语言服务失败：${String(err)}`);
     }
   }
 
@@ -108,7 +116,7 @@ export class LspManager {
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
       });
-      log("info", `clangd 启动：${exe} ${args.join(" ")}`);
+      this.emitLog(`clangd 启动：${exe} ${args.join(" ")}`);
       return localTransport(child);
     }
     const configuredPython = this.deps.serverPaths?.().python ?? "";
@@ -123,7 +131,7 @@ export class LspManager {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-    log("info", `pylsp 启动：${exe} ${pyArgs.join(" ")}（PYTHONPATH=${env.PYTHONPATH ?? ""}）`);
+    this.emitLog(`pylsp 启动：${exe} ${pyArgs.join(" ")}（PYTHONPATH=${env.PYTHONPATH ?? ""}）`);
     return localTransport(child);
   }
 
@@ -190,7 +198,7 @@ export class LspManager {
       ? `clangd ${CLANGD_ARGS.join(" ")} --target=${this.mirror.targetTriplet}`
       : "python3 -m pylsp";
     const handle = await conn.execStream(command, { cwd: remoteRoot, timeoutMs: 0 });
-    log("info", `板子上启动语言服务：${command}（cwd=${remoteRoot}）`);
+    this.emitLog(`板子上启动语言服务：${command}（cwd=${remoteRoot}）`);
     return remoteTransport(handle);
   }
 }

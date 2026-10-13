@@ -1,0 +1,413 @@
+{
+  "name": "rce-remote",
+  "displayName": "RemoteCodeEditor 远程 SSH",
+  "description": "用我们自己的 SSH/SFTP 层替代 Remote-SSH：远端文件系统、终端、搜索、源代码管理、语言服务（clangd/pylsp 走本地镜像）",
+  "version": "0.2.0",
+  "publisher": "remote-code-editor",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./out/extension.js",
+  "enabledApiProposals": [
+    "fileSearchProvider",
+    "textSearchProvider",
+    "contribViewsRemote"
+  ],
+  "capabilities": {
+    "virtualWorkspaces": true,
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "activationEvents": [
+    "*",
+    "onFileSystem:sshfs"
+  ],
+  "contributes": {
+    "taskDefinitions": [
+      {
+        "type": "rce-remote",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "任务名（对应远端 tasks.json 里的 label）"
+          }
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "rce.connect",
+        "title": "连接到远程主机…",
+        "category": "RemoteCodeEditor"
+      },
+      {
+        "command": "rce.disconnect",
+        "title": "断开远程连接",
+        "category": "RemoteCodeEditor"
+      },
+      {
+        "command": "rce.newRemoteTerminal",
+        "title": "新建远程终端",
+        "category": "RemoteCodeEditor"
+      },
+      {
+        "command": "rce.showLog",
+        "title": "显示日志",
+        "category": "RemoteCodeEditor"
+      },
+      {
+        "command": "rce.scm.refresh",
+        "title": "刷新远端仓库",
+        "category": "RemoteCodeEditor",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "rce.scm.stage",
+        "title": "暂存更改",
+        "category": "RemoteCodeEditor",
+        "icon": "$(add)"
+      },
+      {
+        "command": "rce.scm.unstage",
+        "title": "取消暂存",
+        "category": "RemoteCodeEditor",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "rce.scm.discard",
+        "title": "放弃更改",
+        "category": "RemoteCodeEditor",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "rce.scm.commit",
+        "title": "提交",
+        "category": "RemoteCodeEditor"
+      },
+      {
+        "command": "rce.lsp.syncMirror",
+        "title": "重新同步远端镜像",
+        "category": "RemoteCodeEditor",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "rce.lsp.restart",
+        "title": "重启语言服务",
+        "category": "RemoteCodeEditor",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "rce.cache.cleanup",
+        "title": "清理本机语言服务缓存",
+        "category": "RemoteCodeEditor",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "remote-explorer.add",
+        "title": "新建远程",
+        "icon": "$(plus)"
+      },
+      {
+        "command": "remote-explorer.configureSsh",
+        "title": "打开 SSH 配置文件",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "remote-explorer.refresh",
+        "title": "刷新",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "remote-explorer.connectToRemoteInCurrentWindow",
+        "title": "在当前窗口中连接...",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "remote-explorer.connectToRemoteInNewWindow",
+        "title": "在新窗口中连接...",
+        "icon": "$(empty-window)"
+      },
+      {
+        "command": "remote-explorer.connectToFolderInCurrentWindow",
+        "title": "在当前窗口中连接...",
+        "icon": "$(arrow-right)"
+      },
+      {
+        "command": "remote-explorer.connectToFolderInNewWindow",
+        "title": "在新窗口中连接...",
+        "icon": "$(empty-window)"
+      },
+      {
+        "command": "remote-explorer.deleteFolderHistoryItem",
+        "title": "从最近使用列表中删除",
+        "icon": "$(remove)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "rce.connect",
+        "key": "ctrl+alt+o",
+        "mac": "cmd+alt+o"
+      },
+      {
+        "command": "rce.newRemoteTerminal",
+        "key": "ctrl+shift+alt+`",
+        "when": "virtualWorkspace"
+      }
+    ],
+    "menus": {
+      "scm/title": [
+        {
+          "command": "rce.scm.refresh",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "navigation"
+        }
+      ],
+      "scm/resourceState/context": [
+        {
+          "command": "rce.scm.stage",
+          "when": "scmProvider =~ /^rce-sshfs/ && scmResourceGroup == changes",
+          "group": "inline"
+        },
+        {
+          "command": "rce.scm.unstage",
+          "when": "scmProvider =~ /^rce-sshfs/ && scmResourceGroup == staged",
+          "group": "inline"
+        },
+        {
+          "command": "rce.scm.discard",
+          "when": "scmProvider =~ /^rce-sshfs/ && scmResourceGroup == changes",
+          "group": "discard"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "remote-explorer.add",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.configureSsh",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.refresh",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.connectToRemoteInCurrentWindow",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.connectToRemoteInNewWindow",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.connectToFolderInCurrentWindow",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.connectToFolderInNewWindow",
+          "when": "false"
+        },
+        {
+          "command": "remote-explorer.deleteFolderHistoryItem",
+          "when": "false"
+        },
+        {
+          "command": "rce.disconnect",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "remote-explorer.refresh",
+          "when": "view == remoteTargets",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "remote-explorer.configureSsh",
+          "when": "viewItem == remote-explorer.sshGroup",
+          "group": "inline@1"
+        },
+        {
+          "command": "remote-explorer.configureSsh",
+          "when": "viewItem == remote-explorer.sshGroup",
+          "group": "navigation@1"
+        },
+        {
+          "command": "remote-explorer.add",
+          "when": "viewItem == remote-explorer.sshGroup",
+          "group": "inline@2"
+        },
+        {
+          "command": "remote-explorer.add",
+          "when": "viewItem == remote-explorer.sshGroup",
+          "group": "navigation@2"
+        },
+        {
+          "command": "remote-explorer.connectToRemoteInCurrentWindow",
+          "when": "viewItem == remote-explorer.sshRemoteTarget",
+          "group": "inline@1"
+        },
+        {
+          "command": "remote-explorer.connectToRemoteInCurrentWindow",
+          "when": "viewItem == remote-explorer.sshRemoteTarget",
+          "group": "navigation@1"
+        },
+        {
+          "command": "remote-explorer.connectToRemoteInNewWindow",
+          "when": "viewItem == remote-explorer.sshRemoteTarget",
+          "group": "inline@2"
+        },
+        {
+          "command": "remote-explorer.connectToRemoteInNewWindow",
+          "when": "viewItem == remote-explorer.sshRemoteTarget",
+          "group": "navigation@2"
+        },
+        {
+          "command": "remote-explorer.connectToFolderInCurrentWindow",
+          "when": "viewItem == remote-explorer.remoteFolder",
+          "group": "inline@1"
+        },
+        {
+          "command": "remote-explorer.connectToFolderInCurrentWindow",
+          "when": "viewItem == remote-explorer.remoteFolder",
+          "group": "navigation@1"
+        },
+        {
+          "command": "remote-explorer.connectToFolderInNewWindow",
+          "when": "viewItem == remote-explorer.remoteFolder",
+          "group": "inline@2"
+        },
+        {
+          "command": "remote-explorer.connectToFolderInNewWindow",
+          "when": "viewItem == remote-explorer.remoteFolder",
+          "group": "navigation@2"
+        },
+        {
+          "command": "remote-explorer.deleteFolderHistoryItem",
+          "when": "viewItem == remote-explorer.remoteFolder",
+          "group": "navigation@3"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "RemoteCodeEditor",
+      "properties": {
+        "rce.watch.pollMs": {
+          "type": "number",
+          "default": 3000,
+          "markdownDescription": "远端目录轮询间隔（毫秒）。SFTP 没有 inotify，远端又不允许常驻服务，所以外部改动只能轮询发现；调大可以省带宽。"
+        },
+        "rce.lsp.enabled": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "是否启用远端语言服务（C/C++ 补全·跳转·诊断 / Python）。开启后会把远端目录镜像到本机（1 条 tar 命令），由**工作机上的** clangd / pylsp 提供服务；目标机不装任何东西。"
+        },
+        "rce.lsp.transport": {
+          "type": "string",
+          "enum": [
+            "local",
+            "remote",
+            "disabled"
+          ],
+          "default": "local",
+          "markdownDescription": "语言服务跑在哪：`local` = 工作机（默认，指向本地镜像）；`remote` = 唯一例外，按需拉起**你自己装在板子上**的 clangd/pylsp；`disabled` = 完全关闭。"
+        },
+        "rce.lsp.cppPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "clangd 可执行文件路径（留空 = 内置 clangd，再退回 PATH 里的 `clangd`）。"
+        },
+        "rce.lsp.pythonPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Python 语言服务路径（留空 = `python3 -m pylsp`）。"
+        },
+        "remote.SSH.configFile": {
+          "type": "string",
+          "default": "",
+          "scope": "application",
+          "description": "自定义 SSH 配置文件路径。留空时使用 ~/.ssh/config。"
+        },
+        "remote-explorer.foldersSortOrder": {
+          "type": "string",
+          "description": "指定在远程资源管理器的远程目标下显示文件夹的顺序。",
+          "default": "most recently used",
+          "scope": "application",
+          "enum": [
+            "most recently used",
+            "alphabetical"
+          ],
+          "enumDescriptions": [
+            "按最近在顶部打开的顺序显示文件夹",
+            "按字母顺序显示文件夹"
+          ]
+        },
+        "remote-explorer.collapseRecentFolders": {
+          "type": "boolean",
+          "default": false,
+          "description": "折叠远程资源管理器远程目标下的最近文件夹。",
+          "scope": "application"
+        },
+        "rce.lsp.maxFiles": {
+          "type": "number",
+          "default": 20000,
+          "markdownDescription": "自动建立语言服务镜像的最大源文件数。超过此值时暂停自动镜像，状态栏会提示；点击状态栏可强制同步。VS Code Remote-SSH 不镜像目录，这里是为了嵌入式场景在工作机跑语言服务而做的折中。"
+        },
+        "rce.cache.maxSizeMB": {
+          "type": "number",
+          "default": 10240,
+          "markdownDescription": "本机语言服务影子缓存的总容量上限（MB）。超过后按最近使用时间淘汰非活跃项目；当前项目和未同步项目不会被自动删除。"
+        },
+        "rce.cache.maxProjectMB": {
+          "type": "number",
+          "default": 5120,
+          "markdownDescription": "单个项目影子缓存的上限（MB）。源码镜像和 clangd/pylsp 索引合计超过此值且项目不活跃时会被清理。"
+        },
+        "rce.cache.ttlDays": {
+          "type": "number",
+          "default": 30,
+          "markdownDescription": "影子缓存多久未使用后允许自动清理（天）。设为 0 表示不按时间清理。"
+        },
+        "rce.cache.cleanupOnDisconnect": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "断开远程连接后立即执行一次缓存容量/过期清理。不会删除当前仍在使用或未同步的项目。"
+        }
+      }
+    },
+    "configurationDefaults": {
+      "terminal.integrated.defaultProfile.linux": "RemoteCodeEditor",
+      "terminal.integrated.defaultProfile.osx": "RemoteCodeEditor",
+      "window.confirmSaveUntitledWorkspace": false
+    },
+    "terminal": {
+      "profiles": [
+        {
+          "id": "rceRemote",
+          "title": "RemoteCodeEditor",
+          "icon": "remote"
+        }
+      ]
+    },
+    "views": {
+      "remote": [
+        {
+          "id": "remoteTargets",
+          "name": "远程(隧道/SSH)",
+          "group": "targets@1",
+          "remoteName": "sshfs"
+        }
+      ]
+    }
+  }
+}

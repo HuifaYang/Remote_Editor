@@ -1,9 +1,7 @@
 {
-  "//": "根配置：references 分层（shared 被各层各自编译进自己的 outDir，运行时相对路径一致）",
+  "//": "共享核心编译：SSH / SFTP / Git / 搜索 / 终端 / 镜像 / LSP。CodeOSS 扩展由 ide/tools/build-extension.mjs 再打包。",
   "files": [],
   "references": [
-    { "path": "tsconfig.main.json" },
-    { "path": "tsconfig.preload.json" },
-    { "path": "tsconfig.renderer.json" }
+    { "path": "tsconfig.main.json" }
   ]
 }

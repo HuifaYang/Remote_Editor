@@ -8,14 +8,14 @@ import { extractTarGz } from "../../src/main/mirror/tar";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   MirrorManager, buildFullSyncCommand, buildIncrementalSyncCommand, buildPythonEnvTarCommand,
-  buildSysrootTarCommand, splitStderr,
+  buildSysrootTarCommand, parseSections, splitStderr,
 } from "../../src/main/mirror/manager";
 import {
   createManifest, diffManifest, mirrorRelativePath, parseFindListing, parseManifest, serializeManifest, toEntryMap,
 } from "../../src/main/mirror/manifest";
 import {
-  buildCompileFlagsTxt, buildCompileCommandsFindCommand, buildDirExistsCommand, mergeCompileCommands,
-  rewriteCompileCommand, splitCommandLine, type CompileRewriteContext,
+  buildCompileFlagsTxt, buildCompileCommandsFindCommand, buildDirExistsCommand, collectFromParsedData,
+  mergeCompileCommands, rewriteCompileCommand, splitCommandLine, type CompileRewriteContext,
 } from "../../src/main/lsp/clangd-config";
 
 let scratch: string;
@@ -261,6 +261,22 @@ describe("T5.5 MirrorManager.sync 全流程（假连接）", () => {
     await expect(mgr.sync("/ws")).rejects.toMatchObject({ code: "unsupported" });
   });
 
+  it("test_cancel_aborts_in_flight_sync", async () => {
+    // Given 源码流挂起不吐字节（gatedStream） When 同步中途 cancel Then 以「已取消」失败，不退化为全量重传
+    const conn = makeFakeConn({
+      tars: [makeTarGz([{ path: "./src/a.c", content: "int a;\n" }])],
+      listings: ["./src/a.c 7 1729990000.5\n"],
+      gatedStream: true,
+    });
+    const mgr = new MirrorManager(conn, path.join(scratch, "mirror"));
+    const promise = mgr.sync("/ws");
+    await new Promise((r) => setTimeout(r, 20));      // 确保已进入 tar 流等待
+    mgr.cancel();
+    await expect(promise).rejects.toThrow("镜像同步已取消");
+    expect(conn.streamCalls).toBe(1);                  // 没有触发增量失败后的全量重传
+    expect(fs.existsSync(path.join(scratch, "mirror", "src", "a.c"))).toBe(false);
+  });
+
   it("test_apply_local_save_updates_mirror_file", async () => {
     const conn = makeFakeConn({ tars: [makeTarGz([{ path: "./src/a.c", content: "int a;\n" }])], listings: ["./src/a.c 7 1729990000.5\n"] });
     const mirrorRoot = path.join(scratch, "mirror");
@@ -312,6 +328,8 @@ interface FakeConnOptions {
   tars: Buffer[];
   listings: string[];
   tarAvailable?: boolean;
+  /** execStream 返回一个挂起的流（不吐字节，等 close 销毁）：用于取消用例 */
+  gatedStream?: boolean;
 }
 
 /** 假 SSHConnection：exec 按命令分类应答；execStream 依次吐出 tar 流 + 清单 */
@@ -321,6 +339,7 @@ function makeFakeConn(opts: FakeConnOptions): FakeConnection {
 
 class FakeConnection {
   private tarIndex = 0;
+  streamCalls = 0;
   constructor(private readonly opts: FakeConnOptions) {}
 
   async exec(cmd: string): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -346,6 +365,16 @@ class FakeConnection {
     const tar = this.opts.tars[Math.min(this.tarIndex, this.opts.tars.length - 1)];
     const listing = this.opts.listings[Math.min(this.tarIndex, this.opts.listings.length - 1)];
     this.tarIndex++;
+    this.streamCalls++;
+    if (this.opts.gatedStream) {
+      // 挂起流：不推任何字节，直到 close() 销毁（模拟用户取消时断开 SSH 流）
+      const stream = new Readable({ read() { /* 等 close */ } });
+      return {
+        stdout: stream,
+        wait: async () => ({ code: 0, stderr: `1729990000\n${listing}` }),
+        close: () => stream.destroy(new Error("cancelled")),
+      };
+    }
     return {
       stdout: Readable.from(tar),
       wait: async () => ({ code: 0, stderr: `1729990000\n${listing}` }),
@@ -371,5 +400,84 @@ describe("T5.7 镜像同步命令预算（§5.3.1）", () => {
     expect(cmd).toContain("-newermt '@1729990000'");
     expect(cmd).toContain("tar --null -czf - -T -");
     expect(cmd).toContain("1>&2");
+  });
+});
+
+describe("T5.8 全量同步命令的分段格式（A8b/A9 组合，端到端暴露过 bug）", () => {
+  // 这一组用例是回归：早先的复合命令有两处硬伤 ——
+  //   1) 分段之间会拼出空分段（`; ;`），整条命令在远端直接**语法错误**，镜像永远同步不了；
+  //   2) 分段标记是当命令名用的（靠 "command not found" 顺带打到 stderr），带参数的 `__FILE__ <路径>` 拼不出来。
+  const cmd = buildFullSyncCommand("/home/le/ws");
+
+  it("test_full_sync_command_has_no_empty_section_and_real_markers", () => {
+    expect(cmd).not.toMatch(/;[\s]*;/);                                  // 空分段 = 语法错误
+    expect(cmd).toContain("printf '%s\\n' '__RCE_SECTION____CAP__' 1>&2");
+    expect(cmd).toContain("printf '%s\\n' '__RCE_SECTION____PROBE__' 1>&2");
+    // 带参数的 __FILE__ 分段（老写法拼不出来）
+    expect(cmd).toContain('printf \'%s\\n\' "__RCE_SECTION____FILE__ $__rce_f" 1>&2');
+    // 能力探测与 sys.path 必须打到 stderr（stdout 是 tar 的 gzip 流，混进去就解不开）
+    expect(cmd).toContain("} 1>&2");
+    expect(cmd).toContain("2>/dev/null 1>&2");
+  });
+
+  it("test_listing_is_emitted_before_the_first_section_marker", () => {
+    // parseSections 的契约：第一个分段头之前的 stderr 全是「date + 文件清单」
+    const listingAt = cmd.indexOf("-printf '%p %s %T@\\n' 1>&2");
+    const firstMarkerAt = cmd.indexOf("__RCE_SECTION__");
+    expect(listingAt).toBeGreaterThan(-1);
+    expect(firstMarkerAt).toBeGreaterThan(-1);
+    expect(listingAt).toBeLessThan(firstMarkerAt);
+  });
+
+  it("test_parse_sections_round_trip_from_command_output_shape", () => {
+    // Given 命令真实产生的 stderr 形状（分段头独占一行，__FILE__ 后面跟路径）
+    const stderr = [
+      "1750000000",
+      "./compile_commands.json 220 1750000000.7",
+      "./src/main.c 65 1750000000.7",
+      "__RCE_SECTION____CAP__",
+      "tar (GNU tar) 1.34",
+      "aarch64-linux-gnu",
+      "/usr/lib/gcc/aarch64-linux-gnu/12/include",
+      "__RCE_SECTION____FIND__",
+      "/home/le/ws/build/compile_commands.json",
+      "__RCE_SECTION____FILE__ /home/le/ws/build/compile_commands.json",
+      '[ { "directory": "/home/le/ws", "file": "/home/le/ws/src/main.c",',
+      '    "command": "gcc -c -I/usr/include -I/home/le/ws/src -o /home/le/ws/build/main.o /home/le/ws/src/main.c" } ]',
+      "__RCE_SECTION____PROBE__",
+      "/usr/include",
+      "/usr/lib/gcc/aarch64-linux-gnu/12/include",
+      "__RCE_SECTION____PYPATH__",
+      '["/usr/lib/python3.10", "/usr/lib/python3/dist-packages"]',
+      "",
+    ].join("\n");
+
+    // When 解析分段 + 重写 compile_commands
+    const sections = parseSections(stderr);
+    const { listing, syncedAt } = splitStderr(sections.listing ?? "");
+    const mirrorRoot = path.join(scratch, "mirror");
+    const compile = collectFromParsedData("/home/le/ws", {
+      findOutput: sections.find ?? "",
+      fileTexts: sections.fileTexts ?? {},
+      probeOutput: sections.probe ?? "",
+    }, { mirrorRoot, triplet: "aarch64-linux-gnu" });
+
+    // Then 清单/能力/compile_commands/探测/sys.path 全都解析出来了
+    expect(syncedAt).toBe(1750000000);
+    expect(listing.split("\n").filter(Boolean)).toHaveLength(2);
+    expect(sections.cap).toContain("aarch64-linux-gnu");
+    expect(sections.find?.trim()).toBe("/home/le/ws/build/compile_commands.json");
+    expect(Object.keys(sections.fileTexts ?? {})).toEqual(["/home/le/ws/build/compile_commands.json"]);
+    expect(sections.probe).toContain("/usr/include");
+    expect(sections.pyPath).toContain("/usr/lib/python3.10");
+
+    // 且 compile_commands 里的远端绝对路径被重写成镜像前缀（§13 坑 2），系统头映射到 _sysroot
+    expect(compile.kind).toBe("compile_commands");
+    expect(compile.entryCount).toBe(1);
+    expect(compile.sysrootRoots).toContain("/usr/include");
+    const rewritten = fs.readFileSync(path.join(mirrorRoot, "compile_commands.json"), "utf8");
+    expect(rewritten).toContain(mirrorRoot);
+    expect(rewritten).not.toContain("/home/le/ws/");
+    expect(rewritten).toContain(path.join(mirrorRoot, "_sysroot", "usr", "include"));
   });
 });

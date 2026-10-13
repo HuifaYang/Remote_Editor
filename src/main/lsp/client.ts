@@ -3,7 +3,9 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { AppError } from "../../shared/errors.js";
 import type {
-  LspCompletionItem, LspCompletionList, LspDiagnostic, LspDiagnosticEvent, LspLocation,
+  LspCodeAction, LspCompletionItem, LspCompletionList, LspDiagnostic, LspDiagnosticEvent,
+  LspDocumentHighlight, LspDocumentSymbol, LspFoldingRange, LspLocation, LspRange,
+  LspSignatureHelp, LspTextEdit,
 } from "../../shared/types.js";
 
 /** 语言服务器进程的抽象（本机 spawn / 板子上 SSH exec 两种实现见 manager.ts） */
@@ -102,7 +104,30 @@ export class LspClient {
           synchronization: { dynamicRegistration: false, didSave: true },
           completion: { completionItem: { snippetSupport: true, documentationFormat: ["markdown", "plaintext"] } },
           definition: {},
+          declaration: {},
+          typeDefinition: {},
+          implementation: {},
+          references: {},
+          rename: { prepareSupport: true },
+          signatureHelp: {
+            signatureInformation: {
+              documentationFormat: ["markdown", "plaintext"],
+              parameterInformation: { labelOffsetSupport: true },
+            },
+          },
+          documentHighlight: {},
+          codeAction: {
+            codeActionLiteralSupport: {
+              codeActionKind: {
+                valueSet: ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.rewrite", "source", "source.organizeImports"],
+              },
+            },
+          },
+          formatting: {},
+          rangeFormatting: {},
+          foldingRange: {},
           hover: { contentFormat: ["markdown", "plaintext"] },
+          documentSymbol: { hierarchicalDocumentSymbolSupport: true },
           publishDiagnostics: {},
         },
       },
@@ -157,9 +182,7 @@ export class LspClient {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
     });
-    if (result === null || result === undefined) return [];
-    const list = Array.isArray(result) ? result : [result];
-    return list.filter(isLocation).map((l) => ({ uri: l.uri, range: l.range }));
+    return normalizeLocations(result);
   }
 
   async hover(uri: string, line: number, character: number): Promise<string | null> {
@@ -168,6 +191,114 @@ export class LspClient {
       position: { line, character },
     });
     return hoverToMarkdown(result);
+  }
+
+  /** 文档符号（ui-parity E08）：层级 DocumentSymbol 与扁平 SymbolInformation 都归一化 */
+  async documentSymbol(uri: string): Promise<LspDocumentSymbol[]> {
+    const result = await this.request("textDocument/documentSymbol", {
+      textDocument: { uri: toFileUri(uri) },
+    });
+    return normalizeDocumentSymbols(result);
+  }
+
+  /** 跳转类能力共用：definition / declaration / typeDefinition / implementation / references */
+  private async locations(method: string, uri: string, line: number, character: number): Promise<LspLocation[]> {
+    const result = await this.request(method, {
+      textDocument: { uri: toFileUri(uri) },
+      position: { line, character },
+    });
+    return normalizeLocations(result);
+  }
+
+  declaration(uri: string, line: number, character: number): Promise<LspLocation[]> {
+    return this.locations("textDocument/declaration", uri, line, character);
+  }
+
+  typeDefinition(uri: string, line: number, character: number): Promise<LspLocation[]> {
+    return this.locations("textDocument/typeDefinition", uri, line, character);
+  }
+
+  implementation(uri: string, line: number, character: number): Promise<LspLocation[]> {
+    return this.locations("textDocument/implementation", uri, line, character);
+  }
+
+  async references(uri: string, line: number, character: number, includeDeclaration = true): Promise<LspLocation[]> {
+    const result = await this.request("textDocument/references", {
+      textDocument: { uri: toFileUri(uri) },
+      position: { line, character },
+      context: { includeDeclaration },
+    });
+    return normalizeLocations(result);
+  }
+
+  async prepareRename(uri: string, line: number, character: number): Promise<LspRange | null> {
+    const result = await this.request("textDocument/prepareRename", {
+      textDocument: { uri: toFileUri(uri) },
+      position: { line, character },
+    });
+    if (result === null || result === undefined) return null;
+    const range = (result as { range?: unknown }).range ?? result;
+    return isRange(range) ? range : null;
+  }
+
+  async rename(uri: string, line: number, character: number, newName: string): Promise<Record<string, LspTextEdit[]>> {
+    const result = await this.request("textDocument/rename", {
+      textDocument: { uri: toFileUri(uri) },
+      position: { line, character },
+      newName,
+    });
+    if (!result || typeof result !== "object") return {};
+    return normalizeWorkspaceEdit((result as { changes?: unknown }).changes);
+  }
+
+  async signatureHelp(uri: string, line: number, character: number): Promise<LspSignatureHelp | null> {
+    const result = await this.request("textDocument/signatureHelp", {
+      textDocument: { uri: toFileUri(uri) },
+      position: { line, character },
+      context: { triggerKind: 1 },
+    });
+    return normalizeSignatureHelp(result);
+  }
+
+  async documentHighlight(uri: string, line: number, character: number): Promise<LspDocumentHighlight[]> {
+    const result = await this.request("textDocument/documentHighlight", {
+      textDocument: { uri: toFileUri(uri) },
+      position: { line, character },
+    });
+    return normalizeDocumentHighlights(result);
+  }
+
+  async codeAction(uri: string, range: LspRange, diagnostics: LspDiagnostic[]): Promise<LspCodeAction[]> {
+    const result = await this.request("textDocument/codeAction", {
+      textDocument: { uri: toFileUri(uri) },
+      range,
+      context: { diagnostics },
+    });
+    return normalizeCodeActions(result);
+  }
+
+  async formatting(uri: string, options: Record<string, unknown>): Promise<LspTextEdit[]> {
+    const result = await this.request("textDocument/formatting", {
+      textDocument: { uri: toFileUri(uri) },
+      options,
+    });
+    return normalizeTextEdits(result);
+  }
+
+  async rangeFormatting(uri: string, range: LspRange, options: Record<string, unknown>): Promise<LspTextEdit[]> {
+    const result = await this.request("textDocument/rangeFormatting", {
+      textDocument: { uri: toFileUri(uri) },
+      range,
+      options,
+    });
+    return normalizeTextEdits(result);
+  }
+
+  async foldingRanges(uri: string): Promise<LspFoldingRange[]> {
+    const result = await this.request("textDocument/foldingRange", {
+      textDocument: { uri: toFileUri(uri) },
+    });
+    return normalizeFoldingRanges(result);
   }
 
   didOpen(uri: string, text: string, version: number): void {
@@ -263,7 +394,181 @@ function isMarkup(v: unknown): v is { value: string } {
 
 function isLocation(v: unknown): v is LspLocation {
   const l = v as LspLocation | null;
-  return !!l && typeof l.uri === "string" && typeof l.range === "object" && l.range !== null;
+  return !!l && typeof l.uri === "string" && isRange(l.range);
+}
+
+function isRange(v: unknown): v is LspRange {
+  const r = v as LspRange | null;
+  return !!r && typeof r === "object" && typeof r.start?.line === "number"
+    && typeof r.start?.character === "number" && typeof r.end?.line === "number" && typeof r.end?.character === "number";
+}
+
+function markupText(v: unknown): string | undefined {
+  if (typeof v === "string") return v;
+  if (isMarkup(v)) return v.value;
+  if (Array.isArray(v)) {
+    const parts = v.map(markupText).filter((x): x is string => typeof x === "string");
+    return parts.length ? parts.join("\n\n") : undefined;
+  }
+  return undefined;
+}
+
+/** Location 与 LocationLink 都归一化成 { uri, range }。 */
+export function normalizeLocations(result: unknown): LspLocation[] {
+  if (result === null || result === undefined) return [];
+  const list = Array.isArray(result) ? result : [result];
+  const out: LspLocation[] = [];
+  for (const raw of list) {
+    if (isLocation(raw)) {
+      out.push({ uri: raw.uri, range: raw.range });
+      continue;
+    }
+    const link = raw as { targetUri?: unknown; targetRange?: unknown; targetSelectionRange?: unknown } | null;
+    if (link && typeof link.targetUri === "string") {
+      const range = isRange(link.targetSelectionRange) ? link.targetSelectionRange : link.targetRange;
+      if (isRange(range)) out.push({ uri: link.targetUri, range });
+    }
+  }
+  return out;
+}
+
+function isTextEdit(v: unknown): v is LspTextEdit {
+  const e = v as LspTextEdit | null;
+  return !!e && isRange(e.range) && typeof e.newText === "string";
+}
+
+export function normalizeTextEdits(result: unknown): LspTextEdit[] {
+  if (!Array.isArray(result)) return [];
+  return result.filter(isTextEdit).map((e) => ({ range: e.range, newText: e.newText }));
+}
+
+export function normalizeWorkspaceEdit(changes: unknown): Record<string, LspTextEdit[]> {
+  if (!changes || typeof changes !== "object" || Array.isArray(changes)) return {};
+  const out: Record<string, LspTextEdit[]> = {};
+  for (const [uri, edits] of Object.entries(changes as Record<string, unknown>)) {
+    const normalized = normalizeTextEdits(edits);
+    if (normalized.length) out[uri] = normalized;
+  }
+  return out;
+}
+
+export function normalizeSignatureHelp(result: unknown): LspSignatureHelp | null {
+  if (!result || typeof result !== "object") return null;
+  const raw = result as { signatures?: unknown; activeSignature?: unknown; activeParameter?: unknown };
+  if (!Array.isArray(raw.signatures)) return null;
+  const signatures = raw.signatures.map((entry) => {
+    const s = entry as { label?: unknown; documentation?: unknown; parameters?: unknown; activeParameter?: unknown };
+    const parameters = Array.isArray(s.parameters) ? s.parameters.map((p) => {
+      const param = p as { label?: unknown; documentation?: unknown };
+      const label = typeof param.label === "string" || (Array.isArray(param.label) && param.label.length === 2)
+        ? param.label as string | [number, number]
+        : "";
+      const info: { label: string | [number, number]; documentation?: string } = { label };
+      const doc = markupText(param.documentation);
+      if (doc) info.documentation = doc;
+      return info;
+    }) : undefined;
+    const info: LspSignatureHelp["signatures"][number] = { label: String(s.label ?? "") };
+    const doc = markupText(s.documentation);
+    if (doc) info.documentation = doc;
+    if (parameters && parameters.length) info.parameters = parameters;
+    if (typeof s.activeParameter === "number") info.activeParameter = s.activeParameter;
+    return info;
+  }).filter((s) => s.label.length > 0);
+  if (!signatures.length) return null;
+  const help: LspSignatureHelp = { signatures };
+  if (typeof raw.activeSignature === "number") help.activeSignature = raw.activeSignature;
+  if (typeof raw.activeParameter === "number") help.activeParameter = raw.activeParameter;
+  return help;
+}
+
+export function normalizeDocumentHighlights(result: unknown): LspDocumentHighlight[] {
+  if (!Array.isArray(result)) return [];
+  const out: LspDocumentHighlight[] = [];
+  for (const raw of result) {
+    const h = raw as { range?: unknown; kind?: unknown } | null;
+    if (h && isRange(h.range)) out.push({ range: h.range, kind: typeof h.kind === "number" ? h.kind : undefined });
+  }
+  return out;
+}
+
+export function normalizeCodeActions(result: unknown): LspCodeAction[] {
+  if (!Array.isArray(result)) return [];
+  const out: LspCodeAction[] = [];
+  for (const raw of result) {
+    const a = raw as Record<string, unknown> | null;
+    if (!a || typeof a.title !== "string") continue;
+    const action: LspCodeAction = { title: a.title };
+    if (typeof a.kind === "string") action.kind = a.kind;
+    if (a.edit && typeof a.edit === "object") {
+      const changes = normalizeWorkspaceEdit((a.edit as { changes?: unknown }).changes);
+      if (Object.keys(changes).length) action.edit = { changes };
+    }
+    if (typeof a.command === "string") {
+      action.command = {
+        title: a.title,
+        command: a.command,
+        arguments: Array.isArray(a.arguments) ? a.arguments : undefined,
+      };
+    }
+    if (a.isPreferred === true) action.isPreferred = true;
+    const disabled = a.disabled as { reason?: unknown } | undefined;
+    if (disabled && typeof disabled.reason === "string") action.disabled = { reason: disabled.reason };
+    if (Array.isArray(a.diagnostics)) action.diagnostics = a.diagnostics as LspDiagnostic[];
+    out.push(action);
+  }
+  return out;
+}
+
+export function normalizeFoldingRanges(result: unknown): LspFoldingRange[] {
+  if (!Array.isArray(result)) return [];
+  const out: LspFoldingRange[] = [];
+  for (const raw of result) {
+    const f = raw as { startLine?: unknown; startCharacter?: unknown; endLine?: unknown; endCharacter?: unknown; kind?: unknown; collapsedText?: unknown } | null;
+    if (!f || typeof f.startLine !== "number" || typeof f.endLine !== "number") continue;
+    const range: LspFoldingRange = { startLine: f.startLine, endLine: f.endLine };
+    if (typeof f.startCharacter === "number") range.startCharacter = f.startCharacter;
+    if (typeof f.endCharacter === "number") range.endCharacter = f.endCharacter;
+    if (typeof f.kind === "string") range.kind = f.kind;
+    if (typeof f.collapsedText === "string") range.collapsedText = f.collapsedText;
+    out.push(range);
+  }
+  return out;
+}
+
+/** 归一化文档符号：层级 DocumentSymbol（range/selectionRange）与扁平 SymbolInformation（location.range）都支持 */
+export function normalizeDocumentSymbols(result: unknown): LspDocumentSymbol[] {
+  if (!Array.isArray(result)) return [];
+  const out: LspDocumentSymbol[] = [];
+  for (const raw of result) {
+    const symbol = normalizeDocumentSymbol(raw);
+    if (symbol) out.push(symbol);
+  }
+  return out;
+}
+
+function normalizeDocumentSymbol(raw: unknown): LspDocumentSymbol | null {
+  const s = raw as Record<string, unknown> | null;
+  if (!s || typeof s.name !== "string") return null;
+  // 层级形状带 range；扁平形状把范围放在 location.range 里
+  const ownRange = isRange(s.range) ? s.range : null;
+  const locRange = isRange((s.location as { range?: unknown } | undefined)?.range)
+    ? (s.location as { range: LspRange }).range : null;
+  const range = ownRange ?? locRange;
+  if (!range) return null;
+  const selectionRange = isRange(s.selectionRange) ? s.selectionRange : range;
+  const symbol: LspDocumentSymbol = {
+    name: s.name,
+    kind: typeof s.kind === "number" ? s.kind : 0,
+    range,
+    selectionRange,
+  };
+  if (typeof s.detail === "string") symbol.detail = s.detail;
+  if (Array.isArray(s.children)) {
+    const children = normalizeDocumentSymbols(s.children);
+    if (children.length > 0) symbol.children = children;
+  }
+  return symbol;
 }
 
 /** hover 内容可能是 string / MarkedString / MarkupContent / 数组（§5.5.2） */

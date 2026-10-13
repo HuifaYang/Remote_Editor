@@ -1,6 +1,7 @@
 // 假 SSH 服务端（总纲 §10.2）：进程内 ssh2 Server，SFTP 由真实临时目录支撑，exec 返回罐装输出
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { spawn, type SpawnOptions } from "node:child_process";
 import { Server, type SFTPStream, type SFTPStatusCode } from "ssh2";
 import { utils } from "ssh2";
 
@@ -160,11 +161,29 @@ export interface FakeServer {
   close(): Promise<void>;
 }
 
+/** 真机行为开关（默认全关，保持既有用例的“罐装”语义）：
+ *  · realExec —— exec 没命中罐装规则时，把远端路径重写成临时根后**真的执行**（终端/搜索/git 的端到端验证用）
+ *  · realShell —— 支持 shell/pty 请求，用 `script` 起一个真 pty 里的 bash（集成终端的端到端验证用）
+ *  · shellWrapper —— 真机命令外面再套一层可执行文件（argv 前缀），用来模拟“另一台机器”：
+ *    端到端里用它把工作机的 /usr/include 盖成空目录（见 ide/tools/fake-target.sh），
+ *    否则镜像同步会把工作机几百 MB 的系统头当成远端 sysroot 拉一遍。 */
+export interface FakeServerOptions {
+  realExec?: boolean;
+  realShell?: boolean;
+  shellWrapper?: string;
+}
+
 /** 起假服务端：密码 u/test；execRules 匹配前先剥 `cd '...' && ` 前缀 */
-export function startFakeServer(execRules: ExecRule[]): Promise<FakeServer> {
+export function startFakeServer(execRules: ExecRule[], opts: FakeServerOptions = {}): Promise<FakeServer> {
   // ssh2 自家工具生成 OpenSSH 格式主机密钥（node:crypto 的 PKCS8 PEM 它不认）
   const hostKey = utils.generateKeyPairSync("ed25519").private;
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os_tmp()), "rce-fake-ssh-"));
+
+  /** 远端绝对路径 → 临时根里的真实路径（与 SFTP 的 real() 同一套映射，只处理带引号/前有空格的形态） */
+  const rewrite = (command: string): string =>
+    command
+      .replace(/'\/ws/g, `'${root}/ws`)
+      .replace(/(^|\s)\/ws(?=\/|\s|$)/g, `$1${root}/ws`);
 
   const server = new Server({ hostKeys: [hostKey] }, (client) => {
     client.on("authentication", (ctx) => {
@@ -178,17 +197,66 @@ export function startFakeServer(execRules: ExecRule[]): Promise<FakeServer> {
           const stream = acceptExec();
           const cmd = info.command.replace(/^cd '[^']*' && /, "");
           let reply = { code: 0, stdout: "", stderr: "" };
+          let matched = false;
           for (const [pattern, r] of execRules) {
             if (pattern.test(cmd)) {
               reply = r;
+              matched = true;
               break;
             }
+          }
+          if (!matched && opts.realExec) {
+            const argv = ["/bin/bash", "-c", rewrite(info.command)];
+            const child = opts.shellWrapper
+              ? spawn(opts.shellWrapper, argv, { cwd: root, env: process.env })
+              : spawn(argv[0], argv.slice(1), { cwd: root, env: process.env });
+            child.stdout.on("data", (d: Buffer) => stream.write(d));
+            child.stderr.on("data", (d: Buffer) => stream.stderr.write(d));
+            child.on("close", (code: number | null) => {
+              stream.exit(code ?? 0);
+              stream.end();
+            });
+            return;
           }
           if (reply.stdout) stream.write(reply.stdout);
           if (reply.stderr) stream.stderr.write(reply.stderr);
           stream.exit(reply.code);
           stream.end();
         });
+        if (opts.realShell) {
+          session.on("pty", (acceptPty: () => void) => { acceptPty(); });
+          session.on("window-change", () => { /* 尺寸变化忽略：验证用的假靶机不需要真的 resize */ });
+          session.on("shell", (acceptShell: () => NodeJS.ReadWriteStream) => {
+            const stream = acceptShell() as unknown as {
+              write(d: string | Buffer): void;
+              stderr: { write(d: string | Buffer): void };
+              exit(code: number): void;
+              end(): void;
+              on(ev: string, cb: (d?: Buffer) => void): void;
+            };
+            // script(1) 能不带 node-pty 就造出真 pty，bash 因此有提示符、有回显
+            const shellArgv = ["script", "-q", "-f", "-c", "/bin/bash", "/dev/null"];
+            const shellOpts: SpawnOptions = {
+              cwd: root,
+              env: { ...process.env, TERM: "xterm-256color" },
+              stdio: ["pipe", "pipe", "pipe"],
+            };
+            const child = opts.shellWrapper
+              ? spawn(opts.shellWrapper, shellArgv, shellOpts)
+              : spawn(shellArgv[0], shellArgv.slice(1), shellOpts);
+            const childIn = child.stdin;
+            const childOut = child.stdout;
+            const childErr = child.stderr;
+            if (!childIn || !childOut || !childErr) throw new Error("假靶机：pty 子进程缺少管道");
+            stream.on("data", (d?: Buffer) => { if (d) childIn.write(d); });
+            childOut.on("data", (d: Buffer) => stream.write(d));
+            childErr.on("data", (d: Buffer) => stream.stderr.write(d));
+            child.on("close", (code: number | null) => {
+              stream.exit(code ?? 0);
+              stream.end();
+            });
+          });
+        }
         session.on("sftp", (acceptSftp) => {
           new FakeSftp(acceptSftp(), root);
         });

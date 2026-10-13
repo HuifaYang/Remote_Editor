@@ -4,17 +4,20 @@ import type { AppErrorCode, AppErrorShape } from "./types.js";
 export class AppError extends Error {
   readonly code: AppErrorCode;
   readonly detail?: string;
+  /** 底层 SFTP 状态码（仅 sftp/not-found 场景有），给宿主 FileSystemProvider 做精确错误映射 */
+  readonly sftpCode?: number;
 
-  constructor(code: AppErrorCode, message: string, detail?: string) {
+  constructor(code: AppErrorCode, message: string, detail?: string, sftpCode?: number) {
     super(message);
     this.name = "AppError";
     this.code = code;
     this.detail = detail;
+    this.sftpCode = sftpCode;
   }
 
   /** 跨 IPC 传输前转成可序列化的形状 */
   toShape(): AppErrorShape {
-    return { code: this.code, message: this.message, detail: this.detail };
+    return { code: this.code, message: this.message, detail: this.detail, sftpCode: this.sftpCode };
   }
 }
 
@@ -34,6 +37,7 @@ export const ERROR_TEXT: Record<AppErrorCode, string> = {
   "host-key": "主机公钥校验失败",
   "ssh": "SSH 错误",
   "sftp": "文件传输错误",
+  "not-found": "远端路径不存在",
   "git": "Git 命令失败",
   "mirror": "环境镜像同步失败",
   "lsp": "语言服务错误",
