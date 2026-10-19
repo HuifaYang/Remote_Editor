@@ -65,15 +65,24 @@ export class MessageBuffer {
 export interface LspClientOptions {
   rootUri: string;
   clientName?: string;
+  initializationOptions?: unknown;
   /** 规格未覆盖：请求超时，默认 10 秒（补全卡住时不能把 UI 挂死） */
   timeoutMs?: number;
   diagnostics?: (event: LspDiagnosticEvent) => void;
+  onLog?: (message: string) => void;
+}
+
+/** 与 VSCode CancellationToken 结构兼容，避免核心层反向依赖 vscode。 */
+export interface LspCancellationToken {
+  readonly isCancellationRequested: boolean;
+  onCancellationRequested(listener: () => void): { dispose(): void };
 }
 
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout | undefined;
+  cleanup?: () => void;
 }
 
 export class LspClient {
@@ -95,11 +104,18 @@ export class LspClient {
   /** 握手：initialize → initialized（T8.4 顺序断言） */
   async start(): Promise<void> {
     if (this.initialized) return;
-    await this.request("initialize", {
+    const params: Record<string, unknown> = {
       processId: process.pid,
       clientInfo: { name: this.opts.clientName ?? "RemoteCodeEditor", version: "2.0.0" },
       rootUri: this.opts.rootUri,
       capabilities: {
+        workspace: {
+          workspaceFolders: true,
+          configuration: true,
+          applyEdit: true,
+          didChangeConfiguration: { dynamicRegistration: false },
+        },
+        general: { positionEncodings: ["utf-16"] },
         textDocument: {
           synchronization: { dynamicRegistration: false, didSave: true },
           completion: { completionItem: { snippetSupport: true, documentationFormat: ["markdown", "plaintext"] } },
@@ -132,27 +148,47 @@ export class LspClient {
         },
       },
       workspaceFolders: [{ uri: this.opts.rootUri, name: "workspace" }],
-    });
+    };
+    if (this.opts.initializationOptions !== undefined) params.initializationOptions = this.opts.initializationOptions;
+    await this.request("initialize", params);
     this.notify("initialized", {});
     this.initialized = true;
   }
 
-  request(method: string, params: unknown): Promise<unknown> {
+  request(method: string, params: unknown, token?: LspCancellationToken): Promise<unknown> {
     if (this.exited) return Promise.reject(new AppError("lsp", "语言服务已退出"));
+    if (token?.isCancellationRequested) return Promise.reject(new AppError("lsp", `请求已取消：${method}`));
     const id = this.nextId++;
     const timeoutMs = this.opts.timeoutMs ?? 10000;
     return new Promise<unknown>((resolve, reject) => {
+      const cleanup = (): void => {
+        if (timer) clearTimeout(timer);
+        subscription?.dispose();
+      };
       const timer = Number.isFinite(timeoutMs) && timeoutMs > 0
         ? setTimeout(() => {
           this.pending.delete(id);
+          subscription?.dispose();
           reject(new AppError("lsp", `语言服务响应超时：${method}`));
         }, timeoutMs)
         : undefined;
-      this.pending.set(id, { resolve, reject, timer });
+      const cancel = (): void => {
+        if (!this.pending.has(id)) return;
+        this.pending.delete(id);
+        cleanup();
+        this.notify("$/cancelRequest", { id });
+        reject(new AppError("lsp", `请求已取消：${method}`));
+      };
+      const subscription = token?.onCancellationRequested(cancel);
+      this.pending.set(id, { resolve, reject, timer, cleanup });
+      if (token?.isCancellationRequested) {
+        cancel();
+        return;
+      }
       try {
         this.transport.send(encodeMessage({ jsonrpc: "2.0", id, method, params }).toString("utf8"));
       } catch (err) {
-        if (timer) clearTimeout(timer);
+        cleanup();
         this.pending.delete(id);
         reject(new AppError("lsp", "语言服务写入失败", String(err)));
       }
@@ -166,144 +202,144 @@ export class LspClient {
 
   // ---- 规格 §5.5 接口 ----
 
-  async completion(uri: string, line: number, character: number): Promise<LspCompletionItem[]> {
+  async completion(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspCompletionItem[]> {
     const result = await this.request("textDocument/completion", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
-    });
+    }, token);
     if (result === null || result === undefined) return [];
     const list = result as LspCompletionList | LspCompletionItem[] | null;
     const items = Array.isArray(list) ? list : Array.isArray(list?.items) ? list.items : [];
     return items.map(normalizeCompletion);
   }
 
-  async definition(uri: string, line: number, character: number): Promise<LspLocation[]> {
+  async definition(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspLocation[]> {
     const result = await this.request("textDocument/definition", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
-    });
+    }, token);
     return normalizeLocations(result);
   }
 
-  async hover(uri: string, line: number, character: number): Promise<string | null> {
+  async hover(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<string | null> {
     const result = await this.request("textDocument/hover", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
-    });
+    }, token);
     return hoverToMarkdown(result);
   }
 
   /** 文档符号（ui-parity E08）：层级 DocumentSymbol 与扁平 SymbolInformation 都归一化 */
-  async documentSymbol(uri: string): Promise<LspDocumentSymbol[]> {
+  async documentSymbol(uri: string, token?: LspCancellationToken): Promise<LspDocumentSymbol[]> {
     const result = await this.request("textDocument/documentSymbol", {
       textDocument: { uri: toFileUri(uri) },
-    });
+    }, token);
     return normalizeDocumentSymbols(result);
   }
 
   /** 跳转类能力共用：definition / declaration / typeDefinition / implementation / references */
-  private async locations(method: string, uri: string, line: number, character: number): Promise<LspLocation[]> {
+  private async locations(method: string, uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspLocation[]> {
     const result = await this.request(method, {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
-    });
+    }, token);
     return normalizeLocations(result);
   }
 
-  declaration(uri: string, line: number, character: number): Promise<LspLocation[]> {
-    return this.locations("textDocument/declaration", uri, line, character);
+  declaration(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspLocation[]> {
+    return this.locations("textDocument/declaration", uri, line, character, token);
   }
 
-  typeDefinition(uri: string, line: number, character: number): Promise<LspLocation[]> {
-    return this.locations("textDocument/typeDefinition", uri, line, character);
+  typeDefinition(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspLocation[]> {
+    return this.locations("textDocument/typeDefinition", uri, line, character, token);
   }
 
-  implementation(uri: string, line: number, character: number): Promise<LspLocation[]> {
-    return this.locations("textDocument/implementation", uri, line, character);
+  implementation(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspLocation[]> {
+    return this.locations("textDocument/implementation", uri, line, character, token);
   }
 
-  async references(uri: string, line: number, character: number, includeDeclaration = true): Promise<LspLocation[]> {
+  async references(uri: string, line: number, character: number, includeDeclaration = true, token?: LspCancellationToken): Promise<LspLocation[]> {
     const result = await this.request("textDocument/references", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
       context: { includeDeclaration },
-    });
+    }, token);
     return normalizeLocations(result);
   }
 
-  async prepareRename(uri: string, line: number, character: number): Promise<LspRange | null> {
+  async prepareRename(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspRange | null> {
     const result = await this.request("textDocument/prepareRename", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
-    });
+    }, token);
     if (result === null || result === undefined) return null;
     const range = (result as { range?: unknown }).range ?? result;
     return isRange(range) ? range : null;
   }
 
-  async rename(uri: string, line: number, character: number, newName: string): Promise<Record<string, LspTextEdit[]>> {
+  async rename(uri: string, line: number, character: number, newName: string, token?: LspCancellationToken): Promise<Record<string, LspTextEdit[]>> {
     const result = await this.request("textDocument/rename", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
       newName,
-    });
+    }, token);
     if (!result || typeof result !== "object") return {};
     return normalizeWorkspaceEdit((result as { changes?: unknown }).changes);
   }
 
-  async signatureHelp(uri: string, line: number, character: number): Promise<LspSignatureHelp | null> {
+  async signatureHelp(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspSignatureHelp | null> {
     const result = await this.request("textDocument/signatureHelp", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
       context: { triggerKind: 1 },
-    });
+    }, token);
     return normalizeSignatureHelp(result);
   }
 
-  async documentHighlight(uri: string, line: number, character: number): Promise<LspDocumentHighlight[]> {
+  async documentHighlight(uri: string, line: number, character: number, token?: LspCancellationToken): Promise<LspDocumentHighlight[]> {
     const result = await this.request("textDocument/documentHighlight", {
       textDocument: { uri: toFileUri(uri) },
       position: { line, character },
-    });
+    }, token);
     return normalizeDocumentHighlights(result);
   }
 
-  async codeAction(uri: string, range: LspRange, diagnostics: LspDiagnostic[]): Promise<LspCodeAction[]> {
+  async codeAction(uri: string, range: LspRange, diagnostics: LspDiagnostic[], token?: LspCancellationToken): Promise<LspCodeAction[]> {
     const result = await this.request("textDocument/codeAction", {
       textDocument: { uri: toFileUri(uri) },
       range,
       context: { diagnostics },
-    });
+    }, token);
     return normalizeCodeActions(result);
   }
 
-  async formatting(uri: string, options: Record<string, unknown>): Promise<LspTextEdit[]> {
+  async formatting(uri: string, options: Record<string, unknown>, token?: LspCancellationToken): Promise<LspTextEdit[]> {
     const result = await this.request("textDocument/formatting", {
       textDocument: { uri: toFileUri(uri) },
       options,
-    });
+    }, token);
     return normalizeTextEdits(result);
   }
 
-  async rangeFormatting(uri: string, range: LspRange, options: Record<string, unknown>): Promise<LspTextEdit[]> {
+  async rangeFormatting(uri: string, range: LspRange, options: Record<string, unknown>, token?: LspCancellationToken): Promise<LspTextEdit[]> {
     const result = await this.request("textDocument/rangeFormatting", {
       textDocument: { uri: toFileUri(uri) },
       range,
       options,
-    });
+    }, token);
     return normalizeTextEdits(result);
   }
 
-  async foldingRanges(uri: string): Promise<LspFoldingRange[]> {
+  async foldingRanges(uri: string, token?: LspCancellationToken): Promise<LspFoldingRange[]> {
     const result = await this.request("textDocument/foldingRange", {
       textDocument: { uri: toFileUri(uri) },
-    });
+    }, token);
     return normalizeFoldingRanges(result);
   }
 
-  didOpen(uri: string, text: string, version: number): void {
+  didOpen(uri: string, text: string, version: number, languageId?: string): void {
     this.notify("textDocument/didOpen", {
-      textDocument: { uri: toFileUri(uri), languageId: languageIdOf(uri), version, text },
+      textDocument: { uri: toFileUri(uri), languageId: languageId || languageIdOf(uri), version, text },
     });
   }
 
@@ -334,7 +370,7 @@ export class LspClient {
     await this.transport.kill();
     this.exited = true;
     for (const [, p] of this.pending) {
-      if (p.timer) clearTimeout(p.timer);
+      p.cleanup?.();
       p.reject(new AppError("lsp", "语言服务已关闭"));
     }
     this.pending.clear();
@@ -349,7 +385,7 @@ export class LspClient {
       const pending = this.pending.get(Number(msg.id));
       if (!pending) return;
       this.pending.delete(Number(msg.id));
-      if (pending.timer) clearTimeout(pending.timer);
+      pending.cleanup?.();
       if (msg.error) pending.reject(new AppError("lsp", msg.error.message, `code=${msg.error.code}`));
       else pending.resolve(msg.result);
       return;
@@ -359,9 +395,21 @@ export class LspClient {
       if (params?.uri) this.opts.diagnostics?.({ uri: params.uri, diagnostics: params.diagnostics ?? [] });
       return;
     }
-    // 服务端主动请求必须应答，否则 clangd 会一直等（workspace/configuration 给空数组）
+    if (msg.method === "window/logMessage" || msg.method === "window/showMessage") {
+      const params = msg.params as { message?: unknown } | undefined;
+      if (typeof params?.message === "string") this.opts.onLog?.(params.message);
+      if (msg.id === undefined) return;
+    }
+    // 标准 LSP 服务端会主动问配置/工作区；不回应会让 clangd、gopls、rust-analyzer 等卡住。
     if (msg.id !== undefined && msg.method) {
-      const result = msg.method === "workspace/configuration" ? [] : null;
+      const params = msg.params as { items?: unknown[] } | undefined;
+      const result = msg.method === "workspace/configuration"
+        ? (Array.isArray(params?.items) ? params.items.map(() => null) : [])
+        : msg.method === "workspace/workspaceFolders"
+          ? [{ uri: this.opts.rootUri, name: "workspace" }]
+          : msg.method === "workspace/applyEdit"
+            ? { applied: false, failureReason: "织码当前通过编辑器侧应用工作区编辑" }
+            : null;
       try {
         this.transport.send(encodeMessage({ jsonrpc: "2.0", id: msg.id, result }).toString("utf8"));
       } catch {
@@ -373,7 +421,7 @@ export class LspClient {
   private onExit(): void {
     this.exited = true;
     for (const [, p] of this.pending) {
-      if (p.timer) clearTimeout(p.timer);
+      p.cleanup?.();
       p.reject(new AppError("lsp", "语言服务已退出"));
     }
     this.pending.clear();

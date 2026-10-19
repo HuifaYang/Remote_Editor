@@ -20,9 +20,17 @@ const PRODUCTS = [
   path.resolve(VSCODE, "product.json"),
   path.resolve(ROOT, "ide", "VSCode-linux-x64", "resources", "app", "product.json"),
 ];
-const REQUIRED_PROPOSALS = ["fileSearchProvider", "textSearchProvider", "contribViewsRemote"];
+const REQUIRED_PROPOSALS = [
+  "fileSearchProvider",
+  "textSearchProvider",
+  "contribViewsRemote",
+  "scmHistoryProvider",
+  "scmActionButton",
+  "contribSourceControlHistoryItemMenu",
+];
 const LANG_SRC = path.resolve(VSCODE, "extensions", "language-pack-zh-hans", "translations", "main.i18n.json");
 const LANG_DEST = path.resolve(ROOT, "ide", "VSCode-linux-x64", "resources", "app", "extensions", "language-pack-zh-hans", "translations", "main.i18n.json");
+const PYTHON_LSP_SRC = path.resolve(ROOT, "resources", "python-lsp");
 
 // 正式包只允许 product.json 白名单里的 proposed API。build-extension 会直接同步到已解包的
 // VSCode-linux-x64，因此这里同步补齐白名单，避免「源码里正常、正式包看不到 Remote Explorer」。
@@ -107,6 +115,9 @@ for (const f of ["package.json", "out/extension.js", "resources/remote-explorer.
   fs.mkdirSync(path.dirname(target), { recursive: true });
   fs.copyFileSync(path.join(SRC, f), target);
 }
+if (fs.existsSync(PYTHON_LSP_SRC)) {
+  fs.cpSync(PYTHON_LSP_SRC, path.join(DEST, "resources", "python-lsp"), { recursive: true });
+}
 fs.writeFileSync(path.join(DEST, "README.md"), "构建期产物，勿改。真源：ide/extensions/sshfs\n");
 
 // 若已经有正式 Linux 包，同步替换其中的内置扩展，避免跑正式包时还是旧 SSH 层。
@@ -117,6 +128,9 @@ if (fs.existsSync(path.dirname(path.dirname(PKG_DEST)))) {
     const target = path.join(PKG_DEST, f);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.copyFileSync(path.join(SRC, f), target);
+  }
+  if (fs.existsSync(PYTHON_LSP_SRC)) {
+    fs.cpSync(PYTHON_LSP_SRC, path.join(PKG_DEST, "resources", "python-lsp"), { recursive: true });
   }
   fs.writeFileSync(path.join(PKG_DEST, "README.md"), "构建期产物，勿改。真源：ide/extensions/sshfs\n");
   console.log(`== 4/4 已同步到正式包 ${PKG_DEST}`);

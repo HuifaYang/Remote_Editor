@@ -45,13 +45,32 @@ export class GitRemote {
   /** 往返预算 = 2 条命令（rev-parse 合并 + status），多一条即返工（§5.4.1） */
   async treeStatus(directory: string): Promise<GitTreeStatus> {
     const dir = normalizeRemotePath(directory, "/");
-    const info = await this.mustExec("git rev-parse --show-toplevel --abbrev-ref HEAD", dir, "读取仓库信息");
-    const [root = "", branch = ""] = info.split("\n").map((s) => s.trim());
+    // 一条命令同时拿 root / branch / HEAD / 工作区前缀 / upstream。历史图与 Quick Diff
+    // 都需要这些信息；尤其是 /home → /robotdata 这种 canonical root 与打开路径不一致时，
+    // workspacePrefix 能避免 UI 路径被错误地拿 canonical root 做前缀判断。
+    const info = await this.mustExec(
+      "git rev-parse --show-toplevel --abbrev-ref HEAD; "
+      + "git rev-parse --verify HEAD 2>/dev/null || true; "
+      + "git rev-parse --show-prefix 2>/dev/null || true; "
+      + "git rev-parse --symbolic-full-name @{u} 2>/dev/null || true; "
+      + "git rev-parse @{u} 2>/dev/null || true",
+      dir,
+      "读取仓库信息",
+    );
+    const lines = info.split("\n").map((s) => s.trim());
+    const [root = "", branch = "", headCommit = "", workspacePrefix = "", upstreamRef = "", upstreamCommit = ""] = lines;
     if (!root) throw new AppError("git", "不是 Git 仓库", dir);
     const status = await this.mustExec("git status --porcelain -uall", root, "git status");
     const tree = TreeStatus.fromParsed(root, dir, branch, parsePorcelain(status));
     this.trees.set(dir, tree);
-    return tree.toSnapshot();
+    const snapshot = tree.toSnapshot();
+    return {
+      ...snapshot,
+      headCommit: headCommit || undefined,
+      workspacePrefix: workspacePrefix || undefined,
+      upstreamRef: upstreamRef || undefined,
+      upstreamCommit: upstreamCommit || undefined,
+    };
   }
 
   /**
@@ -124,20 +143,24 @@ export class GitRemote {
   /** `git branch -a`（板子 git 可能很老，不用 --format） */
   async branches(directory: string): Promise<BranchInfo[]> {
     const root = normalizeRemotePath(directory, "/");
-    const stdout = await this.mustExec("git branch -a", root, "读取分支列表");
+    // 用 for-each-ref 而不是 git branch -a：需要每个分支的 commit hash（revision）与 upstream。
+    // CodeOSS 的历史图用 ref.revision 去定位提交与配色，缺了它整张图会退化（只剩一条线）。
+    const format = "%(refname)%00%(objectname)%00%(HEAD)%00%(upstream:short)";
+    const stdout = await this.mustExec(
+      `git for-each-ref --format=${shellQuote(format)} refs/heads refs/remotes`,
+      root,
+      "读取分支列表",
+    );
     const out: BranchInfo[] = [];
     for (const raw of stdout.split("\n")) {
       if (!raw.trim()) continue;
-      const current = raw.startsWith("*");
-      let name = raw.slice(1).trim();
-      let detached = false;
-      const m = /^\(HEAD detached (?:at|from) .+\)$/.exec(name);
-      if (m) {
-        detached = true;
-        name = name.slice(1, -1);   // "(HEAD detached at abc)" → "HEAD detached at abc"
-      }
-      const remote = name.startsWith("remotes/") ? (name = name.slice("remotes/".length), true) : false;
-      out.push({ name, current, remote, upstream: "", detached });
+      const [refname = "", revision = "", head = "", upstream = ""] = raw.split("\0");
+      if (!refname) continue;
+      // refs/remotes/origin/HEAD 是符号引用，跳过（否则图里会多一个 origin/HEAD 别名）
+      if (refname.endsWith("/HEAD")) continue;
+      const remote = refname.startsWith("refs/remotes/");
+      const name = refname.replace(/^refs\/heads\//, "").replace(/^refs\/remotes\//, "");
+      out.push({ name, current: head.trim() === "*", remote, upstream, detached: false, revision });
     }
     return out;
   }
@@ -151,12 +174,42 @@ export class GitRemote {
     return (r.stdout + r.stderr).trim();
   }
 
+  /** 检出某个提交（游离 HEAD）——历史图上"检出此提交" */
+  async checkoutRev(directory: string, rev: string): Promise<string> {
+    const root = normalizeRemotePath(directory, "/");
+    const r = await this.conn.exec(`git checkout ${shellQuote(rev)}`, { cwd: root });
+    if (r.code !== 0) throw new AppError("git", "检出提交失败", r.stderr.trim());
+    return (r.stdout + r.stderr).trim();
+  }
+
+  /** 撤销某条提交（生成一条反向提交，不改历史） */
+  async revert(directory: string, rev: string): Promise<string> {
+    const root = normalizeRemotePath(directory, "/");
+    await this.mustExec(`git revert --no-edit ${shellQuote(rev)}`, root, "撤销提交");
+    return "";
+  }
+
+  /** 硬重置到某条提交（会丢改动，调用方必须先确认） */
+  async resetHard(directory: string, rev: string): Promise<string> {
+    const root = normalizeRemotePath(directory, "/");
+    await this.mustExec(`git reset --hard ${shellQuote(rev)}`, root, "重置到提交");
+    return "";
+  }
+
   /** 一条 git log → CommitInfo[] → 泳道布局（§5.4.7） */
-  async logGraph(directory: string, limit = 200): Promise<GraphRow[]> {
+  async logGraph(directory: string, limit = 200, refs: readonly string[] = [], skip = 0): Promise<GraphRow[]> {
     const root = normalizeRemotePath(directory, "/");
     const format = "%H%x00%P%x00%an%x00%ad%x00%s%x00%D";
+    const uniqueRefs = [...new Set(refs.filter((ref) => typeof ref === "string" && ref.length > 0))];
+    const revisions = uniqueRefs.length > 0
+      ? uniqueRefs.map(shellQuote).join(" ")
+      : "--all";
+    const skipArgs = skip > 0 ? ` --skip=${Math.floor(skip)}` : "";
     const stdout = await this.mustExec(
-      `git log --all --date-order --max-count=${Math.floor(limit)} --pretty=format:${shellQuote(format)}`,
+      // --topo-order（而不是 --date-order）：CodeOSS 的图渲染器按数组顺序 + parentIds 重建泳道，
+      // 要求严格拓扑序（子提交一定排在父提交之前）。date-order 在有多分支/合并时会打乱顺序，
+      // 渲染器对不上就塌成一条线。内置 git 扩展也用的是 topo-order。
+      `git log --topo-order --decorate=full --max-count=${Math.floor(limit)}${skipArgs} --pretty=format:${shellQuote(format)} ${revisions}`,
       root,
       "读取提交历史",
     );
@@ -175,6 +228,33 @@ export class GitRemote {
       });
     }
     return layout(commits);
+  }
+
+  /**
+   * 某个提交改了哪些文件（历史图里点开一条提交时用）。
+   * `--root` 让仓库的第一个提交也能列出全部文件；rename 会带出旧路径，交给上层裁成新路径。
+   */
+  async commitChanges(directory: string, rev: string, parentId?: string): Promise<Array<{ status: string; path: string }>> {
+    const root = normalizeRemotePath(directory, "/");
+    // 合并提交有多个父提交，git diff-tree 默认不会输出；历史图已经给了首父，直接做两树比较。
+    const command = parentId
+      ? `git diff --name-status -r ${shellQuote(parentId)} ${shellQuote(rev)}`
+      : `git diff-tree --no-commit-id --name-status -r --root ${shellQuote(rev)}`;
+    const out = await this.mustExec(
+      command,
+      root,
+      "读取提交变更",
+    );
+    const files: Array<{ status: string; path: string }> = [];
+    for (const line of out.split("\n")) {
+      if (!line.trim()) continue;
+      const parts = line.split("\t");
+      const status = (parts[0] || "").trim();
+      // R100\told\tnew / C100\told\tnew：取新路径
+      const file = (parts.length > 2 ? parts[parts.length - 1] : parts[1] || "").trim();
+      if (file) files.push({ status: status.charAt(0) || "M", path: file });
+    }
+    return files;
   }
 
   // ---- M5：暂存区 / 逐文件操作（每次一条命令，路径一律 shellQuote）----

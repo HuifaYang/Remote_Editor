@@ -19,6 +19,7 @@ const ENV_AUTOCONNECT_SUPPRESSED = "rce.envAutoConnect.suppressed";
 
 let channel;
 let lspItem;
+let attachFolders = () => {};   // activate 内赋值；自动重连成功后用它重新挂载 SCM/镜像预热
 let sessions;
 let scm;
 let lsp;
@@ -35,13 +36,24 @@ function log(msg) {
   if (channel) channel.appendLine(line);
 }
 
-/** 语言服务设置（§5.5）：默认在工作机跑；cppPath/pythonPath 留空就用内置 clangd / PATH 里的 */
+/** 原生 Remote Indicator 只认识 URI，不认识 SSH 是否真的连上；这里把真实会话状态同步给工作台。 */
+function setRemoteConnectionState(state, detail = "") {
+  void vscode.commands.executeCommand("setContext", "rce.remoteConnectionState", state);
+  void vscode.commands.executeCommand("setContext", "rce.remoteConnectionMessage", detail);
+}
+
+/** 通用语言服务设置：默认按需在远端启动；任意标准 LSP 都通过 servers 表注册。 */
 function lspConfig() {
   const cfg = vscode.workspace.getConfiguration("rce");
   const pick = (key) => cfg.get(`lsp.${key}`);
   return {
     enabled: pick("enabled") !== false,
-    transport: pick("transport") || "local",
+    transport: pick("transport") || "mount",
+    mode: pick("mode") || "browse",
+    autoPromoteOnEdit: pick("autoPromoteOnEdit") !== false,
+    warmRetentionMs: Number(pick("warmRetentionMinutes") ?? 5) * 60_000,
+    servers: pick("servers") && typeof pick("servers") === "object" ? pick("servers") : {},
+    sshfsPath: pick("sshfsPath") || "",
     // 开发/自检：RCE_SPIKE_LSP_CPP 直接指到一个语言服务可执行文件（端到端里用的是假 clangd）
     cppPath: process.env.RCE_SPIKE_LSP_CPP || pick("cppPath") || "",
     pythonPath: process.env.RCE_SPIKE_LSP_PYTHON || pick("pythonPath") || "",
@@ -81,6 +93,72 @@ function connectionFromAuthority(authority) {
     host: value.slice(at + 1, colon),
     port: Number(value.slice(colon + 1)) || 22,
   };
+}
+
+/** 会话意外断开后的自动重连：凭据从 ~/.ssh/config 的 identityFile 恢复（密码类无法恢复，提示手动）。
+ *  指数退避重试；成功后重建语言服务通道并重新 attach SCM，让编辑器无缝继续工作。 */
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const reconnectingAuthorities = new Set();
+async function autoReconnect(authority) {
+  if (reconnectingAuthorities.has(authority)) return;
+  reconnectingAuthorities.add(authority);
+  try {
+  const folder = (vscode.workspace.workspaceFolders || []).find((f) => f.uri.authority === authority);
+  if (!folder) return;                 // 远端工作区已不在窗口里，无需重连
+  const connection = connectionFromAuthority(authority);
+  if (!connection) return;
+  log(`检测到 ${authority} 连接中断，尝试自动重连…`);
+  setRemoteConnectionState("reconnecting", `正在重连 ${authority}`);
+  lspItem && (lspItem.text = "语言智能：连接中断，重连中…", lspItem.show());
+  let lastErr;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const configured = (await readSshHosts(vscode)).find((host) =>
+        host.hostName === connection.host
+        || host.label === connection.host
+        || host.label === `${connection.username}@${connection.host}`
+      );
+      let identityFile = configured?.identityFile || "";
+      if (identityFile.startsWith("~")) {
+        identityFile = require("node:path").join(require("node:os").homedir(), identityFile.slice(1));
+      }
+      const session = await sessions.ensure({
+        host: connection.host,
+        port: connection.port,
+        username: configured?.username || connection.username,
+        privateKeyPath: identityFile || undefined,
+        timeoutMs: 12000,
+        keepaliveMs: 15000,
+        strictHostKey: false,
+      });
+      log(`已自动重连 ${session.authority}`);
+      // 重建依赖旧会话句柄的服务：LSP 通道里的 MirrorManager 持有死 conn，必须整体换新
+      try {
+        scm?.detachAll();
+        lsp.dispose();
+        lsp = createLanguageServices(vscode, lspDeps);
+      } catch (err) {
+        log(`重连后重建语言服务失败：${err && err.message}`);
+      }
+      attachFolders();
+      setRemoteConnectionState("connected", `已连接 ${session.authority}`);
+      lspItem && (lspItem.text = "语言智能：待机", lspItem.show());
+      vscode.window.showInformationMessage(`已自动重连 ${session.authority}`);
+      return;
+    } catch (err) {
+      lastErr = err;
+      const delay = Math.min(30000, 2000 * 2 ** attempt);
+      log(`自动重连第 ${attempt + 1} 次失败（${err && err.message}），${delay / 1000}s 后重试`);
+      await sleepMs(delay);
+    }
+  }
+  setRemoteConnectionState("failed", `自动重连 ${authority} 失败：${lastErr && lastErr.message}`);
+  lspItem && (lspItem.text = "本机语言服务：连接已断开", lspItem.tooltip = `自动重连失败：${lastErr && lastErr.message}\n点击手动重连`, lspItem.show());
+  vscode.window.showErrorMessage(`自动重连 ${authority} 失败：${lastErr && lastErr.message}`, "手动重连")
+    .then((choice) => choice === "手动重连" && vscode.commands.executeCommand("rce.connect"));
+  } finally {
+    reconnectingAuthorities.delete(authority);
+  }
 }
 
 async function ensureSessionWithPrompt(initial) {
@@ -468,7 +546,24 @@ async function runE2E() {
     await scm.refreshAll();
     const entry = [...scm.entries.values()][0];
     if (!entry) throw new Error("SCM 没挂上（不是 git 仓库？）");
-    return `${entry.staged.resourceStates.length} 暂存 / ${entry.changes.resourceStates.length} 更改`;
+    if (!entry.historyProvider) throw new Error("SCM 历史图 provider 没挂上（proposed API 被拦？）");
+    const refs = await entry.historyProvider.provideHistoryItemRefs(undefined, undefined);
+    if (!refs.some((ref) => ref.id === "refs/heads/main")) throw new Error("历史图没有 main 分支 ref");
+    if (refs.some((ref) => !ref.icon)) throw new Error("历史图 ref 缺少 ThemeIcon，CodeOSS 会跳过 badge 渲染");
+    const history = await entry.historyProvider.provideHistoryItems({ limit: 20, historyItemRefs: ["refs/heads/main"] }, undefined);
+    if (history.length < 5) throw new Error(`历史图提交太少：${history.length}`);
+    const allHistory = await entry.historyProvider.provideHistoryItems({
+      limit: 100,
+      historyItemRefs: refs.map((ref) => ref.revision).filter(Boolean),
+    }, undefined);
+    const missingRefs = refs.filter((ref) => !allHistory.some((item) =>
+      item.id === ref.revision && (item.references || []).some((candidate) => candidate.id === ref.id)));
+    if (missingRefs.length > 0) throw new Error(`历史图分支 badge 没挂上：${missingRefs.map((ref) => ref.name).join(", ")}`);
+    const first = history.find((item) => item.parentIds.length > 0) || history[0];
+    const changes = await entry.historyProvider.provideHistoryItemChanges(first.id, first.parentIds[0], undefined);
+    if (changes.length === 0) throw new Error("历史提交没有文件变更");
+    return `${entry.staged.resourceStates.length} 暂存 / ${entry.changes.resourceStates.length} 更改；`
+      + `${refs.length} refs / ${history.length} 提交 / ${changes.length} 个变更文件 / badge 全部命中`;
   });
 
   await record("搜索视图命令（Ctrl+Shift+F 走我们的 provider）", async () => {
@@ -481,47 +576,48 @@ async function runE2E() {
     return "已切到源代码管理";
   });
 
-  await record("语言服务：镜像同步 + compile_commands 重写（§13 坑 2）", async () => {
-    const service = await lsp.syncMirror(folder.uri);
-    const fsMod = require("node:fs");
-    const pathMod = require("node:path");
-    const cc = pathMod.join(service.mirrorRoot, "compile_commands.json");
-    let detail = "（镜像里没有 compile_commands.json，走的是 compile_flags.txt 兜底）";
-    if (fsMod.existsSync(cc)) {
-      const text = fsMod.readFileSync(cc, "utf8");
-      const entries = JSON.parse(text);
-      const first = Array.isArray(entries) ? entries[0] : undefined;
-      if (!first) throw new Error("compile_commands.json 是空数组");
-      if (!String(first.directory).startsWith(service.mirrorRoot)) {
-        throw new Error(`远端绝对路径没重写成镜像前缀：${first.directory}`);
-      }
-      if (text.includes('"/ws/') || text.includes('"/ws"')) throw new Error("还残留远端绝对路径");
-      detail = `entries=${entries.length}，directory=${first.directory}`;
+  await record("语言服务：远程模式零镜像 + 通用 LSP 注册表", async () => {
+    const before = lsp.stats();
+    if (before.mode !== "browse" || before.projects.some((project) => project.live)) {
+      throw new Error(`浏览模式不是冷启动：${JSON.stringify(before)}`);
     }
-    return `${service.mirror.manifest().size} 个文件；${detail}`;
+    await vscode.commands.executeCommand("rce.lsp.intelligentMode");
+    const service = await lsp.syncMirror(folder.uri);
+    if (!service) throw new Error("没有建立远端语言服务通道");
+    const after = lsp.stats();
+    if (after.transport !== "mount") throw new Error(`默认 transport 不是 mount：${after.transport}`);
+    if (!after.servers.some((server) => server.id === "cpp") || !after.servers.some((server) => server.id === "python")) {
+      throw new Error("默认通用 LSP 注册表缺少 cpp/python");
+    }
+    return `浏览模式冷启动；${after.servers.length} 个服务器定义；项目根=${service.remoteRoot}，语言服务本机运行，只读 SSHFS 不复制源码/sysroot`;
   });
 
-  await record("语言服务：跳转/悬浮/符号/补全（镜像 + 假 clangd）", async () => {
+  await record("语言服务：跳转/悬浮/符号/补全（本机 LSP + 只读 SSHFS）", async () => {
     const uri = vscode.Uri.joinPath(folder.uri, "src/main.c");
     const doc = await vscode.workspace.openTextDocument(uri);
     await vscode.window.showTextDocument(doc, { preview: false });
-    const service = lsp.serviceOfDocument(doc);
+    const match = lsp.matchForDocument(doc);
+    if (!match) throw new Error(`main.c 没匹配到语言服务器（languageId=${doc.languageId}）`);
+    const service = lsp.serviceOfDocument(doc) || await lsp.syncMirror(folder.uri);
     if (!service) throw new Error("没有语言服务通道（会话/工作区没匹配上）");
     const pos = new vscode.Position(1, 4);
 
     // 先直连语言服务：把「LSP 往返」和「VSCode provider 解析」两件事分开验，坏了才定位得出来
     let direct = [];
+    let directSymbols = [];
     for (let i = 0; i < 60; i++) {
       try {
-        const ctx = await service.contextFor(doc);
-        direct = ctx ? await ctx.client.definition(ctx.mirrorPath, 1, 4) : [];
+        const ctx = await service.contextFor(doc, match);
+        direct = ctx ? await ctx.client.definition(ctx.servicePath, 1, 4) : [];
+        directSymbols = ctx ? await ctx.client.documentSymbol(ctx.servicePath) : [];
       } catch (err) {
         log(`直连语言服务失败：${err && err.message}`);
       }
-      if (direct.length > 0) break;
+      if (direct.length > 0 && directSymbols.length > 0) break;
       await sleep(500);
     }
-    if (direct.length === 0) throw new Error("30s 内直连语言服务也拿不到定义（镜像/进程/JSON-RPC 有问题）");
+    if (direct.length === 0) throw new Error("30s 内直连语言服务也拿不到定义（远端进程/JSON-RPC 有问题）");
+    if (directSymbols.length === 0) throw new Error("30s 内直连语言服务拿不到文档符号");
 
     // 每步都加超时：卡住时必须能说出「卡在哪一条 executeCommand」，不能等窗口被杀才报 Canceled
     const within = (p, ms, label) => Promise.race([
@@ -549,10 +645,15 @@ async function runE2E() {
       15000, "vscode.executeHoverProvider",
     )) || [];
     log(`E2E：悬浮 ${hovers.length} 条`);
-    const symbols = (await within(
-      Promise.resolve(vscode.commands.executeCommand("vscode.executeDocumentSymbolProvider", uri)),
-      15000, "vscode.executeDocumentSymbolProvider",
-    )) || [];
+    let symbols = [];
+    for (let i = 0; i < 20 && symbols.length === 0; i++) {
+      symbols = (await within(
+        Promise.resolve(vscode.commands.executeCommand("vscode.executeDocumentSymbolProvider", uri)),
+        15000, "vscode.executeDocumentSymbolProvider",
+      )) || [];
+      if (symbols.length === 0) await sleep(250);
+    }
+    if (symbols.length === 0) throw new Error("文档符号 provider 返回空");
     log(`E2E：符号 ${symbols.length} 个`);
     const completions = await within(
       Promise.resolve(vscode.commands.executeCommand("vscode.executeCompletionItemProvider", uri, pos)),
@@ -676,7 +777,25 @@ async function runE2E() {
 async function activate(context) {
   extensionContext = context;
   channel = vscode.window.createOutputChannel("织码 WeaveCode");
-  sessions = new SessionManager(log);
+  // SSH 意外断开（网络抖动 / 板子重启 / 休眠唤醒）时自动重连：
+  // 远端工作区还挂在窗口里，不重连的话所有文件请求都会报「没有会话」且永远卡住。
+  sessions = new SessionManager(log, {
+    onConnecting: (authority) => setRemoteConnectionState("connecting", `正在连接 ${authority}`),
+    onConnected: (authority) => {
+      setRemoteConnectionState("connected", `已连接 ${authority}`);
+      updateStatus();
+    },
+    onConnectionFailed: (authority, err) => {
+      const state = reconnectingAuthorities.has(authority) ? "reconnecting" : "failed";
+      setRemoteConnectionState(state, `${authority}：${err && err.message ? err.message : String(err)}`);
+      updateStatus();
+    },
+    onUnexpectedClose: (authority) => {
+      setRemoteConnectionState("reconnecting", `连接中断，正在重连 ${authority}`);
+      updateStatus();
+      void autoReconnect(authority);
+    },
+  });
   remoteExplorer = createRemoteExplorer(vscode, {
     context,
     getSessions: () => sessions,
@@ -726,6 +845,13 @@ async function activate(context) {
   //    否则移除远端工作区会重建扩展宿主，下一轮 activate 又看到 RCE_SPIKE_* 并偷偷连回去。
   const envSpec = context.globalState.get(ENV_AUTOCONNECT_SUPPRESSED, false) ? null : specFromEnv();
   const initialRemoteFolder = (vscode.workspace.workspaceFolders || []).find((item) => item.uri.scheme === SCHEME);
+  if (initialRemoteFolder) {
+    if (sessions.get(initialRemoteFolder.uri.authority)) {
+      setRemoteConnectionState("connected", `已连接 ${initialRemoteFolder.uri.authority}`);
+    } else {
+      setRemoteConnectionState("connecting", `正在恢复 ${initialRemoteFolder.uri.authority}`);
+    }
+  }
   let envSession;
   if (initialRemoteFolder && !sessions.get(initialRemoteFolder.uri.authority)) {
     // 新窗口拿到的是 sshfs://user@host:port/path，没有旧窗口内存里的密码。
@@ -743,14 +869,28 @@ async function activate(context) {
         || host.label === `${authority.username}@${authority.host}`
       );
       if (authority) {
-        const session = await ensureSessionWithPrompt({
-          host: authority.host,
-          username: configured?.username || authority.username,
-          port: configured?.port || authority.port,
-          identityFile: configured?.identityFile,
-          preferredAuthentications: configured?.preferredAuthentications,
-        });
-        if (session) session.spec.workspace = initialRemoteFolder.uri.path;
+        // ~/.ssh/config 里 IdentityFile 常带 ~ 前缀，直接传给 ssh2 会读不到文件 → 认证失败。
+        // 必须展开成绝对路径（这是窗口重载后「悄悄连不上」的头号原因）。
+        let identityFile = configured?.identityFile || "";
+        if (identityFile.startsWith("~")) {
+          identityFile = require("node:path").join(require("node:os").homedir(), identityFile.slice(1));
+        }
+        try {
+          const session = await ensureSessionWithPrompt({
+            host: authority.host,
+            username: configured?.username || authority.username,
+            port: configured?.port || authority.port,
+            identityFile,
+            preferredAuthentications: configured?.preferredAuthentications,
+          });
+          if (session) session.spec.workspace = initialRemoteFolder.uri.path;
+        } catch (err) {
+          // 以前这里静默吞掉：窗口重载后远端工作区还在、会话没了、也不提示，用户只看到「一直加载」。
+          log(`恢复远程连接失败 ${initialRemoteFolder.uri.authority}：${err && err.message}`);
+          setRemoteConnectionState("failed", `恢复 ${initialRemoteFolder.uri.authority} 失败：${err && err.message}`);
+          vscode.window.showErrorMessage(`恢复远程连接 ${initialRemoteFolder.uri.authority} 失败：${err && err.message}`, "重新连接")
+            .then((choice) => choice === "重新连接" && vscode.commands.executeCommand("rce.connect"));
+        }
       }
     }
   } else if (envSpec) {
@@ -796,19 +936,25 @@ async function activate(context) {
   scm = createScmService(vscode, { log, sessionOf });
   context.subscriptions.push(
     { dispose: () => scm.dispose() },
-    vscode.workspace.registerTextDocumentContentProvider(GIT_SCHEME, {
-      provideTextDocumentContent: (uri) => scm.provideOriginalContent(uri),
+    // 用**只读 FileSystemProvider** 而不是 TextDocumentContentProvider：Quick Diff 的
+    // gutter / 概览标尺 / minimap 标记要靠它把「原始版本」当普通文件解析并同步给 diff worker。
+    // 内置 git 扩展同样是给 git: 注册 FileSystemProvider（我们此前只注册文本内容提供器，
+    // 结果资源管理器有着色、编辑器里却一个改动标记都没有）。
+    vscode.workspace.registerFileSystemProvider(GIT_SCHEME, scm.createOriginalFileSystemProvider(), {
+      isReadonly: true,
+      isCaseSensitive: true,
     }),
   );
 
-  // 6) 语言服务：本地镜像 + 工作机上的 clangd/pylsp（路线文档 §2.9；嵌入式场景价值最高的一块）
+  // 6) 语言服务：标准 LSP 直连远端，浏览/代码智能双模式。远端无需部署常驻服务。
   lspItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 99);
-  lspItem.command = "rce.lsp.syncMirror";
+  // 点击状态栏是「看进度 + 选操作」的入口，不是直接全量重同步（用户下意识一点就白拉一遍）
+  lspItem.command = "rce.lsp.menu";
   context.subscriptions.push(
     lspItem,
     { dispose: () => lsp.dispose() },
   );
-  // 镜像 / 语言服务的工作目录：globalStorage（每个窗口一份，卸载扩展时一起清）
+  // 本地缓存目录只放挂载点、编译视图和 local 兼容缓存；mount 模式不会复制源码或 sysroot。
   const storageDir = context.globalStorageUri
     ? context.globalStorageUri.fsPath
     : require("node:path").join(require("node:os").tmpdir(), "rce-extension-host");
@@ -824,44 +970,55 @@ async function activate(context) {
       if (result.removed.length) log(`影子缓存清理完成：${result.removed.length} 个项目，${result.freedBytes} 字节`);
     })
     .catch((err) => log(`影子缓存清理失败：${err && err.message}`));
-  lspItem.text = "本机语言服务：待机";
+  lspItem.text = lspConfig().mode === "intelligent" ? "语言智能：准备中…" : "浏览模式";
   lspDeps = {
     log,
     session: (uri) => sessionOf(uri),
     config: lspConfig,
     cache: shadowCache,
     storageDir,
+    onLspState: (state) => {
+      lspItem.text = state.message;
+      lspItem.tooltip = state.detail || "";
+      lspItem.command = "rce.lsp.menu";
+      lspItem.show();
+    },
     onMirrorProgress: (service, progress) => {
-      lspItem.text = `本机语言服务：${progress.current || "同步中…"}`;
+      lspItem.text = `语言服务（兼容镜像）：${progress.current || "同步中…"}`;
       lspItem.tooltip = `${service.title}\n${progress.current || "同步中…"}（${progress.done}/${progress.total}）`;
       lspItem.show();
     },
     onMirrorReady: (service, result) => {
-      lspItem.text = `本机语言服务：镜像就绪（${result.fileCount} 文件）`;
+      lspItem.text = `语言服务（兼容镜像）：就绪（${result.fileCount} 文件）`;
       lspItem.tooltip = `${service.title}\n镜像根：${service.mirrorRoot}\n点击重新同步`;
       lspItem.show();
     },
     onMirrorTooLarge: (service, err) => {
-      lspItem.text = `本机语言服务：未同步（${err.mirrorFileCount} 文件）`;
+      lspItem.text = `语言服务（兼容镜像）：未同步（${err.mirrorFileCount} 文件）`;
       lspItem.tooltip = `${service.title}\n工作区文件数 ${err.mirrorFileCount}，超过自动镜像上限 ${err.mirrorMaxFiles}。\n建议打开具体项目子目录；点击本状态栏可强制同步。`;
       lspItem.show();
       if (!lspTooLargeWarned.has(service.title)) {
         lspTooLargeWarned.add(service.title);
         vscode.window.showWarningMessage(
-          `已暂停自动镜像：${service.title} 包含 ${err.mirrorFileCount} 个文件，超过上限 ${err.mirrorMaxFiles}。请打开具体项目目录，或点击状态栏“本机语言服务”强制同步。`,
+          `已暂停自动镜像：${service.title} 包含 ${err.mirrorFileCount} 个文件，超过上限 ${err.mirrorMaxFiles}。请打开具体项目目录，或点击状态栏“语言服务”强制同步。`,
         );
       }
     },
     onMirrorError: (service, err) => {
-      lspItem.text = "本机语言服务：同步失败";
+      lspItem.text = "语言服务（兼容镜像）：同步失败";
       lspItem.tooltip = `${service.title}\n${err && err.message ? err.message : String(err)}\n点击重试`;
+      lspItem.show();
+    },
+    onMountReady: (service, prepared) => {
+      lspItem.text = `语言智能：已连接远端文件视图（${prepared.entryCount ? `${prepared.entryCount} 条编译命令` : "flags 兜底"}）`;
+      lspItem.tooltip = `${service.title}\n只读 SSHFS：${service.mountRoot}\n目标：${prepared.targetTriplet}\n点击查看操作`;
       lspItem.show();
     },
   };
   lsp = createLanguageServices(vscode, lspDeps);
   lspItem.show();
 
-  const attachFolders = () => {
+  attachFolders = () => {
     for (const folder of vscode.workspace.workspaceFolders || []) {
       if (folder.uri.scheme !== SCHEME) continue;
       const session = sessionOf(folder.uri);
@@ -874,8 +1031,8 @@ async function activate(context) {
         });
       }
       scm.attach(folder.uri).catch((err) => log(`SCM 挂载失败：${err && err.message}`));
-      // 镜像预热（惰性语言服务真正启动是在第一次需要补全/跳转/诊断时）
-      if (!lsp.attach(folder.uri)) log(`语言服务：${folder.uri.authority} 还没有会话，暂不预热镜像`);
+      // 只登记工作区；浏览模式保持零语言服务进程，切到代码智能后才按文件启动。
+      if (!lsp.attach(folder.uri)) log(`语言服务：${folder.uri.authority} 还没有会话`);
     }
   };
   context.subscriptions.push(vscode.workspace.onDidChangeWorkspaceFolders(() => {
@@ -885,6 +1042,27 @@ async function activate(context) {
 
   // 命令
   const register = (id, fn) => context.subscriptions.push(vscode.commands.registerCommand(id, fn));
+  const setLanguageMode = async (mode) => {
+    await vscode.workspace.getConfiguration("rce").update("lsp.mode", mode, vscode.ConfigurationTarget.Global);
+    lsp.setMode(mode);
+    const detail = mode === "intelligent"
+      ? "当前文件优先启动，语言服务在远端按需运行"
+      : "语言服务进入热保留，超时后自动停止";
+    vscode.window.setStatusBarMessage(`织码：${mode === "intelligent" ? "代码智能" : "浏览模式"} · ${detail}`, 3000);
+  };
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration((event) => {
+    if (!event.affectsConfiguration("rce.lsp")) return;
+    const runtimeKeys = [
+      "enabled", "transport", "servers", "cppPath", "pythonPath", "maxFiles",
+      "autoPromoteOnEdit", "warmRetentionMinutes",
+    ];
+    if (runtimeKeys.some((key) => event.affectsConfiguration(`rce.lsp.${key}`))) {
+      void lsp.reload().catch((err) => log(`重载语言服务配置失败：${err && err.message}`));
+      return;
+    }
+    // 只改模式时保留现有编辑器模型和语言进程，走平滑切换而不是重建扩展。
+    if (event.affectsConfiguration("rce.lsp.mode")) lsp.setMode(lspConfig().mode);
+  }));
   register("rce.connect", async () => {
     try {
       await pickAndConnect();
@@ -899,6 +1077,7 @@ async function activate(context) {
     await context.globalState.update(ENV_AUTOCONNECT_SUPPRESSED, true);
     // context key 先落下：远程指示器菜单应立即从「断开」切回「连接」。
     vscode.commands.executeCommand("setContext", "rce.connected", false);
+    setRemoteConnectionState("disconnected", "已断开所有远程连接");
     const closing = sessions.closeAll();
     updateStatus();
     // CodeOSS 的远程指示器是按工作区 scheme/authority 画的；不移除 sshfs 文件夹，
@@ -916,7 +1095,7 @@ async function activate(context) {
     } catch (err) {
       log(`重建语言服务失败（会话已断开）：${err && err.message}`);
     }
-    lspItem.text = "本机语言服务：未连接";
+    lspItem.text = "语言服务：未连接";
     if (cacheConfig().cleanupOnDisconnect) {
       void shadowCache?.cleanup().catch((err) => log(`断开时清理影子缓存失败：${err && err.message}`));
     }
@@ -934,21 +1113,54 @@ async function activate(context) {
     }
   });
   register("rce.showLog", () => channel.show());
+  register("rce.lsp.browseMode", () => setLanguageMode("browse"));
+  register("rce.lsp.intelligentMode", () => setLanguageMode("intelligent"));
+  register("rce.lsp.toggleMode", () => setLanguageMode(lsp.currentMode() === "intelligent" ? "browse" : "intelligent"));
+  register("rce.lsp.configure", () => vscode.commands.executeCommand("workbench.action.openSettings", "rce.lsp"));
+  register("rce.lsp.menu", async () => {
+    const folder = vscode.workspace.workspaceFolders?.find((f) => f.uri.scheme === SCHEME);
+    const session = folder ? sessionOf(folder.uri) : undefined;
+    const intelligent = lsp.currentMode() === "intelligent";
+    const transport = lspConfig().transport;
+    const items = [
+      intelligent
+        ? { label: "$(eye) 切换到浏览模式", detail: "停止新请求；现有语言服务先热保留，超时后退出", run: () => setLanguageMode("browse") }
+        : { label: "$(symbol-method) 切换到代码智能", detail: "当前文件优先启动，保留光标、撤销历史和标签", run: () => setLanguageMode("intelligent") },
+      { label: "$(settings-gear) 配置语言服务器…", detail: "任意标准 LSP；C++/Python 已内置默认项", run: () => vscode.commands.executeCommand("rce.lsp.configure") },
+      { label: "$(output) 查看语言服务日志", run: () => channel.show() },
+      ...(session ? [] : [{ label: "$(plug) 重新连接远程主机…", run: () => vscode.commands.executeCommand("rce.connect") }]),
+      transport === "local"
+        ? { label: "$(refresh) 重新同步兼容镜像（全量）", detail: "仅 local 兼容模式；remote 模式不需要", run: () => vscode.commands.executeCommand("rce.lsp.syncMirror") }
+        : { label: "$(refresh) 重建语言服务文件视图", detail: "重新挂载远端并启动当前文件的语言服务", run: () => vscode.commands.executeCommand("rce.lsp.syncMirror") },
+      { label: "$(sync) 重启语言服务", detail: "改了 compile_commands / 换了编译器时用", run: () => vscode.commands.executeCommand("rce.lsp.restart") },
+    ];
+    const picked = await vscode.window.showQuickPick(items.map((i) => ({ label: i.label, detail: i.detail })), {
+      title: "织码语言服务",
+      placeHolder: lspItem.tooltip || "",
+    });
+    if (!picked) return;
+    const item = items.find((i) => i.label === picked.label);
+    if (item) void item.run();
+  });
   register("rce.lsp.syncMirror", async () => {
     const folder = vscode.workspace.workspaceFolders?.find((f) => f.uri.scheme === SCHEME);
     if (!folder) {
       vscode.window.showWarningMessage("当前窗口没有已连接的远端目录");
       return;
     }
-    lspItem.text = "本机语言服务：镜像同步中…";
+    lspItem.text = lspConfig().transport === "local" ? "语言服务：同步兼容镜像…" : "语言智能：重建文件视图…";
     lspItem.show();
     try {
       const service = await lsp.syncMirror(folder.uri);
-      const info = service.mirror.manifest().size;
-      vscode.window.showInformationMessage(`远端镜像已同步：${info} 个文件`);
+      if (lspConfig().transport === "local") {
+        const info = service?.mirror?.manifest?.().size ?? 0;
+        vscode.window.showInformationMessage(`兼容镜像已同步：${info} 个文件`);
+      } else {
+        vscode.window.showInformationMessage("语言服务文件视图已重建，当前文件优先启动");
+      }
     } catch (err) {
-      lspItem.text = "本机语言服务：镜像同步失败";
-      vscode.window.showErrorMessage(`镜像同步失败：${err && err.message}`);
+      lspItem.text = "语言智能：启动失败";
+      vscode.window.showErrorMessage(`语言服务操作失败：${err && err.message}`);
     }
   });
   register("rce.cache.cleanup", async () => {
@@ -968,7 +1180,7 @@ async function activate(context) {
     }
     try {
       await lsp.restart(folder.uri);
-      vscode.window.showInformationMessage("语言服务已重启（下一次补全/跳转会按需拉起）");
+      vscode.window.showInformationMessage("语言服务已重启");
     } catch (err) {
       vscode.window.showErrorMessage(`重启语言服务失败：${err && err.message}`);
     }
@@ -983,9 +1195,13 @@ async function activate(context) {
   });
   register("rce.scm.refresh", () => scm.refreshAll());
   register("rce.scm.stage", (arg) => scm.runOnResources(arg, (entry, paths) => entry.git.stage(entry.root, paths))
-    .catch((err) => vscode.window.showErrorMessage(`暂存失败：${err && err.message}`)));
+    .catch((err) => scmReport("暂存失败", err)));
   register("rce.scm.unstage", (arg) => scm.runOnResources(arg, (entry, paths) => entry.git.unstage(entry.root, paths))
-    .catch((err) => vscode.window.showErrorMessage(`取消暂存失败：${err && err.message}`)));
+    .catch((err) => scmReport("取消暂存失败", err)));
+  register("rce.scm.stageAll", (arg) => scm.runOnResources(arg, (entry) => entry.git.stageAll(entry.root))
+    .catch((err) => scmReport("暂存全部失败", err)));
+  register("rce.scm.unstageAll", (arg) => scm.runOnResources(arg, (entry) => entry.git.unstageAll(entry.root))
+    .catch((err) => scmReport("取消暂存全部失败", err)));
   register("rce.scm.discard", async (arg) => {
     const paths = scm.resolvePaths(arg);
     if (paths.length === 0) return;
@@ -1005,24 +1221,217 @@ async function activate(context) {
       const added = rels.filter((r) => untracked.has(r));
       if (tracked.length) await entry.git.discard(entry.root, tracked);
       if (added.length) await entry.git.clean(entry.root, added);
-    }).catch((err) => vscode.window.showErrorMessage(`放弃更改失败：${err && err.message}`));
+    }).catch((err) => scmReport("放弃更改失败", err));
   });
-  register("rce.scm.commit", async (arg) => {
-    // acceptInputCommand 会把输入框内容作为第一个参数传进来；手动调用时取第一个 SourceControl 的输入框
-    let message = typeof arg === "string" ? arg : undefined;
-    const first = scm.entries.values().next().value;
-    if (!first) return;
-    if (!message) message = first.sc.inputBox.value;
+  /** SCM 操作失败：弹窗 + 写输出通道（带上 git 的 stderr，否则只剩一句“提交失败”没法排查） */
+  function scmReport(label, err) {
+    const detail = err && err.detail ? `\n${err.detail}` : "";
+    const text = `${label}：${(err && err.message) || err}${detail}`;
+    log(text);
+    vscode.window.showErrorMessage(text);
+  }
+
+  // 菜单命令会按“菜单上下文 + 被点中的节点”依次传参：历史图右键实际收到
+  // [SourceControl, SourceControlHistoryItem]，不能再假设首个参数就是目标。
+  const flattenCommandArgs = (args) => (Array.isArray(args) ? args.flat(3) : [args]).filter(Boolean);
+
+  // 命令参数可能是输入框字符串（acceptInputCommand）、SourceControl（标题栏/大按钮）、
+  // SourceControlResourceGroup（组级菜单）或上述参数的组合。统一找出目标仓库。
+  const scmTargetOf = (...args) => {
+    const all = [...scm.entries.values()];
+    for (const arg of flattenCommandArgs(args)) {
+      if (arg && arg.rootUri) {
+        const found = scm.entryOf(arg.rootUri);
+        if (found) return found;
+      }
+      const direct = all.find((entry) => entry.sc === arg || entry.staged === arg || entry.changes === arg);
+      if (direct) return direct;
+    }
+    return all[0];
+  };
+
+  register("rce.scm.commit", async (...args) => {
+    // acceptInputCommand 传进来的是输入框字符串；scm/title 的 ✓ 按钮传进来的是 SourceControl（带 rootUri）。
+    let message = flattenCommandArgs(args).find((arg) => typeof arg === "string");
+    const target = scmTargetOf(...args);
+    if (!target) return;
+    if (!message) message = target.sc.inputBox.value;
     if (!message || !message.trim()) {
       vscode.window.showWarningMessage("提交信息不能为空");
       return;
     }
+    if (target.staged.resourceStates.length === 0 && target.changes.resourceStates.length === 0) {
+      vscode.window.showInformationMessage("没有可提交的更改");
+      return;
+    }
     try {
-      await first.git.commitStaged(first.root, message);
-      first.sc.inputBox.value = "";
+      // 和 VS Code 一致：暂存区是空的、但工作区有改动时，先全部暂存再提交
+      if (target.staged.resourceStates.length === 0 && target.changes.resourceStates.length > 0) {
+        await target.git.commitAll(target.root, message);
+      } else {
+        await target.git.commitStaged(target.root, message);
+      }
+      target.sc.inputBox.value = "";
       await scm.refreshAll();
     } catch (err) {
-      vscode.window.showErrorMessage(`提交失败：${err && err.message}`);
+      scmReport("提交失败", err);
+    }
+  });
+
+  // 图表里右键某条提交时，工作台通常传入 [SourceControl, SourceControlHistoryItem]。
+  // 从末尾找真正的提交节点，避免把同样有 id 的 SourceControl 误当提交。
+  const historyCommitOf = (...args) => {
+    const flat = flattenCommandArgs(args);
+    for (let i = flat.length - 1; i >= 0; i--) {
+      const item = flat[i];
+      if (item && typeof item.id === "string"
+        && (Array.isArray(item.parentIds) || typeof item.subject === "string" || typeof item.message === "string")) {
+        return item;
+      }
+    }
+    return undefined;
+  };
+
+  register("rce.scm.copyCommitId", async (...args) => {
+    const item = historyCommitOf(...args);
+    if (!item) return;
+    await vscode.env.clipboard.writeText(item.id);
+    vscode.window.showInformationMessage(`已复制提交 ${item.displayId || item.id.slice(0, 7)}`);
+  });
+
+  register("rce.scm.checkoutCommit", async (...args) => {
+    const item = historyCommitOf(...args);
+    const target = scmTargetOf(...args);
+    if (!item || !target || !target.root) return;
+    const short = item.displayId || item.id.slice(0, 7);
+    const pick = await vscode.window.showWarningMessage(
+      `检出到提交 ${short}？会进入游离 HEAD 状态。`, { modal: true }, "检出",
+    );
+    if (pick !== "检出") return;
+    try {
+      await target.git.checkoutRev(target.root, item.id);
+      await scm.refreshAll();
+      vscode.window.showInformationMessage(`已检出 ${short}`);
+    } catch (err) {
+      scmReport("检出提交失败", err);
+    }
+  });
+
+  register("rce.scm.revertCommit", async (...args) => {
+    const item = historyCommitOf(...args);
+    const target = scmTargetOf(...args);
+    if (!item || !target || !target.root) return;
+    const short = item.displayId || item.id.slice(0, 7);
+    const pick = await vscode.window.showWarningMessage(
+      `撤销提交 ${short}？会生成一条新的反向提交。`, { modal: true }, "撤销",
+    );
+    if (pick !== "撤销") return;
+    try {
+      await target.git.revert(target.root, item.id);
+      await scm.refreshAll();
+      vscode.window.showInformationMessage(`已撤销 ${short}`);
+    } catch (err) {
+      scmReport("撤销提交失败", err);
+    }
+  });
+
+  register("rce.scm.resetCommit", async (...args) => {
+    const item = historyCommitOf(...args);
+    const target = scmTargetOf(...args);
+    if (!item || !target || !target.root) return;
+    const short = item.displayId || item.id.slice(0, 7);
+    const pick = await vscode.window.showWarningMessage(
+      `硬重置到 ${short}？这会丢弃该提交之后的所有提交和当前改动，无法恢复。`,
+      { modal: true }, "硬重置",
+    );
+    if (pick !== "硬重置") return;
+    try {
+      await target.git.resetHard(target.root, item.id);
+      await scm.refreshAll();
+      vscode.window.showInformationMessage(`已重置到 ${short}`);
+    } catch (err) {
+      scmReport("重置失败", err);
+    }
+  });
+
+  register("rce.scm.checkout", async (...args) => {
+    const target = scmTargetOf(...args);
+    if (!target || !target.root) return;
+    let branches;
+    try {
+      branches = await target.git.branches(target.root);
+    } catch (err) {
+      scmReport("读取分支失败", err);
+      return;
+    }
+    if (!branches.length) {
+      vscode.window.showInformationMessage("没有可切换的分支");
+      return;
+    }
+    const current = branches.find((b) => b.current);
+    const pick = await vscode.window.showQuickPick(
+      branches.map((b) => ({
+        label: `${b.current ? "$(check)" : "$(git-branch)"} ${b.name}`,
+        description: b.remote ? "远端分支" : (b.upstream ? `→ ${b.upstream}` : ""),
+        detail: b.detached ? "游离 HEAD" : undefined,
+        branch: b,
+      })),
+      { title: "切换分支", placeHolder: current ? `当前在 ${current.name}` : "选择要切换到的分支" },
+    );
+    if (!pick) return;
+    const name = pick.branch.name;
+    if (pick.branch.remote) {
+      vscode.window.showInformationMessage("远端分支不能直接切换，请先在远端建本地分支");
+      return;
+    }
+    if (current && name === current.name) return;
+    try {
+      await target.git.switchBranch(target.root, name);
+      await scm.refreshAll();
+      vscode.window.showInformationMessage(`已切换到 ${name}`);
+    } catch (err) {
+      scmReport("切换分支失败", err);
+    }
+  });
+
+  register("rce.scm.commitAmend", async (...args) => {
+    const target = scmTargetOf(...args);
+    if (!target) return;
+    const message = (target.sc.inputBox.value || "").trim();
+    try {
+      // 输入框为空时走 `git commit --amend --no-edit`，沿用上一条提交信息
+      await target.git.commitStaged(target.root, message, { amend: true });
+      target.sc.inputBox.value = "";
+      await scm.refreshAll();
+    } catch (err) {
+      scmReport("提交（修改）失败", err);
+    }
+  });
+
+  register("rce.scm.commitAndPush", async (...args) => {
+    const target = scmTargetOf(...args);
+    if (!target) return;
+    const message = (target.sc.inputBox.value || "").trim();
+    if (!message) {
+      vscode.window.showWarningMessage("提交信息不能为空");
+      return;
+    }
+    if (target.staged.resourceStates.length === 0 && target.changes.resourceStates.length === 0) {
+      vscode.window.showInformationMessage("没有可提交的更改");
+      return;
+    }
+    try {
+      if (target.staged.resourceStates.length === 0 && target.changes.resourceStates.length > 0) {
+        await target.git.commitAll(target.root, message);
+      } else {
+        await target.git.commitStaged(target.root, message);
+      }
+      target.sc.inputBox.value = "";
+      await target.git.push(target.root);
+      await scm.refreshAll();
+      vscode.window.showInformationMessage("已提交并推送");
+    } catch (err) {
+      scmReport("提交和推送失败", err);
     }
   });
 
@@ -1052,6 +1461,14 @@ async function activate(context) {
       const uri = vscode.Uri.from({ scheme: SCHEME, authority: envSession.authority, path: envSpec.workspace });
       vscode.workspace.updateWorkspaceFolders(0, 0, { uri, name: `${envSession.authority}${envSpec.workspace}` });
     }
+  }
+  // 兜底挂载：窗口重载后远端工作区文件夹在扩展激活**之前**就恢复了，
+  // onDidChangeWorkspaceFolders 不会再触发——SCM attach / 镜像预热必须在这里主动做一遍。
+  // 这是「git 面板永远空」的根因：以前只有环境变量连接路径会走到 attachFolders。
+  // attachFolders 内部对每个 folder 幂等（entries.has 去重），重复调用无副作用。
+  const anyRemoteFolder = (vscode.workspace.workspaceFolders || []).some((f) => f.uri.scheme === SCHEME);
+  if (anyRemoteFolder && [...sessions.byAuthority.values()].length > 0) {
+    attachFolders();
   }
   updateStatus();
 }

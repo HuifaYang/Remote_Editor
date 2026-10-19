@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=@@NAME_LONG@@ - URL Handler
+Comment=Open WeaveCode URLs
+GenericName=Integrated Development Environment
+Exec=@@EXEC@@ --open-url %U
+Icon=@@ICON@@
+Type=Application
+NoDisplay=true
+StartupNotify=true
+Categories=Utility;Development;IDE;TextEditor;
+MimeType=x-scheme-handler/@@URLPROTOCOL@@;
+Keywords=weavecode;remote;ssh;embedded;ide;

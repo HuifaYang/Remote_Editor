@@ -1,0 +1,14 @@
+Package: @@NAME@@
+Version: @@VERSION@@
+Section: devel
+Depends: sshfs, @@DEPENDS@@
+Recommends: @@RECOMMENDS@@
+Priority: optional
+Architecture: @@ARCHITECTURE@@
+Maintainer: Huifa Yang <huifayang@users.noreply.github.com>
+Homepage: https://github.com/HuifaYang/Remote_Editor
+Installed-Size: @@INSTALLEDSIZE@@
+Description: WeaveCode remote IDE
+ WeaveCode is a CodeOSS-based IDE for embedded ARM development.
+ It keeps targets lightweight by replacing the remote server workflow
+ with an SSH/SFTP connection and on-demand standard language servers.

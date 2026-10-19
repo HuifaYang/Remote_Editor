@@ -40,6 +40,10 @@ export interface GitFileStatus {
 export interface GitTreeStatus {
   root: string;                  // 仓库根（远端绝对路径）
   branch: string;
+  headCommit?: string;           // HEAD 指向的 commit hash（历史图 HEAD 泳道定位用）
+  workspacePrefix?: string;      // 当前工作目录相对仓库根的路径（符号链接 / 子目录工作区用）
+  upstreamRef?: string;          // 当前分支 upstream 的完整 ref（refs/remotes/... 或 refs/heads/...）
+  upstreamCommit?: string;       // upstream 指向的 commit hash（历史图远端泳道定位用）
   scope: string;                 // 扫描范围（= 工作目录）
   files: Record<string, GitFileStatus>;   // key = 远端绝对路径
   dirs: Record<string, "added" | "modified" | "deleted">; // 目录继承色（key=远端绝对路径）
@@ -55,7 +59,7 @@ export interface GitDiff {
   isDeletedFile: boolean;
 }
 
-export interface BranchInfo { name: string; current: boolean; remote: boolean; upstream: string; detached: boolean }
+export interface BranchInfo { name: string; current: boolean; remote: boolean; upstream: string; detached: boolean; revision?: string }
 
 export interface CommitInfo { hash: string; parents: string[]; author: string; date: string; subject: string; refs: string[] }
 
@@ -140,8 +144,8 @@ export interface LspFoldingRange {
   collapsedText?: string;
 }
 
-/** 语言服务位置（U9）：默认本机；板子上是唯一远端例外；disabled=完全关闭 */
-export type LspTransportMode = "local" | "remote" | "disabled";
+/** 语言服务位置：mount=本机 LSP 读取只读 SSHFS（默认）；remote=目标机已有 LSP；local=旧镜像兼容 */
+export type LspTransportMode = "mount" | "remote" | "local" | "disabled";
 
 export type AppErrorCode =
   | "auth" | "auth-passphrase-required" | "timeout" | "network"

@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+APP=@@NAME@@
+
+# 只做本机安装项注册，不修改用户的 apt 源。
+ln -sfn "/usr/share/${APP}/bin/${APP}" "/usr/bin/${APP}"
+
+if command -v update-alternatives >/dev/null 2>&1; then
+	update-alternatives --install /usr/bin/editor editor "/usr/bin/${APP}" 0 >/dev/null || true
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+	update-desktop-database >/dev/null 2>&1 || true
+fi
+
+if command -v update-mime-database >/dev/null 2>&1; then
+	update-mime-database /usr/share/mime >/dev/null 2>&1 || true
+fi
+
+exit 0

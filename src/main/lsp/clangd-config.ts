@@ -19,6 +19,7 @@ export interface CompileCommandEntry {
 
 export interface CompileRewriteContext {
   remotePrefix: string;      // 远端工作目录（= compile_commands 里的绝对路径前缀）
+  remoteAliases?: string[];  // 同一工作目录的软链接/真实路径（CMake 常输出 readlink -f 后的路径）
   localPrefix: string;       // 本地镜像根（工作机的绝对路径）
   sysrootRoots: string[];    // 本次收集的远端头文件目录（工作目录外）
   localSysrootPrefix: string; // = <镜像>/_sysroot
@@ -42,14 +43,63 @@ export interface CompileCollection {
 /** find 收集命令（§5.3.6：一条 exec，禁止递归 SFTP 列目录） */
 export function buildCompileCommandsFindCommand(workspace: string): string {
   const ws = workspace.replace(/\/+$/, "") || "/";
-  const build = `${ws}/build`;
-  return [
-    `if [ -d ${shellQuote(build)} ]; then`,
-    `  find ${shellQuote(build)} -type f -name compile_commands.json;`,
-    "else",
-    `  find ${shellQuote(ws)} -maxdepth 4 -type f -name compile_commands.json;`,
-    "fi",
-  ].join("\n");
+  // ROS2/colcon 等「源码与构建分离」布局把 compile_commands.json 放在源码树的兄弟构建目录
+  // （~/ros2_ws/src/<pkg> → ~/ros2_ws/build/<pkg>）。只搜项目内会永远找不到，clangd 失去编译数据库。
+  // 候选集保持有界：项目 build / 项目内 maxdepth 4 / 上层 build/<包名> / 上层 build maxdepth 2。
+  const lines = [
+    "{",
+    `  if [ -d ${shellQuote(`${ws}/build`)} ]; then`,
+    `    find ${shellQuote(`${ws}/build`)} -type f -name compile_commands.json;`,
+    "  else",
+    `    find ${shellQuote(ws)} -maxdepth 4 -type f -name compile_commands.json;`,
+    "  fi;",
+  ];
+  // colcon 布局：项目是 <base>/src/<pkg>，构建产物在 <base>/build/<pkg>（祖父目录的兄弟）。
+  // 只有路径足够深时才追加外层搜索，避免 /ws 这类短路径拼出 //build。
+  const parts = ws.split("/").filter(Boolean);
+  if (parts.length >= 2) {
+    const pkgName = parts[parts.length - 1];
+    const base = "/" + parts.slice(0, -2).join("/");
+    const outerBuild = `${base}/build`;
+    const outerPkg = `${outerBuild}/${pkgName}`;
+    lines.push(
+      `  if [ -d ${shellQuote(outerPkg)} ]; then`,
+      `    find ${shellQuote(outerPkg)} -type f -name compile_commands.json;`,
+      `  elif [ -d ${shellQuote(outerBuild)} ]; then`,
+      `    find ${shellQuote(outerBuild)} -maxdepth 2 -type f -name compile_commands.json;`,
+      "  fi;",
+    );
+  }
+  lines.push("} 2>/dev/null");
+  return lines.join("\n");
+}
+
+/** 没有 compile_commands.json 时的 CMake 兜底：找同一构建目录里的 flags.make。
+ *  colcon 默认 CMAKE_EXPORT_COMPILE_COMMANDS=OFF，但每个 target 的 flags.make 一定包含
+ *  实际使用的 include / define / 标准参数。 */
+export function buildCmakeFlagsFindCommand(workspace: string): string {
+  const ws = workspace.replace(/\/+$/, "") || "/";
+  const lines = [
+    "{",
+    `  if [ -d ${shellQuote(`${ws}/build`)} ]; then`,
+    `    find ${shellQuote(`${ws}/build`)} -type f -path '*/CMakeFiles/*.dir/flags.make';`,
+    "  else",
+    `    find ${shellQuote(ws)} -maxdepth 5 -type f -path '*/CMakeFiles/*.dir/flags.make';`,
+    "  fi;",
+  ];
+  const parts = ws.split("/").filter(Boolean);
+  if (parts.length >= 2) {
+    const pkgName = parts[parts.length - 1];
+    const base = "/" + parts.slice(0, -2).join("/");
+    const outerPkg = `${base}/build/${pkgName}`;
+    lines.push(
+      `  if [ -d ${shellQuote(outerPkg)} ]; then`,
+      `    find ${shellQuote(outerPkg)} -type f -path '*/CMakeFiles/*.dir/flags.make';`,
+      "  fi;",
+    );
+  }
+  lines.push("} 2>/dev/null");
+  return lines.join("\n");
 }
 
 /** 头文件目录存在性探测（一条 exec）：只保留远端真实存在的目录 */
@@ -59,9 +109,23 @@ export function buildDirExistsCommand(dirs: string[]): string {
 }
 
 /** 退化兜底（§5.3.6 / A9.3）：找不到 compile_commands.json 时给 clangd 的 compile_flags.txt */
-export function buildCompileFlagsTxt(localPrefix: string): string {
+export function buildCompileFlagsTxt(localPrefix: string, sysrootDirs?: string[], extraFlags: string[] = []): string {
   const p = localPrefix.replace(/[\\/]+$/, "");
-  return ["-std=c++17", `-I${path.join(p, "include")}`, `-I${p}`, ""].join("\n");
+  const lines: string[] = [];
+  const add = (flag: string) => { if (!lines.includes(flag)) lines.push(flag); };
+  if (!extraFlags.some((flag) => flag.startsWith("-std="))) add("-std=c++17");
+  add(`-I${path.join(p, "include")}`);
+  add(`-I${p}`);
+  // 没有 compile_commands 时 clangd 读的是 compile_flags.txt：必须把镜像里的系统头目录也写成
+  // -isystem，否则交叉编译下找不到目标架构的 C++ 标准库（std::* 全红）。
+  for (const dir of sysrootDirs ?? []) {
+    const rel = dir.replace(/^\/+/, "");
+    if (!rel) continue;
+    add(`-isystem${path.join(p, "_sysroot", ...rel.split("/"))}`);
+  }
+  // CMake flags.make 里已有的 -I/-isystem/-D/-std 等参数已经重写成镜像路径，最后并入兜底文件。
+  for (const flag of extraFlags) if (flag) add(flag);
+  return lines.join("\n") + "\n";
 }
 
 /** 命令行切词：保留引号原样（只做识别与替换，重置时不重新解释） */
@@ -99,12 +163,18 @@ function unquote(token: string): string {
   return token;
 }
 
-/** 远端路径前缀替换（A9.1：只替换开头，不匹配的原样保留） */
-export function rewriteRemotePrefix(value: string, remotePrefix: string, localPrefix: string): string {
-  const remote = remotePrefix.replace(/\/+$/, "");
-  if (remote && (value === remote || value.startsWith(remote + "/"))) {
-    const rest = value.slice(remote.length).replace(/^\/+/, "");
-    return rest ? path.join(localPrefix, ...rest.split("/")) : localPrefix;
+function distinctPrefixes(remotePrefix: string, aliases: string[] = []): string[] {
+  return [...new Set([remotePrefix, ...aliases].map((p) => p.replace(/\/+$/, "")).filter(Boolean))]
+    .sort((a, b) => b.length - a.length);
+}
+
+/** 远端路径前缀替换（A9.1：只替换开头，不匹配的原样保留）。软链接别名优先匹配最长前缀。 */
+export function rewriteRemotePrefix(value: string, remotePrefix: string, localPrefix: string, aliases: string[] = []): string {
+  for (const remote of distinctPrefixes(remotePrefix, aliases)) {
+    if (value === remote || value.startsWith(remote + "/")) {
+      const rest = value.slice(remote.length).replace(/^\/+/, "");
+      return rest ? path.join(localPrefix, ...rest.split("/")) : localPrefix;
+    }
   }
   return value;
 }
@@ -118,8 +188,8 @@ function isUnder(p: string, root: string): boolean {
 /** 三分规则（A9.4）：镜像源码 / _sysroot / 丢弃 */
 export function classifyIncludePath(includePath: string, ctx: CompileRewriteContext): { value: string | null; kind: "workspace" | "sysroot" | "relative" | "drop" } {
   if (!includePath.startsWith("/")) return { value: includePath, kind: "relative" };   // 相对路径相对 directory，directory 已重写
-  if (isUnder(includePath, ctx.remotePrefix)) {
-    return { value: rewriteRemotePrefix(includePath, ctx.remotePrefix, ctx.localPrefix), kind: "workspace" };
+  if (distinctPrefixes(ctx.remotePrefix, ctx.remoteAliases).some((prefix) => isUnder(includePath, prefix))) {
+    return { value: rewriteRemotePrefix(includePath, ctx.remotePrefix, ctx.localPrefix, ctx.remoteAliases), kind: "workspace" };
   }
   for (const root of ctx.sysrootRoots) {
     if (isUnder(includePath, root)) {
@@ -163,7 +233,7 @@ function rewriteTokens(tokens: string[], ctx: CompileRewriteContext, dropped: st
       out.push(flag + shellQuote(cls.value));
       continue;
     }
-    out.push(bare.startsWith("/") ? shellQuote(rewriteRemotePrefix(bare, ctx.remotePrefix, ctx.localPrefix)) : token);
+    out.push(bare.startsWith("/") ? shellQuote(rewriteRemotePrefix(bare, ctx.remotePrefix, ctx.localPrefix, ctx.remoteAliases)) : token);
   }
   return out;
 }
@@ -174,7 +244,7 @@ export function rewriteCompileCommand(entry: CompileCommandEntry, ctx: CompileRe
   const next: CompileCommandEntry = { ...entry };
   for (const key of ["directory", "file", "output"] as const) {
     const value = next[key];
-    if (typeof value === "string") next[key] = rewriteRemotePrefix(value, ctx.remotePrefix, ctx.localPrefix);
+    if (typeof value === "string") next[key] = rewriteRemotePrefix(value, ctx.remotePrefix, ctx.localPrefix, ctx.remoteAliases);
   }
   if (Array.isArray(next.arguments)) {
     next.arguments = rewriteTokens(next.arguments, ctx, dropped);
@@ -206,6 +276,11 @@ export function mergeCompileCommands(
 /** 从 command / arguments 里抽出 -I/-isystem/-iquote 目录（用于 sysroot 收集） */
 export function collectIncludeDirs(entry: CompileCommandEntry): string[] {
   const tokens = Array.isArray(entry.arguments) ? entry.arguments : typeof entry.command === "string" ? splitCommandLine(entry.command) : [];
+  return collectIncludeDirsFromFlags(tokens);
+}
+
+/** 从一串编译参数里抽出绝对 include 目录（flags.make 兜底同样复用）。 */
+export function collectIncludeDirsFromFlags(tokens: string[]): string[] {
   const dirs: string[] = [];
   for (let i = 0; i < tokens.length; i++) {
     const bare = unquote(tokens[i]);
@@ -219,6 +294,84 @@ export function collectIncludeDirs(entry: CompileCommandEntry): string[] {
     if (joined) dirs.push(bare.slice(joined.length));
   }
   return dirs.filter((d) => d.startsWith("/"));
+}
+
+export interface CmakeFlags {
+  includes: string[];
+  defines: string[];
+  flags: string[];
+  args: string[];
+}
+
+/** flags.make 是 Makefile 片段：把 `-isystem /x` 统一成 `-isystem/x`，便于逐行写入 compile_flags。 */
+function joinIncludeFlagPairs(tokens: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const bare = unquote(tokens[i]);
+    const exact = INCLUDE_FLAGS.find((flag) => bare === flag);
+    if (exact && tokens[i + 1] !== undefined) {
+      out.push(exact + unquote(tokens[i + 1]));
+      i++;
+    } else {
+      out.push(bare);
+    }
+  }
+  return out;
+}
+
+function unescapeMakeToken(token: string): string {
+  return token.replace(/\\(["'\\])/g, "$1");
+}
+
+/** 解析 CMake 生成的 flags.make。只取 CXX_*；值里的反斜杠续行先合并。 */
+export function parseCmakeFlags(text: string): CmakeFlags {
+  const logical = text.replace(/\\\r?\n/g, " ");
+  const includes: string[] = [];
+  const defines: string[] = [];
+  const flags: string[] = [];
+  for (const line of logical.split(/\r?\n/)) {
+    const match = /^\s*(CXX_INCLUDES|CXX_DEFINES|CXX_FLAGS)\s*=\s*(.*)$/.exec(line);
+    if (!match) continue;
+    const tokens = splitCommandLine(match[2]).map(unquote).map(unescapeMakeToken);
+    if (match[1] === "CXX_INCLUDES") includes.push(...joinIncludeFlagPairs(tokens));
+    else if (match[1] === "CXX_DEFINES") defines.push(...tokens);
+    else flags.push(...tokens);
+  }
+  return {
+    includes,
+    defines: [...new Set(defines)],
+    flags: [...new Set(flags)],
+    args: [...includes, ...new Set([...defines, ...flags])],
+  };
+}
+
+/** 把 flags.make 参数重写到本地镜像；未知的绝对头目录映射到 _sysroot。 */
+export function rewriteCompileFlags(tokens: string[], ctx: CompileRewriteContext): { flags: string[]; dropped: string[] } {
+  const flags: string[] = [];
+  const dropped: string[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    const bare = unquote(token);
+    const exact = INCLUDE_FLAGS.find((f) => bare === f);
+    if (exact) {
+      const next = tokens[i + 1];
+      if (next === undefined) { flags.push(token); continue; }
+      const cls = classifyIncludePath(unquote(next), ctx);
+      if (cls.value === null) dropped.push(unquote(next));
+      else flags.push(exact + cls.value);
+      i++;
+      continue;
+    }
+    const joined = INCLUDE_FLAGS.find((f) => bare.startsWith(f) && bare.length > f.length);
+    if (joined) {
+      const cls = classifyIncludePath(bare.slice(joined.length), ctx);
+      if (cls.value === null) dropped.push(bare.slice(joined.length));
+      else flags.push(joined + cls.value);
+      continue;
+    }
+    flags.push(bare);
+  }
+  return { flags, dropped };
 }
 
 async function readRemoteText(conn: SSHConnection, p: string, maxBytes = 16 * 1024 * 1024): Promise<string> {
@@ -258,7 +411,14 @@ function parseCompileCommands(text: string, file: string, warnings: string[]): C
 export function collectFromParsedData(
   workspace: string,
   data: { findOutput: string; fileTexts: Record<string, string>; probeOutput: string },
-  opts: { mirrorRoot: string; triplet: string; gccIncludeDir?: string },
+  opts: {
+    mirrorRoot: string;
+    triplet: string;
+    gccIncludeDir?: string;
+    systemIncludeDirs?: string[];
+    remoteAliases?: string[];
+    fallbackFlags?: string[];
+  },
 ): CompileCollection {
   const ws = workspace.replace(/\/+$/, "") || "/";
   const warnings: string[] = [];
@@ -272,7 +432,10 @@ export function collectFromParsedData(
   // sysroot 收集集合 = compile_commands 里的绝对 -I 目录 + 默认系统头目录，且远端真实存在
   const candidates = new Set<string>();
   for (const f of parsed) for (const e of f.entries) for (const d of collectIncludeDirs(e)) {
-    if (!isUnder(d, ws)) candidates.add(d);
+    if (!distinctPrefixes(ws, opts.remoteAliases).some((prefix) => isUnder(d, prefix))) candidates.add(d);
+  }
+  for (const d of collectIncludeDirsFromFlags(opts.fallbackFlags ?? [])) {
+    if (!distinctPrefixes(ws, opts.remoteAliases).some((prefix) => isUnder(d, prefix))) candidates.add(d);
   }
   candidates.add("/usr/include");
   candidates.add(`/usr/include/${opts.triplet}`);
@@ -283,15 +446,25 @@ export function collectFromParsedData(
     const alive = new Set(data.probeOutput.split("\n").map((l) => l.trim()).filter(Boolean));
     sysrootRoots = candidateList.filter((d) => alive.has(d));
   }
+  // 目标架构的 C++ 标准库 / 系统头目录（来自 __CAP__ 段，远端已存在性校验）：
+  // 这些不走 probe 过滤（probe 依赖 compile_commands，没有编译数据库时是空的）。
+  // 少了它们，交叉编译下 std/uint8_t/chrono 全部报未定义。
+  for (const d of opts.systemIncludeDirs ?? []) {
+    if (d.startsWith("/") && !sysrootRoots.includes(d)) sysrootRoots.push(d);
+  }
+  sysrootRoots = [...new Set(sysrootRoots)].sort();
 
   const ctx: CompileRewriteContext = {
     remotePrefix: ws,
+    remoteAliases: opts.remoteAliases,
     localPrefix: opts.mirrorRoot,
     sysrootRoots,
     localSysrootPrefix: path.join(opts.mirrorRoot, "_sysroot"),
   };
   const merged = mergeCompileCommands(parsed, ctx);
   const droppedIncludes = [...new Set(merged.dropped)];
+  const fallback = rewriteCompileFlags(opts.fallbackFlags ?? [], ctx);
+  droppedIncludes.push(...fallback.dropped.filter((d) => !droppedIncludes.includes(d)));
   for (const d of droppedIncludes) log("warn", `已丢弃本机不可映射的 -I: ${d}`);
   for (const w of warnings) log("warn", w);
 
@@ -307,7 +480,7 @@ export function collectFromParsedData(
     };
   }
   fs.rmSync(compileCommandsPath, { force: true });
-  fs.writeFileSync(compileFlagsPath, buildCompileFlagsTxt(opts.mirrorRoot), "utf8");
+  fs.writeFileSync(compileFlagsPath, buildCompileFlagsTxt(opts.mirrorRoot, sysrootRoots, fallback.flags), "utf8");
   return {
     kind: "compile_flags", outputPath: compileFlagsPath, entryCount: 0,
     sourceFiles: files, sysrootRoots, droppedIncludes, warnings,
@@ -318,10 +491,57 @@ export function collectFromParsedData(
  * 独立收集（§5.3.6）：1 条 find + 逐个小文件 SFTP + 1 条目录存在性探测。
  * 仅用于非「同一条复合命令」场景（如测试或手动收集）。
  */
+export async function collectCmakeFlagsFallback(
+  conn: SSHConnection,
+  workspace: string,
+  opts: {
+    mirrorRoot: string;
+    triplet: string;
+    gccIncludeDir?: string;
+    systemIncludeDirs?: string[];
+    remoteAliases?: string[];
+  },
+): Promise<CompileCollection> {
+  const ws = workspace.replace(/\/+$/, "") || "/";
+  const result = await conn.exec(buildCmakeFlagsFindCommand(ws));
+  const files = [...new Set(result.stdout.split("\n").map((l) => l.trim()).filter(Boolean))].sort();
+  const fallbackFlags: string[] = [];
+  for (const file of files) {
+    const parsed = parseCmakeFlags(await readRemoteText(conn, file));
+    fallbackFlags.push(...parsed.args);
+  }
+  const uniqueFlags = [...new Set(fallbackFlags)];
+  const candidates = new Set<string>();
+  for (const d of collectIncludeDirsFromFlags(uniqueFlags)) {
+    if (!distinctPrefixes(ws, opts.remoteAliases).some((prefix) => isUnder(d, prefix))) candidates.add(d);
+  }
+  candidates.add("/usr/include");
+  candidates.add(`/usr/include/${opts.triplet}`);
+  if (opts.gccIncludeDir) candidates.add(opts.gccIncludeDir);
+  let probeOutput = "";
+  const candidateList = [...candidates].sort();
+  if (candidateList.length > 0) {
+    const probe = await conn.exec(buildDirExistsCommand(candidateList));
+    if (probe.code === 0) probeOutput = probe.stdout;
+  }
+  const collected = collectFromParsedData(ws, { findOutput: "", fileTexts: {}, probeOutput }, {
+    ...opts,
+    fallbackFlags: uniqueFlags,
+  });
+  collected.sourceFiles = files;
+  return collected;
+}
+
 export async function collectCompileCommands(
   conn: SSHConnection,
   workspace: string,
-  opts: { mirrorRoot: string; triplet: string; gccIncludeDir?: string },
+  opts: {
+    mirrorRoot: string;
+    triplet: string;
+    gccIncludeDir?: string;
+    systemIncludeDirs?: string[];
+    remoteAliases?: string[];
+  },
 ): Promise<CompileCollection> {
   const ws = workspace.replace(/\/+$/, "") || "/";
   const warnings: string[] = [];
@@ -337,8 +557,11 @@ export async function collectCompileCommands(
   for (const file of files) {
     parsed.push({ path: file, entries: parseCompileCommands(fileTexts[file] ?? "", file, warnings) });
   }
+  if (parsed.every((file) => file.entries.length === 0)) {
+    return collectCmakeFlagsFallback(conn, ws, opts);
+  }
   for (const f of parsed) for (const e of f.entries) for (const d of collectIncludeDirs(e)) {
-    if (!isUnder(d, ws)) candidates.add(d);
+    if (!distinctPrefixes(ws, opts.remoteAliases).some((prefix) => isUnder(d, prefix))) candidates.add(d);
   }
   candidates.add("/usr/include");
   candidates.add(`/usr/include/${opts.triplet}`);

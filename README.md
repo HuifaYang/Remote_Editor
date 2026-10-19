@@ -4,14 +4,15 @@
   <img src="resources/brand/weavecode-lockup-light.png" alt="织码 WeaveCode" width="520">
 </p>
 
-**织码 WeaveCode** = 把远端、源码、语言服务和 AI 补全织在一起。
+**织码 WeaveCode** = 把远端、源码、通用语言服务和 AI 补全织在一起。
 
 织码 WeaveCode 是一个面向嵌入式 ARM 板卡的远程 IDE。它不是重新画一个编辑器壳，而是以
-**CodeOSS 为界面和工作台底座**，用我们自己的 SSH/SFTP 层替换 VS Code Remote-SSH，并在本机维护
-源码影子缓存，让 clangd / pylsp / GitHub Copilot 这类本机能力可以直接工作。
+**CodeOSS 为界面和工作台底座**，用我们自己的 SSH/SFTP 层替换 VS Code Remote-SSH，并让
+开发机标准 LSP 通过只读 SSHFS 直接读取远端工作区。
 
-目标机保持轻量：远端只用原生 `sshd` / `sftp` / `git` / 用户自己的工具链。语言服务默认跑在开发机，
-指向按项目同步下来的源码影子目录；远端不常驻 VS Code Server。
+目标机保持轻量：远端只用原生 `sshd` / `sftp` / `git`，**不需要安装 clangd、pylsp、gopls 或
+任何语言服务器**。代码智能模式在开发机运行语言库，通过只读 SSHFS 按需读取远端源码、系统头
+和 ROS 环境；不复制源码/sysroot，不常驻 VS Code Server。浏览模式不启动语言服务。
 
 ## 目录结构
 
@@ -28,7 +29,7 @@
 │   │       ├── terminal.js     # 远端终端
 │   │       ├── search.js       # 远端搜索
 │   │       ├── scm.js          # 远端 Git / Source Control
-│   │       ├── lsp.js          # 本机语言服务桥 + URI/path 映射
+│   │       ├── lsp.js          # 标准 LSP 桥 + 双模式 + URI/path 映射
 │   │       ├── cache.js        # 影子缓存 LRU/TTL/容量管理
 │   │       └── tasks.js        # 远端任务
 │   └── tools/                  # 构建、启动、端到端、VSIX 安装
@@ -38,7 +39,7 @@
 ├── tests/                      # 核心单元 / 集成测试
 ├── docs/
 │   ├── ssh-vs-remotessh.md     # 与 VS Code Remote-SSH 的差异和实现边界
-│   ├── lsp-mirror-design.md    # 本机语言服务 / 影子缓存设计
+│   ├── lsp-mirror-design.md    # 远端标准 LSP / 双模式 / 兼容镜像设计
 │   └── legacy/                 # 已停止维护的 V2 自绘 UI 规格
 └── resources/                  # 图标、语言服务资源说明
 ```
@@ -84,7 +85,33 @@ cd ../..
 
 # 6. 打包并同步我们的内置扩展
 npm run build:extension
+
+# 7. 构建可安装的 Linux amd64 deb
+npm run build:deb
 ```
+
+deb 产物在 `ide/dist/weavecode_<version>_amd64.deb`，同时生成 `.sha256`、包元数据和内容清单。
+构建需要系统的 `dpkg-deb` 与 `fakeroot`；默认会自动复用本机 Electron 缓存。发布前可执行完整门禁：
+
+```bash
+npm run verify:release
+```
+
+安装：
+
+```bash
+sudo apt install ./ide/dist/weavecode_<version>_amd64.deb
+```
+
+默认 deb 使用 **Open VSX**，适合开源分发。仅限个人自用、且你接受 Microsoft Marketplace
+服务条款的本地构建，可以显式切换市场：
+
+```bash
+RCE_EXTENSION_GALLERY=microsoft npm run build:deb
+```
+
+该模式产物文件名会带 `-ms-marketplace`。不要把这个个人构建当作公开分发版本；企业/私有插件源
+可以通过 `RCE_EXTENSION_GALLERY_JSON='{"serviceUrl":"..."}'` 注入。
 
 ## 运行
 
@@ -101,27 +128,29 @@ bash ide/tools/run-app.sh user@192.168.1.50:22 /home/root/app
 
 ## 语言服务
 
-语言服务默认 `local`：
+语言服务默认 `mount`，通用标准 LSP 在开发机运行：
 
 ```text
 sshfs://user@host:port/项目/src/main.c
-        ⇅ URI/文本翻译
-本机影子目录（只同步源码、头文件、构建配置）
-        ⇅ stdio JSON-RPC
-本机 clangd / pylsp
+        ⇅ 只读 SSHFS 惰性文件视图
+开发机 clangd / 内置 pylsp / gopls / rust-analyzer / 任意标准 LSP
 ```
 
-- 只拉源码、头文件、`compile_commands.json`、`CMakeLists.txt`、`Makefile` 等语言服务输入；
-- 不拉 `node_modules`、`build/`、二进制、依赖库；
-- 首次同步是一条 SSH `exec + tar` 流，不做逐文件 SFTP；
-- 后续增量按 manifest 更新；
-- 影子缓存按项目隔离，并受 `rce.cache.maxSizeMB`、`rce.cache.maxProjectMB`、
-  `rce.cache.ttlDays` 和 LRU 管理，不会无限增长；
-- 当前语言服务支持补全、诊断、跳转、声明/类型定义/实现、引用、重命名、悬浮、符号、
-  签名帮助、代码操作、格式化和折叠。
+- 目标机不需要安装任何语言服务；只需要 sshd/sftp；
+- 开发机用只读 SSHFS 直接读取远端整棵文件系统，源码、`/usr/include`、ROS SDK 都按需访问，不复制；
+- 远端 `compile_commands.json` 和 CMake flags 会重写到 SSHFS 挂载前缀，目标架构仍由远端 GCC 探测；
+- C++/ROS 内置开发机 clangd；Python 内置 `python-lsp-server`，不依赖开发机预装；
+- 任意语言都可用 `rce.lsp.servers` 配置，例如
+  `{"go":{"command":"gopls","args":[],"extensions":[".go"],"rootMarkers":["go.mod"]}}`；
+- 浏览模式不启动 LSP；切换到代码智能时当前文件优先启动，不重启窗口，标签、光标和撤销历史保留；
+- 浏览模式下第一次编辑会自动进入代码智能，服务器就绪后自动触发补全；输入 `in` 等前缀会出现标准
+  LSP 补全框，不依赖 AI；
+- 切回浏览模式先热保留 5 分钟（可配置），期间切回无冷启动顿挫，超时后进程退出；
+- 支持补全、诊断、跳转、声明/类型定义/实现、引用、重命名、悬浮、符号、签名帮助、代码操作、
+  格式化和折叠；过期请求通过 `$/cancelRequest` 取消，连续输入只同步最新全文。
 
-如果上游没有 `clangd`，可以把对应平台的 clangd 放到 `resources/clangd/<平台>/`，或者在设置里
-指定 `rce.lsp.cppPath`。
+开发机需要安装 `sshfs`（deb 会自动作为依赖安装）。`remote` 模式仅供目标机本来就有 LSP 的场景，
+`local` 是旧镜像兼容模式，两者都不再默认使用。
 
 ## GitHub Copilot
 
@@ -151,4 +180,4 @@ bash ide/tools/run-e2e.sh
 ```
 
 `run-e2e.sh` 需要 X / xvfb 和本地监听端口，会在 CodeOSS 里打开 `sshfs://` 工作区，
-验证文件、终端、搜索、SCM、远端配置、任务和本机语言服务链路，并输出 JSON 报告与截图。
+验证文件、终端、搜索、SCM、远端配置、任务和本机 LSP + 只读 SSHFS 链路，并输出 JSON 报告与截图。

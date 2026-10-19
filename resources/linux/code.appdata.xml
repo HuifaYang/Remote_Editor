@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop">
+	<id>@@NAME@@.desktop</id>
+	<metadata_license>@@LICENSE@@</metadata_license>
+	<project_license>@@LICENSE@@</project_license>
+	<name>@@NAME_LONG@@</name>
+	<url type="homepage">https://github.com/HuifaYang/Remote_Editor</url>
+	<summary>Remote development IDE for embedded systems</summary>
+	<content_rating type="oars-1.1"/>
+	<description>
+		<p>WeaveCode is a CodeOSS-based IDE that connects to embedded Linux targets over SSH and SFTP without installing a persistent remote server.</p>
+	</description>
+</component>

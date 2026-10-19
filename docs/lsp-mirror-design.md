@@ -1,285 +1,196 @@
-# 语言服务镜像方案（RCE）
+# 通用多语言语言服务设计（本机 LSP + 只读 SSHFS）
 
-> 状态：2026-10-13 起生效。本文是 `ide/extensions/sshfs/src/lsp.js` 与
-> `src/main/mirror/manager.ts` 的设计基准；实现与本文冲突时，先改实现，再同步本文。
+> 状态：2026-10-17 起生效。本文是 `ide/extensions/sshfs/src/lsp.js`、
+> `src/main/lsp/manager.ts`、`src/main/lsp/sshfs-mount.ts`、
+> `src/main/lsp/mounted-workspace.ts` 与 `src/main/lsp/server-config.ts` 的设计基准。
 
-## 1. 为什么必须镜像
+## 1. 结论
 
-CodeOSS 的 Remote-SSH 常规形态是：
-
-```text
-编辑器 UI ──远端扩展宿主──语言服务（远端）
-```
-
-我们的硬约束是**目标机零部署、零常驻服务**，扩展宿主只能在工作机，所以不能假设板子上有
-clangd / pylsp。最终形态只能是：
+织码不要求目标机安装 clangd、pylsp、gopls 或任何语言服务器。默认主链路：
 
 ```text
-sshfs:// 文档 ──URI/文本翻译── 本机文件镜像 ──stdio JSON-RPC── 本机 clangd / pylsp
+CodeOSS 编辑器 / sshfs:// 文档
+        │
+        ▼
+只读 SSHFS：开发机看到远端整棵 `/`
+        │
+        ▼
+开发机标准 LSP（内置 clangd / 内置 pylsp / 用户配置的任意 LSP）
 ```
 
-镜像不是“同步一个远程文件夹给用户看”，它只是语言服务的**输入缓存**。因此不能拿整个
-`/home/<user>` 或整个工作区当单位；镜像单位必须是**一个源码项目**。
+SSHFS 是惰性文件视图，不是源码镜像：不预取项目、不复制 sysroot、不复制 Python 环境。
+目标机只需要 `sshd` 和 `sftp`。浏览模式不挂载、不启动 LSP。
 
-## 2. 设计目标
+旧“本机 LSP + 源码影子镜像”只保留为 `transport=local` 兼容路径；“目标机已有 LSP”只保留为
+`transport=remote` 兼容路径。两者都不是默认值。
 
-1. **自动**：用户打开源码并触发语言服务时自动准备，不要求先点“同步”。
-2. **快**：首次只传语言服务需要的文件；后续只做增量。
-3. **正确**：`compile_commands.json`、系统头、Python 环境仍然按现有算法重写/补齐。
-4. **可解释**：状态栏和输出通道能说清当前是检查、同步、就绪、跳过还是失败。
-5. **安全**：目标机不部署东西；凭据只存内存；镜像目录在用户数据目录。
-6. **可恢复**：同步失败不阻塞编辑、搜索、终端、SCM；下一次语言服务请求可重试。
+## 2. 为什么不是远端 LSP
 
-## 3. 基本单位：项目
+要求目标机预装语言服务器，会把最关键的准备工作重新推给用户，而且：
 
-语言服务服务对象从“工作区文件夹”改成“项目根”。
+- ARM 板卡上未必有合适版本的 clangd/pylsp/gopls；
+- 语言服务器与目标机内存竞争，2 GB RK3566 很容易被 clangd 索引拖垮；
+- 不同语言的服务器安装方式不统一，无法做到“任意标准 LSP”。
 
-项目根识别从当前文档的目录开始，向上找以下标记，最多走到当前工作区根：
+因此默认把语言服务放在开发机，目标机只承担 SFTP 文件读取。
 
-- C/C++：`compile_commands.json`、`compile_flags.txt`、`CMakeLists.txt`、`Makefile`、`.clangd`
-- Python：`pyproject.toml`、`setup.py`、`setup.cfg`、`requirements.txt`、`Pipfile`
-- 仓库边界：`.git`
+## 3. 只读 SSHFS 视图
 
-命中标记的最近目录就是项目根。没有任何标记时：
+开发和运行时依赖开发机的 `sshfs`；deb 包声明 `Depends: sshfs`。
 
-- 不把工作区根当项目；
-- 退回到**当前文件所在目录**作为项目根；
-- 这样 `/home/sunrise` 下的普通文件不会拖下整个 home。
+挂载参数：
 
-项目根按 `${authority}|${projectRoot}` 缓存。一个工作区可以有多个项目，每个项目有自己的
-`MirrorManager`、manifest、LSP 进程和诊断集合。
+- 远端根 `/` 挂到 `<globalStorage>/mount/<hash>/root`；
+- `ro`：语言服务不能修改远端文件；
+- `cache=yes`、`kernel_cache`、`auto_cache`：减少重复 SFTP 往返；
+- 15 秒 keepalive、断线重连；
+- 密码/私钥口令只通过 sshfs 子进程 stdin 传入，不落盘、不进参数和日志；
+- 浏览模式冷却或切换 local/remote 时执行 `fusermount3 -u`。
 
-## 4. 生命周期
+如果开发机没有 sshfs，状态栏和错误弹窗会明确提示安装，不会静默退回旧镜像。
+
+## 4. C++/ROS 编译视图
+
+远端 `compile_commands.json` 里的路径仍是目标机真实路径。开发机 clangd 需要看到相同目录树，
+因此生成一个**本地编译视图**，但不复制文件：
 
 ```text
-工作区打开
-  │
-  ├─ 不预同步（只显示“待机”）
-  │
-用户打开 .c/.cpp/.py 或触发补全/跳转/悬浮
-  │
-  ├─ 找项目根
-  ├─ 检查项目源文件数（与 tar 使用同一套过滤）
-  ├─ 单飞：同一个项目只允许一次同步
-  ├─ 全量/增量 tar 流 → 本地镜像是原子替换
-  ├─ 重写 compile_commands.json
-  ├─ 同步 sysroot 头文件（仅编译数据库涉及的目录）
-  ├─ 同步 Python 环境（仅纯 Python 文件）
-  └─ 启动 clangd / pylsp（按语言，复用进程）
+远端 /usr/include/...       → SSHFS /mnt/remote/usr/include/...
+远端 /opt/ros/...           → SSHFS /mnt/remote/opt/ros/...
+远端 /home/Le/ws/main.cpp   → SSHFS /mnt/remote/home/Le/ws/main.cpp
 ```
 
-工作区打开只把状态栏设为“待机”。不再在 `attachFolders()` 里对整个工作区启动镜像。
+处理步骤：
 
-## 5. 镜像内容与过滤
+1. 通过 SSH 执行远端 GCC/Clang 探测：`-dumpmachine` 得到目标 triple；
+2. 通过远端 `g++ -E -x c++ - -v` 收集目标 C++ 标准库与系统头搜索目录；
+3. 找到并读取远端 `compile_commands.json`；
+4. 将 `directory`、`file`、`output` 和所有绝对 include/参数重写到 SSHFS 前缀；
+5. 每条命令追加 `--target=<triplet>` 和目标系统 `-isystem`；
+6. 编译数据库写到本地缓存目录，clangd 通过 `--compile-commands-dir` 使用它；
+7. 如果没有编译数据库，读取 CMake `flags.make` 生成 `compile_flags.txt`。
 
-### 5.1 只镜像语言服务需要的文件
+clangd 使用 `--background-index=0 --pch-storage=memory`，避免向只读远端写索引或 PCH。
+当前文件语义高亮、补全、诊断、跳转仍然正常；跨文件索引由已打开文件的动态索引提供。
 
-当前过滤集合：
+## 5. URI 与路径
 
-- C/C++：`*.c`、`*.h`、`*.cc`、`*.cpp`、`*.cxx`、`*.hpp`、`*.hh`、`*.hxx`、`*.inl`、`*.inc`、
-  `*.m`、`*.mm`、`*.S`、`*.s`、`*.asm`、`*.ld`、`*.lds`
-- Python：`*.py`、`*.pyi`
-- 项目配置：`compile_commands.json`、`compile_flags.txt`、`CMakeLists.txt`、`Makefile`、`Kbuild`、
-  `Kconfig`、`pyproject.toml`、`setup.py`、`setup.cfg`、`requirements.txt`、`Pipfile`、`tox.ini`、`.clangd`
-
-不进入镜像：日志、缓存、`.git`、`node_modules`、`__pycache__`、构建产物、扩展目录、二进制、
-README 等非语言服务输入文件。
-
-### 5.2 排除规则仍然是第一道闸门
-
-`MIRROR_EXCLUDE_PATHS` / `MIRROR_EXCLUDE_NAMES` 先排除明显不该传输的内容；源码过滤是第二道。
-两个过滤必须共用，否则“计数小、tar 大”或反过来。
-
-### 5.3 编译数据库和系统头
-
-- `compile_commands.json` 仍由现有 `clangd-config` 收集、合并、重写。
-- `-I` / `-isystem` / `-iquote` 指向系统头时，才把对应目录同步到 `_sysroot`。
-- 源码目录里的头文件直接随项目镜像；不再把整个 `/usr/include` 无条件打包。
-
-### 5.4 Python
-
-- 项目 `.py` / `.pyi` 随项目同步。
-- `site-packages` 只取纯 Python 文件，排除 `.so` / `.pyd`；具体目录由远端 `sys.path` 决定。
-- Python 服务只在第一次 Python 语言请求时启动。
-
-## 6. 缓存与哈希
-
-每个项目独立缓存：
+编辑器：
 
 ```text
-<globalStorage>/mirror/<sha1(authority + projectRoot)>
-<globalStorage>/lsp/<sha1(authority + projectRoot)>
+sshfs://user@host:port/home/Le/ros2_ws/src/main.cpp
 ```
 
-缓存中保留：
-
-- `manifest.json`：远端相对路径、大小、mtime；用于增量判定和删除同步。
-- 源码镜像。
-- `_sysroot` / `_pyenv`（如果是全量同步）。
-- `compile_commands.json` / `compile_flags.txt`。
-
-切换项目或断线不删除缓存；断线只结束进程，缓存留给下次增量。
-
-## 7. 自动闸门
-
-在项目同步前执行一条轻量命令：
-
-```sh
-cd <projectRoot> && find . -type f <excludes> <source-filter> | wc -l
-```
-
-- 计数使用和 tar 完全相同的过滤。
-- 默认上限：`rce.lsp.maxFiles = 20000` 个**源文件**。
-- 未超过：自动同步。
-- 超过：先自动降级为**当前文件所在目录**，不要求用户点“同步”。
-- 只有当前文件目录本身也超过上限，才显示“未同步（N 源文件）”。
-
-源码 tar 传输有 120 秒上限，并按 4MB 粒度向状态栏报告进度，避免无限“同步中”。
-
-## 8. 进度、状态与失败
-
-状态栏状态：
+开发机 LSP：
 
 ```text
-本机语言服务：待机
-本机语言服务：检查项目…
-本机语言服务：全量同步项目…（1/5）
-本机语言服务：传输源码 12MB…
-本机语言服务：镜像就绪（N 文件）
-本机语言服务：同步失败
-本机语言服务：未同步（N 源文件）
+file:///home/.../globalStorage/.../mount/<hash>/root/home/Le/ros2_ws/src/main.cpp
 ```
 
-输出通道记录：
+映射规则：
 
-- 项目根判定结果；
-- 全量/增量；
-- tar 解包、compile_commands、sysroot、Python 环境各阶段；
-- 失败原因和耗时。
+- `sshfs://` 文档 → SSHFS 挂载路径；
+- LSP 返回 `file:` 的挂载路径 → 去掉挂载前缀恢复远端绝对路径 → 生成 `sshfs://` URI；
+- 外部系统头 `/usr/include/...` 同样映射回 `sshfs://`，用户可直接打开；
+- 非 `file:` 虚拟 URI 若由其他扩展注册 scheme，则原样交给 VSCode。
 
-同步失败不会让编辑器卡住：provider 返回空结果，用户下一次请求可以重试；状态栏点击可强制同步。
+## 6. 通用语言注册表
 
-## 9. 并发与取消
+`rce.lsp.servers` 键是服务器 ID，支持字符串命令或完整描述：
 
-- 同一个项目：`ensureMirror()` 单飞，重复请求复用同一个 Promise。
-- 不同项目：可以分别建立镜像；实际 tar 仍受 SSH 连接和 SFTP 串行队列约束。
-- 强制同步：排队，不并发写同一个 staging 目录。
-- 断开连接：停止语言服务进程，取消当前同步，清理 pending。
-- 关闭文档：只发 `didClose`，不杀 LSP 进程。
+```json
+{
+  "go": {
+    "command": "gopls",
+    "args": [],
+    "languageIds": ["go"],
+    "extensions": [".go"],
+    "rootMarkers": ["go.mod", "go.work"]
+  },
+  "rust": {
+    "command": "rust-analyzer",
+    "args": [],
+    "extensions": [".rs"],
+    "rootMarkers": ["Cargo.toml"]
+  }
+}
+```
 
-## 10. 与 VS Code 的关系
+这些命令在**开发机**执行，可直接使用开发机 PATH 或绝对路径。字段：
 
-我们不等价复制 Remote-SSH 的远端扩展宿主；我们只复制它的**用户体验**：
+| 字段 | 含义 |
+|---|---|
+| `command` | 开发机可执行文件 |
+| `args` | 参数数组，不拼裸字符串 |
+| `languageIds` | VSCode languageId；缺省使用服务器 ID |
+| `extensions` | languageId 未识别时的扩展名兜底 |
+| `rootMarkers` | 项目根标记；支持精确名和 `*.suffix` |
+| `env` | 仅此进程的环境变量 |
+| `initializationOptions` | 原样传给 LSP `initialize` |
+| `enabled` / `false` | 关闭服务器 |
 
-- 点主机直接连接；
-- 需要认证时才提示；
-- 打开工作区后由编辑器触发语言服务；
-- 不要求用户手动同步、手动启动服务；
-- 状态栏如实显示语言服务状态。
+内置：
 
-工作区标题、文件树、搜索、终端和 SCM 继续使用 CodeOSS 原生外壳。
+- `cpp`：随 IDE 打包的 x64 clangd；
+- `python`：随 IDE 打包的 `python-lsp-server`，使用开发机 `python3`，不要求系统预装 pylsp。
 
-## 11. 当前实现状态
+用户可覆盖 `cppPath` / `pythonPath` / `servers`。任意标准 LSP 都走同一协议，不写死语言。
 
-已落地：
-
-- `MirrorManager` 的 tar/清单只取语言服务源文件集合。
-- `rce.lsp.maxFiles` 按源文件计数，默认 20000。
-- `lsp.js` 改为按文档解析项目根并懒加载项目服务。
-- 工作区打开不再预同步整个目录。
-- 单文件夹 transient workspace 显示真实文件夹名，不再显示“无标题（工作区）”。
-- 超大项目自动降级为当前文件目录；源码传输有 120 秒上限和进度显示。
-
-下一步（按优先级）：
-
-1. 远端 mtime 增量同步改为项目级后台刷新；
-2. clangd/pylsp 进程按项目回收，避免多项目长期占用内存；
-3. 在设置页提供项目镜像大小、最后一次同步时间和手动清理入口。
-
-## 12. 传输通道与镜像缓存
-
-### 12.1 源码镜像走的是 SSH exec + tar，不是逐文件 SFTP，也不是 scp
-
-当前链路：
+## 7. 双模式生命周期
 
 ```text
-ssh2 Client
-  └─ execStream("cd <项目> && find <源码过滤> -print0 | tar --null -czf - -T -")
-       stdout（tar.gz 字节流）
-         └─ Node pipeline 直接写入本机 .sync.tar.gz
-              └─ 本机解包到项目镜像目录
+浏览模式（冷：无 SSHFS、无 LSP）
+  │ 手动切换 / 首次编辑自动提升
+  ▼
+代码智能：Warming
+  │ 挂载只读 SSHFS → 生成编译视图 → initialize → didOpen 最新全文
+  ▼
+Ready
+  │ 手动切回浏览
+  ▼
+浏览模式（热保留，默认 5 分钟）
+  │ 超时 / 手动停止
+  ▼
+卸载 SSHFS，停止 LSP
 ```
 
-特点：
+- 切换不重启窗口、扩展、编辑器模型；标签、光标和撤销历史保留。
+- 当前文件优先；挂载/初始化期间继续编辑，只发送最新全文。
+- 连续输入按 50ms 合并；Provider 取消时发送 `$/cancelRequest`。
+- 第一次编辑自动提升后，LSP ready 时自动触发一次建议框。
+- 挂载并发生成时 Provider 做一次重试，避免 VSCode 第一次请求拿到空结果并缓存。
 
-- 复用已经建立的 ssh2 连接，不重新认证、不额外开 SSH 会话；
-- 一条远端命令完成过滤、打包、传输；
-- 禁止逐文件 SFTP 往返；
-- `compile_commands.json` 等清单走 stderr 分段，不污染 tar 的 stdout；
-- sysroot / Python 环境也走同类 `execStream + tar`。
+## 8. 资源口径
 
-为什么不直接 scp：
+浏览模式：
 
-- scp 是另一个命令/协议进程，通常需要二次连接或额外 multiplexing；对嵌入式板卡的 sshd/环境依赖更多；
-- scp 不能像 `find + tar` 这样在远端就完成源码过滤和排除；
-- 我们已经有 ssh2 连接和 stream 抽象，直接复用 exec 通道最少状态、最少认证风险；
-- 逐文件 SFTP 才是数量级更差的方案，几百/几千文件会产生大量 round trip。
+- LSP / SSHFS 进程均为 0；
+- 额外常驻内存约 10–30 MB；
+- 空闲 CPU 约 0–1%。
 
-编辑器的普通读文件、写文件仍然走 SFTP；只有语言服务镜像走 tar stream。
+代码智能：
 
-### 12.2 镜像是缓存，不是权威数据
+- 语言服务消耗开发机内存：小型 C++ 150–500 MB，中型 ROS 项目 500 MB–1 GB；
+- RK3566 只承担 SFTP 读取，不运行 clangd；
+- C++ 默认 `-j=1`，SSHFS 视图下关闭后台索引写入；
+- 热保留期间进程空闲，不会重新挂载或重建索引。
 
-镜像保存在 CodeOSS 的扩展全局存储目录：
+## 9. 兼容模式
 
-```text
-<userData>/User/globalStorage/remote-code-editor.rce-remote/
-  mirror/<sha1(authority + projectRoot)>/
-  lsp/<sha1(authority + projectRoot)>/
-```
+- `remote`：目标机已安装语言服务器时，走 SSH exec 双向 LSP，不需要 SSHFS。
+- `local`：旧的源码镜像 + sysroot 同步，保留用于离线排障，不是默认值。
 
-开发启动器固定用户目录时，实际路径类似：
+两者与默认 mount 模式共用同一 LSP client、Provider、双模式、取消和路径映射。
 
-```text
-ide/tools/udd-app/User/globalStorage/remote-code-editor.rce-remote/mirror/<hash>/
-```
+## 10. 测试策略
 
-镜像生命周期：
+不连接真实远程主机：
 
-- 断开连接不删除，下次打开项目可以走 manifest 增量；
-- 关闭窗口不删除；
-- 应用退出不删除；
-- 只有完整同步时用 `.staging` 重建源码树，然后原子替换；
-- `_sysroot` / `_pyenv` / `compile_commands.json` 在源码全量替换时会被保留并继续复用；
-- 自动 TTL/大小清理由 `cache.js` 管理，见下文 §13；设置里可调容量和 TTL。
+1. `mounted-workspace` 单测：编译数据库/系统头/绝对参数重写；
+2. SSHFS 集成：本地假 SSH + 真 `sshfs`，验证只读挂载和按需读取；
+3. 内置 pylsp 集成：不预装 pylsp 时 initialize + completion；
+4. 通用 LSP 注册表单测：cpp/python、任意语言、languageId/扩展名匹配；
+5. 本地假 SSH + 假 LSP：远端兼容模式双向 JSON-RPC；
+6. CodeOSS E2E：浏览冷启动、只读 SSHFS、本机 LSP、定义/悬浮/符号/补全/诊断。
 
-远端仍然是权威数据源。本机镜像只是 clangd / pylsp 的输入副本。
-
-## 13. 影子缓存必须有界（2026-10-13 起）
-
-`mirror/` 和 `lsp/` 是持久缓存，断线/关窗/退出都不删除，因此必须有清理策略。当前由
-`ide/extensions/sshfs/src/cache.js` 管理：
-
-- 每个项目由 `${authority}|${projectRoot}` 哈希隔离；
-- 淘汰时源码镜像和 clangd/pylsp 索引作为一个整体删除；
-- 活跃项目、脏项目、手动固定的项目不自动删；
-- `rce.cache.ttlDays`：超过 N 天未使用允许清理；
-- `rce.cache.maxProjectMB`：单项目超过上限且不活跃时清理；
-- `rce.cache.maxSizeMB`：总容量超过上限时按 LRU 清理到 70% 低水位；
-- `rce.cache.cleanupOnDisconnect`：断开时额外执行一次清理；
-- 启动时后台清理上次异常退出留下的 `.staging` / `.sync.tar.gz`。
-
-默认值：总容量 10 GB、单项目 5 GB、TTL 30 天。清理缓存只会导致下次重新增量同步和重新建索引，
-不会影响远端源码。
-
-## 14. Copilot 与语言服务的关系
-
-语言服务和 Copilot 是两条独立链路：
-
-- 语言服务负责诊断、跳转、引用、重命名、签名、代码操作、格式化等确定性的语言能力；
-- Copilot 负责 AI 补全，输入来自当前编辑器文本和 VS Code 文件系统；
-- Copilot 模型不跑在目标板，也不由本产品代理；
-- 本仓库不打包 GitHub Copilot 的专有 VSIX，只保留 CodeOSS 的扩展/虚拟工作区能力；
-- 用户可用 `ide/tools/install-vsix.sh` 安装自己的官方 Copilot VSIX。
-
-如果 Copilot 扩展在 `sshfs://` 虚拟工作区中无法正常工作，再评估“本地影子工作区”模式；
-那会涉及搜索、SCM、终端 cwd 和保存回写语义的整体切换，不能只改 LSP。
+真机只由用户运行并反馈日志/截图；开发过程禁止主动连接远程主机。

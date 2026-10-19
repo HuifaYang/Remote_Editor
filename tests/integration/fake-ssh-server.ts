@@ -185,6 +185,13 @@ export function startFakeServer(execRules: ExecRule[], opts: FakeServerOptions =
       .replace(/'\/ws/g, `'${root}/ws`)
       .replace(/(^|\s)\/ws(?=\/|\s|$)/g, `$1${root}/ws`);
 
+  /**
+   * 反向映射：exec 的**输出**里出现的临时根路径要还原成远端虚拟路径。
+   * 不还原的话 `git rev-parse --show-toplevel` 会把 `/tmp/rce-fake-ssh-xxx/ws` 吐给客户端，
+   * 客户端按自己的 `/ws` 前缀算相对路径就会算错（表现为暂存/提交失败）。
+   */
+  const unrewrite = (text: string): string => text.split(`${root}/ws`).join('/ws');
+
   const server = new Server({ hostKeys: [hostKey] }, (client) => {
     client.on("authentication", (ctx) => {
       if (ctx.method === "password" && ctx.username === "u" && ctx.password === "test") ctx.accept();
@@ -210,8 +217,19 @@ export function startFakeServer(execRules: ExecRule[], opts: FakeServerOptions =
             const child = opts.shellWrapper
               ? spawn(opts.shellWrapper, argv, { cwd: root, env: process.env })
               : spawn(argv[0], argv.slice(1), { cwd: root, env: process.env });
-            child.stdout.on("data", (d: Buffer) => stream.write(d));
-            child.stderr.on("data", (d: Buffer) => stream.stderr.write(d));
+            // exec 通道是全双工的：普通命令不写 stdin 不受影响，远端 LSP 则靠它收发 JSON-RPC。
+            stream.on("data", (chunk: Buffer) => { child.stdin?.write(chunk); });
+            stream.on("close", () => { child.stdin?.end(); });
+            /*
+             * 只有 rev-parse 会吐绝对路径（--show-toplevel），也只有它需要反向映射。
+             * 不能对所有命令做字符串替换：镜像同步走的是 tar.gz 二进制流，
+             * 二进制里出现同样的字节串就会被改坏（症状：解压镜像失败 incorrect header check）。
+             */
+            const shouldUnrewrite = /rev-parse|pwd -P/.test(info.command);
+            child.stdout.on("data", (d: Buffer) =>
+              stream.write(shouldUnrewrite ? unrewrite(d.toString()) : d));
+            child.stderr.on("data", (d: Buffer) =>
+              stream.stderr.write(shouldUnrewrite ? unrewrite(d.toString()) : d));
             child.on("close", (code: number | null) => {
               stream.exit(code ?? 0);
               stream.end();

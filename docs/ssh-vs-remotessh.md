@@ -13,10 +13,11 @@
 - 我们的硬约束是**目标机零部署、零常驻服务**（AGENTS.md），所以**不能**照搬这条路 ——
   这正是它节省的地方，也是它代价的来源：凡是"必须有个远端进程才能干"的活，都得我们自己补。
 - 我们采用的等价形态：**`sshfs://` 虚拟工作区 + 本地扩展宿主 + 自补远端能力**（终端 / 搜索 / SCM /
-  文件监听 / 语言服务镜像）。
+  文件监听 / 本机标准 LSP + 只读 SSHFS）。
 - 代价集中在两处，都已定位并有对策：
   1. **虚拟工作区语义**带来的扩展启用与"本地/远端"判断差异（影响面比想象小，见 §2.2）；
   2. 一批**内置扩展默认会去操作本机**（终端、git、搜索、任务、调试），必须显式替换。
+  语言服务不再要求目标机安装，也不再走源码镜像：开发机 LSP 通过只读 SSHFS 惰性读取远端整棵文件系统。
 
 ## 1. 机制差异（源码证据）
 
@@ -105,7 +106,9 @@
 | 内置 git 扩展 | 🔴 在虚拟工作区里它**不报错但也找不到仓库**（跑本机 `git`，工作区路径本机不存在）→ SCM 面板空白 | ✅ 已解决：扩展自己 `scm.createSourceControl()` 供面板，复用 `src/main/session/git.ts`（`GitRemote`）与 `src/shared/git-status.ts`（`splitStatus`）；实测 SCM 面板显示 `main` 分支 + 2 处更改（`C src/main.c`、`≡ src/new-file.txt`） |
 | 行内差异（quick diff） | — | ✅ 已解决：`quickDiffProvider` + `rce-git:` 虚拟文档（内容 = 远端 `git show HEAD:<rel>`） |
 | 暂存/取消暂存/放弃/提交 | — | ✅ 已解决：`git add/restore --staged/restore/clean` + `acceptInputCommand` 提交（放弃先弹模态确认） |
-| 历史图、分支切换、stash、push/pull | 内置 git 全都有 | 🟡 待做：`GitRemote` 里已有这些方法（`logGraph/branches/switchBranch/stash*/push/sync`），只是还没接到 UI 上 |
+| 历史图、提交变更、右键操作 | 内置 git 原生 Source Control Graph | ✅ 已解决：`scmHistoryProvider` 喂远端 `git log` / `diff`，图表和连线由 CodeOSS 渲染；查看提交变更、检出提交、撤销提交、硬重置、复制提交 ID 均已接通 |
+| 分支切换、暂存全部、提交修改/提交并推送 | 内置 git 全都有 | ✅ 已解决：标题栏/资源组/大按钮菜单走原生贡献点；修复 merge 提交 `diff-tree` 默认为空、多根工作区参数传递和历史 ref 短名不匹配 |
+| stash、pull/fetch | 内置 git 全都有 | 🟡 待做：`GitRemote` 已有 `stash*/sync` 方法，尚未接 UI |
 | 合并冲突编辑器 | `merge-conflict` 扩展可用 | 🟡 未验证 |
 
 ### 2.7 任务（tasks）/ 调试 / 端口转发
@@ -129,25 +132,28 @@
 
 ### 2.9 语言服务（补全 / 跳转 / 悬浮 / 诊断）
 
-设计基准见 **[lsp-mirror-design.md](lsp-mirror-design.md)**：按项目懒加载镜像，避免把 `/home/<user>` 或整个工作区当语言服务单位。
+设计基准见 **[lsp-mirror-design.md](lsp-mirror-design.md)**：本机标准 LSP 按需读取只读
+SSHFS 视图，目标机零语言服务，浏览模式零进程。
 
 | 项 | Remote-SSH | 我们 |
 |---|---|---|
-| 谁在跑 | 远端扩展宿主里的语言服务器 | **本机**跑 clangd / pylsp，指向前缀镜像 |
-| 镜像与路径重写 | 不需要 | ✅ 复用既有实现：`src/main/mirror/manager.ts`（tar 流式同步 + `compile_commands.json` 远端绝对路径重写为本地镜像前缀）与 `src/main/lsp/manager.ts`（clangd/pylsp 本地/远端两种 transport），由 `ide/extensions/sshfs/src/lsp.js` 接起来 |
-| 接进 CodeOSS | 远端服务器天然用远端路径 | ✅ 已解决：`DefinitionProvider` / `HoverProvider` / `DocumentSymbolProvider` / `CompletionItemProvider` 注册在 `{scheme: sshfs}` 上，URI 在 `sshfs://` ⇄ 镜像 `file:` 之间**双向翻译**（跳进 `/usr/include/stdio.h` 这类镜像 `_sysroot/` 里的文件时，路径要反查回远端绝对路径） |
+| 谁在跑 | 远端扩展宿主里的语言服务器 | **开发机标准 LSP**；目标机只提供 sftp，不安装语言服务器，也不部署 VS Code Server |
+| 镜像与路径重写 | 不需要 | ✅ 只读 SSHFS 挂载远端 `/`，源码和系统头按需读取；远端编译数据库重写到挂载前缀，URI 再映射回 `sshfs://` |
+| 接进 CodeOSS | 远端服务器天然用远端路径 | ✅ `DefinitionProvider` / `HoverProvider` / `DocumentSymbolProvider` / `CompletionItemProvider` 等注册在 `{scheme: sshfs}`，支持补全、诊断、跳转、引用、重命名、签名、代码操作、格式化和折叠 |
 | 诊断 | 远端服务器直接推给编辑器 | ✅ 已解决：`publishDiagnostics` → `vscode.languages.createDiagnosticCollection`（固定 owner，等同 `setModelMarkers`，不自己画波浪线） |
-| 生命周期 | 跟着远端 ext host | ✅ 关标签只发 `didClose`（不杀进程，重开标签不重启 clangd）；进程归 `LspManager`，切工作区/断开会话时统一 `dispose` |
-| 语言匹配 | 天然（远端 languageId） | ⚠️ **坑**：VSCode 里 `.c` 的 languageId 是 **`c`** 不是 `cpp`（由内置 cpp 扩展贡献），`documentSelector` 少写一条 `{language:"c"}` 就一个 provider 都不会被调用（实测现象：跳转永远返回空，但直连 clangd 拿得到结果） |
-| JS/TS/JSON/HTML/CSS | 远端跑 | ✅ 不用管：`typescript-language-features` 等在虚拟工作区下走 `workspace.fs`，直接就能用（limited 支持） |
+| 生命周期 | 跟着远端 ext host | ✅ 浏览模式不启动；代码智能模式按需启动；切回浏览先热保留，超时退出；关标签只发 `didClose` |
+| 语言匹配 | 天然（远端 languageId） | ✅ 通用注册表优先 languageId，扩展名兜底；`.c` 与 `cpp` 都映射到 clangd；任意语言通过 `rce.lsp.servers` 注册 |
+| JS/TS/JSON/HTML/CSS | 远端跑 | 🟡 上游内置语言功能在虚拟工作区走 `workspace.fs`，可提供语法/基础编辑；需要完整 tsserver 时按 `rce.lsp.servers` 配置标准 LSP |
+| 资源占用 | 远端 ext host + 服务器 | 浏览 0 个 LSP；智能模式在**开发机**启动，RK3566 只承担 SFTP 读取。clangd 默认 `-j=1`，索引留在内存 |
 
-**实测（`ide/tools/run-e2e.sh` 第 11~12 步，用假 clangd + 真镜像）**：
-`定义→u@127.0.0.1:42343/ws/src/util.c`（镜像里的另一个文件被翻回 `sshfs://`）、`悬浮 1 条`、
-`符号 1 个`、`补全 4 项`、诊断 `1 条（severity=1，source=rce-fake-clangd）`。
+**实测（`ide/tools/run-e2e.sh`，假 SSH + 真只读 SSHFS + 本机假 LSP）**：
+浏览模式冷启动，切代码智能后 `定义→sshfs://…/ws/src/util.c`、悬浮 1 条、符号 1 个、补全 4 项、
+诊断 1 条。另有本地假 SSH + 真子进程假 LSP 的集成测试覆盖 SSH exec 双向 JSON-RPC。
 
-**配套的命令与配置**：`rce.lsp.syncMirror`（手工全量重同步镜像）、`rce.lsp.restart`（换编译器后重启），
-配置 `rce.lsp.enabled` / `rce.lsp.transport` / `rce.lsp.cppPath` / `rce.lsp.pythonPath`；
-状态栏 `本机语言服务：镜像就绪（N 文件）`。
+**配套命令与配置**：浏览/代码智能模式命令、`rce.lsp.restart`、`rce.lsp.configure`；
+`rce.lsp.mode` / `autoPromoteOnEdit` / `warmRetentionMinutes` / `servers` / `cppPath` / `pythonPath`。
+开发机需要 `sshfs`（deb 自动依赖）。`transport=remote` 仅用于目标机本来就有 LSP 的场景，
+`transport=local` 仅用于旧镜像兼容。状态栏会显示浏览、热保留、挂载、启动中、就绪或失败。
 
 ### 2.10 凭据与安全
 
@@ -164,6 +170,18 @@
 | 左下角远程指示 | "Open a Remote Window" + 绿色远程标记 | ✅ 使用 CodeOSS 原生 `statusBar/remoteIndicator`；未连接显示「连接到远程主机…」，已连接显示「断开远程连接 / 新建远程终端」 |
 | 远程资源管理器 | 内置 `Remote Explorer` 容器：`SSH` 分组、`+` 新建远程、齿轮打开 `~/.ssh/config`、主机/最近目录的原生内联操作 | ✅ 不自制容器：扩展通过 `views.remote` + `remoteTargets` 注册原生 TreeView，界面、图标、标题栏/右键/悬停菜单全由 CodeOSS 渲染；主机行直接连接，配置里的 IdentityFile/User/Port 先用，认证确有需要才弹密码，连上后用原生 QuickPick 逐级选目录或输入路径 |
 | 标题栏/状态栏的远端感 | 有 | 🟡 待做：可把远端主机名加进窗口标题（VSCode 原生 `remoteName` 对我们为空） |
+
+### 2.12 AI 补全与聊天（GitHub Copilot）
+
+| 项 | Remote-SSH | 我们 |
+|---|---|---|
+| 扩展来源 | 官方 Marketplace 一键装 | ✅ 官方 VSIX 手动装（`ide/tools/install-vsix.sh`），仓库不提交专有扩展；Open VSX 上没有这两个包 |
+| 登录 | 内置 GitHub 认证 | ✅ 走 CodeOSS 自带 `vscode.github-authentication`；需要网络能到 `github.com`（中国大陆建议 `RCE_PROXY=http://127.0.0.1:7890`） |
+| 行内补全 | 远端/本地扩展宿主 | ✅ 本地扩宿主跑，补全请求直达 GitHub API；源码仍然只在 `sshfs://` 虚拟工作区里，编辑器读写照旧走 SFTP |
+| Chat | 同上 | ✅ 登录后可用 |
+| proposed API | 微软产品内置白名单 | ✅ `run-app.sh` 用官方 `--enable-proposed-api GitHub.copilot --enable-proposed-api GitHub.copilot-chat` 放行（copilot-chat 0.48.1 声明了 63 个） |
+| 中文品牌名 | 不涉及 | ⚠️ 坑：`vscode.env.appName` 会进 `User-Agent`，非 Latin-1 会让请求在本地构造阶段就抛 `Cannot convert argument to a ByteString`。已由 `apply-branding.mjs`「十一」把交给扩展的 `appName` / 市场 UA 固定为 ASCII，界面显示名仍是中文 |
+| Copilot CLI / agent 会话 | 远端跑 | 🔴 暂不可用：打包产物缺 `node-pty` 原生模块（不影响行内补全与聊天） |
 
 ## 3. 品牌与 CodeOSS 集成补丁（都是实测踩出来的）
 
@@ -182,7 +200,7 @@
 
 ## 4. 当前状态与复现
 
-**一句话现状（2026-10-13 19:10）**：`ide/` 主线已能日常用——文件系统 / 终端 / 搜索 / SCM / 远端工作区配置 / 语言服务 /
+**一句话现状（2026-10-15）**：`ide/` 主线已能日常用——文件系统 / 终端 / 搜索 / SCM / 远端工作区配置 / 语言服务 /
 任务（含依赖、Problems、后台任务）全部接通，端到端 **17/17**，目标机**无任何常驻服务**；语言服务已扩到引用、重命名、签名帮助、代码操作、格式化和折叠，影子缓存已有 LRU/TTL/容量管理。上游补丁由 `ide/tools/apply-branding.mjs` 幂等维护；全局进度快照见 `docs/devlog.md` 末尾。
 
 **已跑通（2026-10-12）：**
@@ -202,7 +220,7 @@ bash ide/tools/run-e2e.sh
 | 远端全文搜索（grep） | ✅ 命中远端 `README.md:3` |
 | 远端文件搜索（proposed API） | ✅ `findFiles("**/main.c") → /ws/src/main.c` |
 | 远端 `.vscode/settings.json` 生效 | ✅ `editor.tabSize=7`（Remote-SSH 对等的关键一条：工作区配置真的从远端读） |
-| SCM 状态（远端 git） | ✅ `0 暂存 / 2 更改`，面板显示 `main` 分支 |
+| SCM 状态（远端 git + 历史图） | ✅ `0 暂存 / 2 更改；3 refs / 5 提交 / 1 个变更文件`，面板显示 `main` 分支 |
 | 打开搜索视图 | ✅ |
 | 切到源代码管理视图 | ✅ |
 | 语言服务：镜像同步 + `compile_commands.json` 重写 | ✅ 按项目懒加载；假靶机 3 个源文件 / `entries=1`，`directory` 已是镜像前缀 |
@@ -216,16 +234,19 @@ bash ide/tools/run-e2e.sh
 
 **待做（按优先级）：**
 
-1. **SCM 补全**：历史图 / 分支切换 / stash / push / pull（`GitRemote` 已有方法，接 UI 即可）。
+1. **SCM 补全**：stash / pull / fetch（历史图、提交变更、分支切换、提交修改和提交并推送已完成）。
 2. 搜索增强：`includes/excludes/wordMatch`、大仓库性能。
 3. **镜像同步的增量路径**：目前全量同步会重建 `compile_commands`/sysroot，增量沿用上一次的结果
    （已修：增量不再把全量收好的 `compile_commands.json` 覆盖成 `compile_flags.txt` 兜底）；
    递归 watch 还只能发现增删，改内容发现不了。
 4. 连接管理正式化：主机列表（`src/main/config/hosts.ts` 的 `hosts.json`）、`~/.ssh/config` 解析、私钥选择。
-5. 打包发布：`npm run gulp vscode-linux-x64`（产物 `ide/VSCode-linux-x64`）+ 装机脚本；打包前必须把
-   `extensionEnabledApiProposals` 写进 `product.json`（否则 proposed 搜索 API 在正式版会被拒）。
+5. **打包发布**：Linux amd64 deb 已由 `npm run build:deb` 一键打通（产物在 `ide/dist/`，带 SHA-256
+   与包内容清单）；仍需补签名、apt 仓库/升级通道和真实机器安装回归。Windows/macOS 尚未纳入本轮。
+   打包链会同步写入 `extensionEnabledApiProposals`，否则 proposed API 在正式版会被拒。
 6. 消除启动期 `ENOPRO` 噪声：§5.4 已处置「请求会等会话就绪」这一半（功能不受影响），日志本身还在（provider 注册前的探测），待做。
-7. 调试 / 端口转发：明确不支持，写进产品说明。
+7. **Copilot CLI / agent 会话**：打包产物缺 `node-pty` 原生模块（`Unable to find node-pty binaries`），
+   行内补全与聊天不受影响；要用 agent 会话时再补（需要匹配 Electron ABI 的 prebuild）。
+8. 调试 / 端口转发：明确不支持，写进产品说明。
 
 ## 5. 踩坑与注意（都是实测踩出来的，改动相关代码前先看）
 

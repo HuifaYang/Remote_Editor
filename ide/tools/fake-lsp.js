@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// 端到端用的**假语言服务**：clangd 在本机不一定装得上，但"语言服务桥"这条链路（镜像 → 进程 → JSON-RPC →
+// 端到端用的**假语言服务**：clangd 在本机不一定装得上，但"语言服务桥"这条链路（SSH exec → 进程 → JSON-RPC →
 // provider → URI 翻译 → 诊断）必须真的跑一遍才算验证过。这个文件就是一个只会说 LSP 的极小实现，
 // 参数/行为都照着 clangd 的关键面来：define / hover / documentSymbol / completion / publishDiagnostics。
 //
@@ -20,7 +20,7 @@ function send(message) {
 const reply = (id, result) => send({ jsonrpc: "2.0", id, result });
 const notify = (method, params) => send({ jsonrpc: "2.0", method, params });
 
-/** 从镜像文件 URI 里反推镜像根：文档是 <root>/src/main.c */
+/** 从文档 URI 里反推项目根：文档是 <root>/src/main.c */
 function rootOf(fileUri) {
   const p = decodeURIComponent(new URL(fileUri).pathname);
   return path.dirname(path.dirname(p));
@@ -68,7 +68,7 @@ function onMessage(msg) {
         severity: 2,
         code: "rce-fake",
         source: "rce-fake-clangd",
-        message: "假语言服务：这条诊断来自镜像里的 clangd（E2E）",
+        message: "假语言服务：这条诊断来自远端标准 LSP（E2E）",
       }],
     });
     return;
@@ -77,7 +77,7 @@ function onMessage(msg) {
     const uri = (msg.params && msg.params.textDocument && msg.params.textDocument.uri) || opened;
     const root = rootOf(uri || "file:///tmp/src/main.c");
     if (msg.method === "textDocument/definition") {
-      // 返回镜像里的另一个文件：验证"镜像路径 → sshfs://"的反向翻译
+      // 返回项目里的另一个文件：验证"远端 file:// → sshfs://"的反向翻译
       reply(msg.id, [{
         uri: `file://${root}/src/util.c`,
         range: range(1, 0, 1, 3),
@@ -85,7 +85,7 @@ function onMessage(msg) {
       return;
     }
     if (msg.method === "textDocument/hover") {
-      reply(msg.id, { contents: { kind: "markdown", value: "**假 clangd**\n\n悬浮信息来自镜像（`" + root + "`）" } });
+      reply(msg.id, { contents: { kind: "markdown", value: "**假 clangd**\n\n悬浮信息来自远端（`" + root + "`）" } });
       return;
     }
     if (msg.method === "textDocument/documentSymbol") {

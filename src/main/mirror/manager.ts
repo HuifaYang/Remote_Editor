@@ -7,7 +7,10 @@ import { AppError } from "../../shared/errors.js";
 import { normalizeRemotePath, shellQuote } from "../../shared/paths.js";
 import type { MirrorEntry, MirrorProgress, MirrorResult } from "../../shared/types.js";
 import { log } from "../log.js";
-import { buildCompileCommandsFindCommand, buildDirExistsCommand, collectFromParsedData, type CompileCollection } from "../lsp/clangd-config.js";
+import {
+  buildCompileCommandsFindCommand, buildDirExistsCommand, collectCmakeFlagsFallback,
+  collectCompileCommands, collectFromParsedData, type CompileCollection,
+} from "../lsp/clangd-config.js";
 import type { ExecStreamHandle, SSHConnection } from "../session/connection.js";
 import {
   createManifest, diffManifest, mirrorRelativePath, parseFindListing, parseManifest,
@@ -73,7 +76,17 @@ function sectionHeader(name: string, extraExpr = ""): string {
 }
 export function buildCapabilitiesCommand(): string {
   // 整段必须打到 **stderr**：stdout 是 tar 的 gzip 流，混进任何字符都会毁掉解包
-  return `${sectionHeader("__CAP__")}; { tar --version 2>&1 || true; gcc -dumpmachine 2>/dev/null || true; gcc -print-file-name=include 2>/dev/null || true; } 1>&2`;
+  // 除 gcc 基本信息外，还要把**目标架构的 C++ 标准库与系统头目录**探出来：
+  // clangd 交叉编译时若拿不到这些（镜像里没同步 sysroot），std/uint8_t/chrono 全部报未定义。
+  // 用 g++ -print-search-dirs / -E -v 这些稳定输出，把真正存在的目录打到 __CAP__ 段。
+  return [
+    `${sectionHeader("__CAP__")};`,
+    `{ tar --version 2>&1 || true; gcc -dumpmachine 2>/dev/null || true; gcc -print-file-name=include 2>/dev/null || true;`,
+    `  __rce_triplet=$(gcc -dumpmachine 2>/dev/null);`,
+    `  for __rce_d in "/usr/include/c++/"* "/usr/include/$__rce_triplet/c++/"* "/usr/include/$__rce_triplet" "/usr/include" "/usr/local/include" "$(gcc -print-file-name=include 2>/dev/null)"; do`,
+    `    [ -n "$__rce_d" ] && [ -d "$__rce_d" ] && printf '%s\\n' "$__rce_d";`,
+    `  done; } 1>&2`,
+  ].join("\n");
 }
 /** compile_commands 的 find 结果存进 shell 变量 `__rce_cc`：后面 dump 内容、算 sysroot 候选目录都复用它，只 find 一次 */
 export function buildCompileFindSection(workspace: string): string {
@@ -183,6 +196,11 @@ export interface MirrorOptions {
   extractTarGz?: (tarPath: string, destDir: string) => Promise<void>;
 }
 
+/** 增量补收编译信息后必须使用刚收集到的 sysroot；旧集合只在完全没有新结果时兜底。 */
+export function selectSysrootRoots(compile: CompileCollection | null, previous: string[]): string[] {
+  return compile?.sysrootRoots ?? previous;
+}
+
 export class MirrorManager {
   private workspace = "";
   private syncedAt = 0;
@@ -190,6 +208,10 @@ export class MirrorManager {
   private sysrootRoots: string[] = [];
   private lastSysrootRoots: string[] | null = null;
   private gccIncludeDir = "";
+  /** 目标架构的 C++ 标准库 / 系统头目录（来自 __CAP__ 探测） */
+  private systemIncludeDirs: string[] = [];
+  private workspaceAliases: string[] = [];
+  private aliasesForWorkspace = "";
   private triplet = "";
   private tarChecked = false;
   private compile: CompileCollection | null = null;
@@ -287,6 +309,7 @@ export class MirrorManager {
     this.syncedAt = source.syncedAt;
     this.entries = toEntryMap(nextEntries);
     this.writeManifest();
+    await this.ensureWorkspaceAliases(ws);
 
     const totalBytes = nextEntries.reduce((sum, e) => sum + e.size, 0);
     const baseResult: MirrorResult = {
@@ -303,7 +326,7 @@ export class MirrorManager {
     // compile_commands.json 覆盖成 compile_flags.txt 兜底（clangd 直接失去编译数据库）。
     if (source.full) {
       try {
-        this.compile = collectFromParsedData(ws, {
+        let collected = collectFromParsedData(ws, {
           findOutput: this.lastSections?.find ?? "",
           fileTexts: this.lastSections?.fileTexts ?? {},
           probeOutput: this.lastSections?.probe ?? "",
@@ -311,13 +334,42 @@ export class MirrorManager {
           mirrorRoot: this.mirrorRoot,
           triplet: this.targetTriplet,
           gccIncludeDir: this.gccIncludeDir,
+          systemIncludeDirs: this.systemIncludeDirs,
+          remoteAliases: this.workspaceAliases,
         });
-        log("info", `compile_commands 来源 ${this.compile.sourceFiles.length} 个，条目 ${this.compile.entryCount} 个`);
+        if (collected.entryCount === 0) {
+          collected = await collectCmakeFlagsFallback(this.conn, ws, {
+            mirrorRoot: this.mirrorRoot,
+            triplet: this.targetTriplet,
+            gccIncludeDir: this.gccIncludeDir,
+            systemIncludeDirs: this.systemIncludeDirs,
+            remoteAliases: this.workspaceAliases,
+          });
+        }
+        this.compile = collected;
+        log("info", `编译配置来源 ${this.compile.sourceFiles.length} 个，条目 ${this.compile.entryCount} 个，系统头目录 ${this.compile.sysrootRoots.length} 个`);
       } catch (err) {
         log("warn", `compile_commands 收集失败：${String(err)}`);
         this.compile = null;
       }
-      onProgress?.({ done: 2, total: 5, current: "已重写 compile_commands.json" });
+      onProgress?.({ done: 2, total: 5, current: "已准备编译配置" });
+    } else if (!this.compile || this.compile.entryCount === 0) {
+      // 增量但还没有可用的编译数据库（上次全量时没找到，或发现逻辑升级前的旧镜像）：
+      // 补一次轻量独立收集。不补的话会永远「沿用」空结果，头文件集合一直是 0、clangd 一直裸跑。
+      onProgress?.({ done: 2, total: 5, current: "增量同步：补收编译配置…" });
+      try {
+        const collected = await collectCompileCommands(this.conn, ws, {
+          mirrorRoot: this.mirrorRoot,
+          triplet: this.targetTriplet,
+          gccIncludeDir: this.gccIncludeDir,
+          systemIncludeDirs: this.systemIncludeDirs,
+          remoteAliases: this.workspaceAliases,
+        });
+        this.compile = collected;
+        log("info", `编译配置补收完成：来源 ${collected.sourceFiles.length} 个，条目 ${collected.entryCount} 个`);
+      } catch (err) {
+        log("warn", `compile_commands 补收失败：${String(err)}`);
+      }
     } else {
       // 增量：沿用上一次的编译数据库与 sysroot 目录集合
       onProgress?.({ done: 2, total: 5, current: "沿用已有 compile_commands.json（增量）" });
@@ -326,7 +378,7 @@ export class MirrorManager {
 
     // 头文件 / sysroot（§5.3.8）：目录集合变了就全量，没变才走时间戳增量；
     // 增量同步拿不到 compile_commands 分段 → 沿用上次收集的集合（否则头文件镜像会被悄悄丢掉）
-    const dirs = source.full ? (this.compile?.sysrootRoots ?? []) : this.sysrootRoots;
+    const dirs = selectSysrootRoots(this.compile, this.sysrootRoots);
     this.sysrootRoots = dirs;
     if (dirs.length > 0) {
       const sameSet = this.lastSysrootRoots !== null && sameList(this.lastSysrootRoots, dirs);
@@ -341,12 +393,19 @@ export class MirrorManager {
     onProgress?.({ done: 3, total: 5, current: `已同步头文件（${dirs.length} 个目录）` });
     this.checkAbort();
 
-    try {
-      await this.pullPythonEnv();
-    } catch (err) {
-      log("warn", `Python 环境同步失败（不用 Python 可忽略）：${String(err)}`);
+    // Python 环境按需同步：项目里没有 .py 就整段跳过。site-packages 动辄几百 MB，
+    // 纯 C/C++ 项目每次白拉一遍是同步慢的最大头（实测占 40s+）。
+    const hasPythonSource = nextEntries.some((e) => e.path.endsWith(".py") || e.path.endsWith(".pyi"));
+    if (hasPythonSource) {
+      try {
+        await this.pullPythonEnv();
+      } catch (err) {
+        log("warn", `Python 环境同步失败（不用 Python 可忽略）：${String(err)}`);
+      }
+      onProgress?.({ done: 4, total: 5, current: "已同步 Python 环境" });
+    } else {
+      onProgress?.({ done: 4, total: 5, current: "无 Python 源码，跳过 Python 环境" });
     }
-    onProgress?.({ done: 4, total: 5, current: "已同步 Python 环境" });
     this.checkAbort();
     onProgress?.({ done: 5, total: 5, current: "镜像就绪" });
     log("info", `镜像同步完成：${nextEntries.length} 个文件，变更 ${diff.changed.length}，删除 ${diff.removed.length}`);
@@ -388,6 +447,8 @@ export class MirrorManager {
     this.sysrootRoots = [];
     this.lastSysrootRoots = null;
     this.compile = null;
+    this.workspaceAliases = [];
+    this.aliasesForWorkspace = "";
   }
 
   /** tar 能力探测 + target 三元组：优先用同一条复合命令里的分段数据（0 额外往返） */
@@ -396,13 +457,31 @@ export class MirrorManager {
       this.applyCapabilitiesFromSections(this.lastSections.cap);
       return;
     }
-    // 兜底（首次构建命令前没有 sections，理论不可达）：单独探测
-    const r = await this.conn.exec("tar --version 2>&1 || echo __RCE_NO_TAR__");
+    // 兜底：没有内存里的 sections（典型场景：**重启后第一次同步走增量**，lastSections 已丢）。
+    // 这里必须把 tar 能力、target 三元组、系统头目录一起探全——否则 systemIncludeDirs 为空，
+    // 编译数据库又恰好缺失时，clangd 拿不到交叉编译所需的 C++ 标准库（std::* 全红）。
+    const r = await this.conn.exec(
+      `{ tar --version 2>&1 || echo __RCE_NO_TAR__; gcc -dumpmachine 2>/dev/null; ` +
+      `for d in /usr/include/c++/* /usr/include/$(gcc -dumpmachine 2>/dev/null)/c++/* ` +
+      `/usr/include/$(gcc -dumpmachine 2>/dev/null) /usr/include /usr/local/include ` +
+      `"$(gcc -print-file-name=include 2>/dev/null)"; do [ -n "$d" ] && [ -d "$d" ] && printf '%s\n' "$d"; done; }`,
+    );
     const out = `${r.stdout}${r.stderr}`;
     if (!/tar|busybox/i.test(out) || out.includes("__RCE_NO_TAR__")) {
       throw new AppError("unsupported", "远端缺少 tar 命令，无法同步环境镜像", out.trim());
     }
     this.tarChecked = true;
+    this.applyCapabilitiesFromSections(out);
+  }
+
+  /** CMake/colcon 经常把软链接工作区解析成 /robotdata/... 真实路径；带上别名才能重写 flags.make。 */
+  private async ensureWorkspaceAliases(workspace: string): Promise<void> {
+    if (this.aliasesForWorkspace === workspace) return;
+    this.aliasesForWorkspace = workspace;
+    this.workspaceAliases = [];
+    const r = await this.conn.exec(`cd ${shellQuote(workspace)} && pwd -P 2>/dev/null`);
+    const real = r.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop() ?? "";
+    if (r.code === 0 && real && real !== workspace) this.workspaceAliases = [real];
   }
 
   private applyCapabilitiesFromSections(cap: string): void {
@@ -422,6 +501,15 @@ export class MirrorManager {
       }
       const includeDir = lines.find((l) => l.startsWith("/")) ?? "";
       this.gccIncludeDir = includeDir.startsWith("/") ? includeDir : "";
+    }
+    // C++ 标准库 / 系统头目录（可能是多个）：全量同步或补齐时把它们纳入 sysroot 候选。
+    // 这些目录与 triplet 一起构成 clangd 交叉编译所需的完整系统头集合。
+    // 注意：cap 里所有绝对路径行都可能是头目录，这里只要 include/c++ 形态的。
+    const allLines = cap.split("\n").map((l) => l.trim()).filter(Boolean);
+    const sysDirs = allLines.filter((l) => l.startsWith("/") && /include|c\+\+/.test(l));
+    if (sysDirs.length > 0) {
+      this.systemIncludeDirs = [...new Set(sysDirs)];
+      log("info", `目标系统头目录 ${this.systemIncludeDirs.length} 个：${this.systemIncludeDirs.join(", ")}`);
     }
   }
 
@@ -569,6 +657,8 @@ export class MirrorManager {
 
   /** 读取上次落盘的 manifest（重启后仍可增量），坏文件安全跳过 */
   loadPersistedManifest(workspace: string): void {
+    // 与 sync() 保持一致的归一化：调用方传原始 remoteRoot（可能带 ~ 或尾斜杠）也能对上
+    const ws = normalizeRemotePath(workspace, "/");
     const file = path.join(this.mirrorRoot, "manifest.json");
     let raw = "";
     try {
@@ -577,7 +667,7 @@ export class MirrorManager {
       return;
     }
     const manifest = parseManifest(raw);
-    if (!manifest || manifest.workspace !== workspace) return;
+    if (!manifest || manifest.workspace !== ws) return;
     this.workspace = manifest.workspace;
     this.syncedAt = manifest.syncedAt;
     this.entries = toEntryMap(manifest.entries);

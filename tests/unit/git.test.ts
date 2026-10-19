@@ -38,6 +38,23 @@ describe("往返预算", () => {
     expect(snap.files["/ws/src/main.c"]).toMatchObject({ letter: "M" });
     expect(snap.branch).toBe("main");
   });
+  it("test_tree_status_parses_workspace_prefix_and_upstream", async () => {
+    const { conn } = fakeConn([
+      [/rev-parse --show-toplevel/, {
+        code: 0,
+        stdout: "/robotdata/ws\nmain\nabc123\npkg/\nrefs/remotes/origin/main\ndef456\n",
+        stderr: "",
+      }],
+      [/git status/, { code: 0, stdout: "", stderr: "" }],
+    ]);
+    const snap = await new GitRemote(conn).treeStatus("/home/me/ws/pkg");
+    expect(snap).toMatchObject({
+      root: "/robotdata/ws",
+      workspacePrefix: "pkg/",
+      upstreamRef: "refs/remotes/origin/main",
+      upstreamCommit: "def456",
+    });
+  });
   it("test_clean_file_diff_uses_zero_git_commands", async () => {
     // Given 快照判「未变更」Then 打开文件 0 条 git 命令
     const { conn, calls } = fakeConn([]);
@@ -123,18 +140,38 @@ describe("分支与提交图", () => {
     await new GitRemote(conn).switchBranch("/ws", "dev");
     expect(calls[0].cmd).toBe("git checkout 'dev'");
   });
-  it("test_branches_parses_detached_head", async () => {
+  it("test_branches_reads_for_each_ref_with_revision", async () => {
+    // for-each-ref 输出：refname \0 objectname \0 HEAD 标记；revision 必须带出来（历史图配色/定位依赖它）
     const { conn } = fakeConn([
-      [/git branch/, {
+      [/git for-each-ref/, {
         code: 0,
-        stdout: "* (HEAD detached at abc1234)\n  main\n  remotes/origin/main\n",
+        stdout: [
+          "refs/heads/main\0abc1234000000000000000000000000000000000\0*",
+          "refs/heads/dev\0def5678000000000000000000000000000000000\0 ",
+          "refs/remotes/origin/main\0feed123000000000000000000000000000000000\0 ",
+          "refs/remotes/origin/HEAD\0abc1234000000000000000000000000000000000\0 ",
+        ].join("\n") + "\n",
         stderr: "",
       }],
     ]);
     const branches = await new GitRemote(conn).branches("/ws");
-    expect(branches[0]).toMatchObject({ current: true, detached: true });
-    expect(branches.find((b) => b.name === "main")).toMatchObject({ remote: false });
+    expect(branches.find((b) => b.name === "main")).toMatchObject({ current: true, remote: false, revision: "abc1234000000000000000000000000000000000" });
+    expect(branches.find((b) => b.name === "dev")).toMatchObject({ remote: false });
     expect(branches.find((b) => b.name === "origin/main")).toMatchObject({ remote: true });
+    // origin/HEAD 是符号引用，必须跳过
+    expect(branches.find((b) => b.name === "origin/HEAD")).toBeUndefined();
+  });
+  it("test_branches_reads_upstream", async () => {
+    const { conn } = fakeConn([
+      [/git for-each-ref/, {
+        code: 0,
+        stdout: "refs/heads/main\0abc123\0*\0origin/main\n",
+        stderr: "",
+      }],
+    ]);
+    await expect(new GitRemote(conn).branches("/ws")).resolves.toEqual([
+      expect.objectContaining({ name: "main", upstream: "origin/main" }),
+    ]);
   });
   it("test_log_graph_returns_layouted_rows", async () => {
     const line = "abc123\0\0作者\0今天\0首个提交\0HEAD -> main";
@@ -143,6 +180,55 @@ describe("分支与提交图", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ lane: 0, laneCount: 1 });
     expect(rows[0].commit).toMatchObject({ hash: "abc123", subject: "首个提交", refs: ["HEAD -> main"] });
+  });
+  it("test_log_graph_uses_requested_branch_revisions", async () => {
+    const { conn, calls } = fakeConn([[/git log/, { code: 0, stdout: "", stderr: "" }]]);
+    await new GitRemote(conn).logGraph("/ws", 50, ["abc123", "def456"], 10);
+    expect(calls[0].cmd).toContain("--topo-order");
+    expect(calls[0].cmd).toContain("--max-count=50");
+    expect(calls[0].cmd).toContain("--skip=10");
+    expect(calls[0].cmd).toContain("'abc123' 'def456'");
+    expect(calls[0].cmd).not.toContain("--all");
+  });
+  it("test_checkout_revert_reset_quote_revision", async () => {
+    const { conn, calls } = fakeConn([]);
+    const git = new GitRemote(conn);
+    await git.checkoutRev("/ws", "abc123");
+    await git.revert("/ws", "def456");
+    await git.resetHard("/ws", "fedcba");
+    expect(calls.map((c) => c.cmd)).toEqual([
+      "git checkout 'abc123'",
+      "git revert --no-edit 'def456'",
+      "git reset --hard 'fedcba'",
+    ]);
+  });
+  it("test_commit_changes_parses_add_modify_rename", async () => {
+    const { conn } = fakeConn([[/git diff-tree/, {
+      code: 0,
+      stdout: "M\tsrc/main.c\nA\tsrc/new.c\nR100\tsrc/old.c\tsrc/renamed.c\n",
+      stderr: "",
+    }]]);
+    await expect(new GitRemote(conn).commitChanges("/ws", "abc123")).resolves.toEqual([
+      { status: "M", path: "src/main.c" },
+      { status: "A", path: "src/new.c" },
+      { status: "R", path: "src/renamed.c" },
+    ]);
+  });
+  it("test_commit_changes_uses_parent_for_merge_commit", async () => {
+    const { conn, calls } = fakeConn([[/git diff --name-status/, {
+      code: 0,
+      stdout: "M\tsrc/main.c\n",
+      stderr: "",
+    }]]);
+    await new GitRemote(conn).commitChanges("/ws", "merge123", "parent456");
+    expect(calls[0].cmd).toBe("git diff --name-status -r 'parent456' 'merge123'");
+  });
+  it("test_commit_changes_surfaces_git_stderr", async () => {
+    const { conn } = fakeConn([[/git diff-tree/, { code: 128, stdout: "", stderr: "bad revision" }]]);
+    await expect(new GitRemote(conn).commitChanges("/ws", "nope")).rejects.toMatchObject({
+      code: "git",
+      detail: "bad revision",
+    });
   });
 });
 

@@ -117,8 +117,32 @@ startFakeServer([], { realExec: true, realShell: true, shellWrapper: targetWrapp
     execFileSync("git", args, { cwd: ws, env: { ...process.env, GIT_AUTHOR_NAME: "rce", GIT_AUTHOR_EMAIL: "rce@x", GIT_COMMITTER_NAME: "rce", GIT_COMMITTER_EMAIL: "rce@x" } });
   try {
     git("init", "-q", "-b", "main");
+    // 仓库级作者身份：客户端通过 SSH 跑 `git commit` 时也要能拿到，
+    // 光靠造提交时的 GIT_AUTHOR_* 环境变量是不够的（否则报“作者身份未知”）。
+    git("config", "user.name", "rce");
+    git("config", "user.email", "rce@x");
     git("add", "-A");
     git("commit", "-q", "-m", "初始提交");
+    // 多造点历史：Source Control Graph（原生图表）需要分支/合并且有连线才看得出效果
+    fs.appendFileSync(path.join(ws, "README.md"), "\n第二行：假靶机历史\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "README：补一行说明");
+    git("checkout", "-q", "-b", "feature/graph");
+    fs.writeFileSync(path.join(ws, "src", "util.c"),
+      "#include <stdio.h>\nint add(int a, int b) { return a + b; }\nint sub(int a, int b) { return a - b; }\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "feature：util 增加 sub()");
+    git("checkout", "-q", "main");
+    fs.appendFileSync(path.join(ws, "src", "main.c"), "/* main 分支上的独立改动 */\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "main：main.c 注释");
+    git("merge", "-q", "--no-ff", "-m", "合并 feature/graph", "feature/graph");
+    // 造一个本地 bare 仓库当 origin，这样“提交和推送”也能在假靶机端到端跑通
+    const origin = path.join(server.root, "origin.git");
+    execFileSync("git", ["init", "-q", "--bare", origin]);
+    git("remote", "add", "origin", origin);
+    git("push", "-q", "-u", "origin", "main");
+    // 最后留一处工作区改动 + 一个未跟踪文件，保持 SCM 面板原本的“2 处更改”观感
     fs.appendFileSync(path.join(ws, "src", "main.c"), "\n// 本地改动\n");
     fs.writeFileSync(path.join(ws, "src", "new-file.txt"), "未跟踪文件\n");
   } catch (err) {

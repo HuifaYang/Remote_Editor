@@ -35,7 +35,7 @@ function specFromEnv(env = process.env) {
 
 /** 一个已建立的会话：连接 + 四个远端能力门面（FS / Git / 搜索 / 终端） */
 class RemoteSession {
-  constructor(spec, conn, log) {
+  constructor(spec, conn, log, onUnexpectedClose) {
     this.spec = spec;
     this.conn = conn;
     this.log = log;
@@ -43,6 +43,14 @@ class RemoteSession {
     this.fs = new RemoteFs(conn);
     this.git = new GitRemote(conn);
     this.search = new SearchRemote(conn);
+    this.disposed = false;
+    // 网络抖动 / 板子重启 / IDE 休眠都会让 SSH 悄悄断掉。主动 dispose 不算意外；
+    // 意外断开必须上报，否则远端工作区还挂着、所有文件请求都报「没有会话」。
+    if (typeof conn.onClose === "function") {
+      conn.onClose(() => {
+        if (!this.disposed) onUnexpectedClose?.(this.authority);
+      });
+    }
   }
 
   /** 新建一个 SSH 交互终端通道（每块终端一个，关闭标签必须 close，见 §13 坑 6） */
@@ -52,6 +60,7 @@ class RemoteSession {
   }
 
   async dispose() {
+    this.disposed = true;   // 先置位：close 触发的 onClose 回调不再当「意外断开」处理
     try {
       await this.conn.close();
     } catch (err) {
@@ -61,8 +70,9 @@ class RemoteSession {
 }
 
 class SessionManager {
-  constructor(log) {
+  constructor(log, hooks = {}) {
     this.log = log;
+    this.hooks = hooks;                     // { onUnexpectedClose?: (authority) => void }
     this.byAuthority = new Map();
     this.pendingByAuthority = new Map();   // authority → 正在连接中的 promise
   }
@@ -103,6 +113,10 @@ class SessionManager {
     const authority = authorityOf(spec);
     const existing = this.byAuthority.get(authority);
     if (existing) return existing;
+    // 同一 authority 的并发请求必须共用一次连接。否则工作台启动时文件系统/SCM/任务同时来问，
+    // 会并发建多条 SSH，既浪费握手，也会让“连接中/失败/成功”状态来回跳。
+    const inFlight = this.pendingByAuthority.get(authority);
+    if (inFlight) return await inFlight.promise;
     this.expect(spec);                       // 先挂位子，让这期间来的文件请求能等我们
     const pending = this.pendingByAuthority.get(authority);
     const conn = new SSHConnection({
@@ -119,14 +133,22 @@ class SessionManager {
       sshDir: spec.sshDir,
     });
     try {
+      this.hooks.onConnecting?.(authority);
       await conn.connect();
-      const session = new RemoteSession({ ...spec, port: spec.port }, conn, this.log);
+      const session = new RemoteSession(
+        { ...spec, port: spec.port },
+        conn,
+        this.log,
+        (auth) => this.hooks.onUnexpectedClose?.(auth),
+      );
       this.byAuthority.set(authority, session);
       this.log(`已连接 ${authority}`);
       if (pending) pending.resolve(session);
+      this.hooks.onConnected?.(authority);
       return session;
     } catch (err) {
       if (pending) pending.reject(err);
+      this.hooks.onConnectionFailed?.(authority, err);
       throw err;
     } finally {
       this.pendingByAuthority.delete(authority);
@@ -144,6 +166,8 @@ class SessionManager {
   }
 
   async closeAll() {
+    // 先标记全部为主动关闭：close 触发的 onClose 回调不再当「意外断开」，避免自动重连抢跑
+    for (const s of this.byAuthority.values()) s.disposed = true;
     const active = [...this.byAuthority.values()];
     const pending = [...this.pendingByAuthority.values()];
     // 先把内存状态清掉：UI 的「断开」必须立刻生效，不能被 SSH close 的等待拖住。

@@ -1,0 +1,19 @@
+[Desktop Entry]
+Name=@@NAME_LONG@@
+Comment=Remote development IDE for embedded systems
+GenericName=Integrated Development Environment
+Exec=@@EXEC@@ %F
+Icon=@@ICON@@
+Type=Application
+StartupNotify=false
+StartupWMClass=@@DESKTOP_NAME@@
+Categories=Utility;Development;IDE;TextEditor;
+MimeType=application/x-@@NAME@@-workspace;
+Actions=new-empty-window;
+Keywords=weavecode;remote;ssh;embedded;ide;
+
+[Desktop Action new-empty-window]
+Name=New Empty Window
+Name[zh_CN]=新建空窗口
+Exec=@@EXEC@@ --new-window %F
+Icon=@@ICON@@

@@ -1082,3 +1082,328 @@ CodeOSS 自带的“关闭远程连接”也通过 `deactivate()` 补写抑制�
 - 可见品牌名统一为“织码 WeaveCode”，内部 extension ID 继续保留
   `remote-code-editor.rce-remote`，避免破坏已有 proposed API 和配置兼容性。
 - CodeOSS 已按新 applicationName `weavecode` 重新编译、打包并通过 xvfb 冒烟。
+
+
+---
+
+## 2026-10-14：官方 Copilot VSIX 在 `sshfs://` 虚拟工作区跑通（行内补全可用）
+
+**目标**：不内置专有扩展、目标机零部署的前提下，用你自己的 GitHub 账号在 `sshfs://`
+虚拟工作区里跑官方 Copilot（登录 + 行内补全 + 聊天）。
+
+**结果**：登录成功（`Got Copilot token`、`sku: free_educational_quota`，模型列表与 embeddings
+均拉取成功），源码里敲字能出灰字行内补全。
+
+**一路上填的五个坑**（全部实测踩出，改动均已幂等化）：
+
+1. **中文品牌名进了 HTTP 头 → 请求在本地构造阶段就失败**
+   `vscode.env.appName = product.nameLong = "织码 WeaveCode"`，而 GitHub 登录扩展和 Copilot
+   都把它拼进 `User-Agent`。HTTP 头只允许 Latin-1，中文让 Electron/Node 直接抛
+   `Cannot convert argument to a ByteString ... value of 32455`（0x7EC7 = “织”），上层只看到
+   `network error`。
+   修复：`apply-branding.mjs`「十一」把三处 exthost 的 `appName` 换成 ASCII `'WeaveCode'`，
+   市场 `User-Agent` 同步 ASCII；**界面显示名仍是中文**（窗口标题 / 关于页走 `nameLong`）。
+
+2. **`builtInExtensionsEnabledWithAutoUpdates` 把 copilot-chat 当内置扩展**
+   该字段仍列着 `GitHub.copilot-chat`，扫描器因此跳过用户手动装的同 ID 扩展，CLI 安装报
+   `Cannot read the extension from ...`。修复：`apply-branding.mjs` 里跟 `builtInExtensions` 一起清空。
+
+3. **proposed API 未放行 → 扩展被禁用**
+   copilot-chat 0.48.1 声明 63 个 proposed API，打包版只认白名单，扩展被禁用后聊天面板还会
+   反复去市场找它（Open VSX 没有）。修复：`run-app.sh` 用官方开关
+   `--enable-proposed-api GitHub.copilot --enable-proposed-api GitHub.copilot-chat`。
+
+4. **首次启动迁移逻辑主动禁用聊天扩展 → 死循环**
+   `extensionEnablementService#ensureChatExtensionInitialDisabledState` 在 “chat setup 未完成”
+   时禁用 `defaultChatAgent.chatExtensionId`：没登录 → 扩展被禁 → 面板找不到 → 去装 → 失败。
+   修复：`run-app.sh` 设 `VSCODE_SKIP_BUILTIN_EXTENSIONS=GitHub.copilot-chat`（源码里正是用它
+   跳过这段逻辑，且只作用于 system 扩展，不影响用户装的副本）。
+
+5. **chat setup 无条件去画廊“安装”已经装好的扩展**
+   `chatSetupController.doInstall()` → `extensionsWorkbenchService.install(id)`，而上游 `_install()`
+   只在“内置扩展 + 允许自动更新”时才提前返回，普通扩展一律查画廊；我们走 CodeOSS + Open VSX，
+   Copilot 专有扩展不在其中 → `无法安装扩展 "GitHub.copilot-chat"，因为找不到它`。
+   修复：`apply-branding.mjs`「十二」让 `doInstall()` 检测到本地已装就直接复用。
+
+**顺带**：
+
+- `run-app.sh` 默认不再清空 `udd-app`，Copilot 登录态得以保留（要干净重来用 `RCE_WIPE_USER_DATA=1`）；
+- `run-app.sh` 支持 `RCE_PROXY=http://127.0.0.1:7890`：中国大陆网络下 GitHub 登录（OAuth 端点都在
+  `github.com`）必须走代理；同时把 `127.0.0.1/localhost` 排除在代理外，避免影响假靶机和本机语言服务。
+
+**遗留**：
+
+- `node-pty` 原生模块缺失，Copilot CLI / agent 会话报 `Unable to find node-pty binaries`
+  （不影响行内补全与聊天，用到了再补）；
+- 上述 `appName` ASCII 补丁目前只在 Linux 打包链验证过。
+
+**验收**：`src/*.c` 里能出灰字行内补全；`GitHub Copilot Chat.log` 里有
+`Got Copilot token for <user>` 与 `BYOK: ... known models list fetched successfully`。
+
+
+---
+
+## 2026-10-14：SCM 面板对齐 VS Code（原生历史图 + 大提交按钮）
+
+**目标**：让源代码管理面板的观感和操作和 VS Code 一致，且**不自绘任何 UI**。
+
+**结果**：提交、暂存、推送、历史图全部在假靶机上跑通（远端 `origin/main` 与本地同步，
+图表提交后自动刷新）。
+
+**用到的两个 proposed API**（都是内置 git 扩展画同一套 UI 用的）：
+
+1. **`scmHistoryProvider`** —— 挂到 `SourceControl` 上后，工作台自动显示原生的
+   **Source Control Graph**（图表视图），分支/合并连线由 CodeOSS 自己画。
+   我们只把 `git log --all --date-order` 的结果（`id` / `parentIds` / `author` / `timestamp` /
+   `references`）翻译成它要的结构，一行 UI 代码都没写。
+2. **`scmActionButton`** —— 输入框下面那个**大绿色 ✓ 提交**按钮 + 下拉菜单：
+
+   | 菜单项 | 命令 |
+   |---|---|
+   | 提交 | `rce.scm.commit` |
+   | 提交（修改） | `rce.scm.commitAmend`（输入框空时走 `--amend --no-edit`） |
+   | 提交和推送 | `rce.scm.commitAndPush` |
+
+**其它对齐 VS Code 的行为**：
+
+- `scm/resourceGroup/context` 菜单：**「更改」组标题有 `+`（全部暂存）**、
+  **「暂存的更改」组标题有 `−`（全部取消暂存）**，不用再一个个点文件；
+- 提交时**暂存区为空但工作区有改动 → 自动全部暂存再提交**（`git add -A && git commit`，
+  和 VS Code 默认行为一致），不再直接抛“没有要提交的内容”；
+- `scm/title` 的提交按钮补上 `$(check)` 图标；
+- 提交命令按传入的 `SourceControl.rootUri` 定位仓库，多工作区不会串。
+
+**这一轮排掉的坑**：
+
+1. **假靶机 exec 只做正向路径映射**：客户端发 `/ws/...`，服务端换成临时目录真实路径后执行，
+   但**输出没换回来**，于是 `git rev-parse --show-toplevel` 把 `/tmp/rce-fake-ssh-xxx/ws` 吐给
+   客户端，客户端按 `/ws` 前缀算相对路径就算错 → 暂存/提交失败。修法是在 exec 输出上做反向映射
+   （`unrewrite`）。**只影响假靶机**，真机上两端路径本来就一致。
+2. **假靶机 git 没配作者身份**：造初始提交时只用了 `GIT_AUTHOR_*` 环境变量，没写进 `.git/config`，
+   客户端 `git commit` 报“作者身份未知”。修法是造仓时 `git config user.name/user.email`。
+3. **图表不刷新**：`onDidChangeHistoryItemRefs` 我们发的 payload 是空数组，工作台据此判断
+   “没有变化”而不重新拉历史；内置 git 传的是真实 delta。改成把当前分支报为 `modified`。
+4. **`AppError.detail` 被吞**：SCM 报错只显示“提交失败”，git 的 stderr 在 detail 里没露出，
+   排查时只能去手工复现。现在统一走 `scmReport()`，弹窗和输出通道都带 git 原话。
+
+**当时遗留（SCM 方向）**：点提交看文件变更（`provideHistoryItemChanges`）、分支切换、stash、pull/fetch。
+
+
+---
+
+## 2026-10-15：SCM 历史操作收尾 + E2E 17/17
+
+**目标**：把上一轮遗留的 SCM 原生交互补完，并让假靶机端到端覆盖历史图，而不是只验证面板能挂上。
+
+**完成**：
+
+- 原生历史图右键菜单：**查看提交变更、检出此提交、撤销此提交、硬重置到提交、复制提交 ID**；
+- 标题栏/大按钮：**切换分支、提交（修改）、提交并推送**；资源组标题栏：**全部暂存、全部取消暂存**；
+- `GitRemote.commitChanges()` 支持传父提交，改用 `git diff <parent> <commit>` 读取变更。此前
+  `git diff-tree --root <merge>` 对 merge 提交默认无输出，E2E 会在第一条合并提交上报“没有文件变更”；
+- 历史节点 ref 统一成完整 `refs/heads/...` / `refs/remotes/...` / `refs/tags/...`，修正图上的
+  当前分支匹配；命令参数按 `[SourceControl, SourceControlHistoryItem]` 组合解析，避免把
+  `SourceControl.id` 误当提交 hash；大按钮命令显式携带所属 `SourceControl`，多根工作区不串仓库。
+
+**proposed API 真坑**：
+
+- 扩展必须在自己的 `package.json#enabledApiProposals` 里声明 `scmHistoryProvider`、
+  `scmActionButton`、`contribSourceControlHistoryItemMenu`。只写 `product.json` 会让源码运行时报
+  “CANNOT use API proposal”，或静默丢弃 `scm/historyItem/context` 菜单；三处现在保持同步。
+
+**验证**：
+
+- `npm run lint`、`npm run typecheck`：通过；
+- `npm test`：151/151 通过（新增历史 ref/merge diff/检出重置等回归）；
+- `bash ide/tools/run-e2e.sh`：**17/17 通过**；SCM 步骤实际取到 `3 refs / 5 提交 / 1 个变更文件`；
+- E2E 同时复验了补全 4 项、诊断、任务和语言服务链路。
+
+**E2E 环境提示**：`apply-branding.mjs` 给 snippets 初始化打的上限补丁在源码里，但开发版运行的是
+`ide/vscode/out`。如果 `out` 是旧的，`executeCompletionItemProvider` 会一直等未完成的
+`_pendingWork`，表现为补全 15s 超时、窗口关闭时才结束；重跑 CodeOSS 编译
+`cd ide/vscode && npm run compile` 后恢复。
+
+
+---
+
+## 2026-10-15：Linux amd64 deb 发行链打通
+
+**目标**：不是“能编译”，而是能产出可安装、可校验、版本一致的 WeaveCode deb，并建立主力 IDE 的发行门禁。
+
+**完成**：
+
+- 新增 `ide/tools/build-deb.sh` / `npm run build:deb`：品牌补丁、共享核心、内置扩展、CodeOSS
+  工作台、deb 打包和产物校验一条命令闭环；
+- deb 使用 WeaveCode 自己的维护者、主页、桌面项、URL handler、AppData 和安装脚本，
+  不再写 Microsoft 元数据，也不会向用户的 apt 源添加 `packages.microsoft.com`；
+- `product.json#version` 取根 `package.json`，应用内、deb 控制字段和 `weavecode --version`
+  统一为 `3.0.0-alpha.0`；构建时不会再被上游 CodeOSS `1.142.0` 覆盖；
+- 明确本产品不提供 tunnel，打包依赖扫描跳过不存在的 `weavecode-tunnel`；
+- deb 构建自动复用本机 Electron 官方缓存；Sysroot/TMP 固定到 `ide/tools/tmp`，避免每次重下；
+- 新增 `npm run verify:release`：`lint → typecheck → test → E2E → deb` 全流程门禁。
+
+**实测**：
+
+- `npm run build:deb`：成功；
+- 产物：`ide/dist/weavecode_3.0.0-alpha.0-<build>_amd64.deb`，约 233 MB；
+- `sha256sum -c`：通过；
+- `dpkg-deb -f`：`Package=weavecode`、`Architecture=amd64`，依赖由 `dpkg-shlibdeps` 生成本次构建的真实列表；
+- deb 解包后 `bin/weavecode --version`：`3.0.0-alpha.0`；
+- 打包成品 xvfb 冒烟：窗口正常启动并截图。
+
+**遗留（发布方向）**：deb 签名、apt 仓库/增量升级元数据、真实机器安装/卸载回归，以及长期稳定性压测。
+
+**个人市场模式**：默认开源构建继续使用 Open VSX。应用品牌脚本支持
+`RCE_EXTENSION_GALLERY=microsoft` 生成个人自用构建，产物文件名带 `-ms-marketplace`；也支持
+`RCE_EXTENSION_GALLERY_JSON` 接入私有兼容市场。公开分发版不默认启用 Microsoft Marketplace，
+避免把第三方市场条款风险带进仓库的通用构建。
+
+
+---
+
+## 2026-10-16：连接状态、Quick Diff、全分支历史图三项实机回归修复
+
+**根因与修复**：
+
+- 左下角状态不匹配：`sshfs:` 是虚拟工作区，CodeOSS Remote Indicator 只按 URI 的
+  scheme/authority 画 label，SSH 正在连接或失败时也会显示成已连接。扩展现在把
+  `connecting / reconnecting / connected / failed / disconnected` 和错误详情同步为 context key；
+  `apply-branding.mjs` 给原生 Remote Indicator 打补丁，sshfs 分支实时读取真实状态并重绘；
+- Quick Diff 无 gutter/minimap 标记：工作区 URI 是 `/home/...`，Git canonical root 是
+  `/robotdata/...`。旧逻辑用 canonical root 对编辑器 URI 做前缀判断，导致 `rce-git:` Provider
+  根本收不到请求。`treeStatus` 现在同时返回 `workspacePrefix`，`rce-git:` URI 携带
+  `base/prefix`，Provider 按 UI 工作区路径映射到 Git 根内相对路径；
+- 历史图只有一条分支：旧实现固定执行 `git log --all`，没有把 CodeOSS graph 当前筛选的 refs
+  真正传给 Git；默认筛选也只取 HEAD + upstream，且我们的 `upstreamRef` 从未设置。
+  `treeStatus` 现在一次命令读取 upstream ref/commit，历史 Provider 把分支 revision 传给
+  `git log --topo-order --stdin` 等价参数，并在 sshfs Provider 上默认选择“全部分支”。
+
+**验证**：
+
+- 根项目 typecheck 通过；单测 `155/155` 通过；CodeOSS `npm run compile` 0 errors；
+- `RCE_EXTENSION_GALLERY=microsoft npm run build:deb` 成功；
+- 产物：`ide/dist/weavecode_3.0.0-alpha.0-1792147453_amd64-ms-marketplace.deb`；
+- 包内容确认包含 `rce.remoteConnectionState`、`workspacePrefix` 和内置 clangd；
+- `sha256sum -c` 通过，旧 deb 产物已清理。
+
+**状态栏收尾**：左下角连接状态只保留原生图标（连接中为旋转图标、失败为警告图标、
+断开为断连图标、正常为远程图标），主机和错误详情仅放在 tooltip，不再占用状态栏文字宽度。
+
+**分支 badge 收尾**：CodeOSS Graph 对没有 `ThemeIcon` 的 ref 会主动跳过 badge；所以即使
+Provider 返回了 4 个分支，界面也看起来像只有当前分支。现在本地分支使用 `git-branch`、
+远端分支使用 `cloud`、标签使用 `tag`，并额外按 commit revision 强制挂载 ref，避免依赖
+`%D` 装饰串。E2E 增加硬断言：每个 ref 必须有 icon，且对应提交必须包含该 ref badge。
+
+---
+
+## 2026-10-17：语言服务改为标准 LSP 直连远端 + 浏览/代码智能双模式
+
+**架构修正**：旧“本机源码镜像 + 本机 clangd/pylsp + 同步 sysroot”不是通用方案，也无法保证
+ROS/交叉编译 `compile_commands.json` 与本机环境一致。主链路改为：
+
+```text
+sshfs:// 文档 ⇄ 远端 file:// 路径 → SSH exec 双向 stdio → 远端已安装标准 LSP
+```
+
+远端语言服务器直接读取权威源码和构建数据库；remote 模式不复制源码/sysroot，不部署 VS Code Server。
+
+**完成**：
+
+- 新增通用 `rce.lsp.servers` 注册表：任意标准 LSP 可配置 `command/args/languageIds/extensions/
+  rootMarkers/env/initializationOptions`，C++/Python 只是内置默认项；
+- `LspManager` 支持任意服务器 ID、远端命令 shell quote、`command -v`/`test -x` 预检、stderr 日志；
+- `pwd -P` 软链接真实路径别名；服务端 `file://`、工作区路径和外部系统头能正确映射回 `sshfs://`；
+- 浏览模式不启动 LSP；代码智能模式按当前文件优先启动；切回浏览默认热保留 5 分钟；
+- 首次编辑自动提升到代码智能，服务 ready 后自动触发一次补全；连续输入 50ms 合并、只发最新全文；
+- Provider 接入 `CancellationToken`，取消时发送 `$/cancelRequest`；
+- 配置变化热重载；状态栏显示浏览、热保留、启动中、就绪和失败；
+- 本地假 SSH 服务端补齐 exec stdin → 子进程 stdin，使远端 LSP 集成测试可验证真实双向 JSON-RPC。
+
+**验证**：
+
+- 新增 server-config、remote-path、取消请求、任意 LSP 命令和假 SSH 远端 LSP roundtrip 测试；
+- 根项目 typecheck / lint / test / extension build 是全量门禁；
+- 不连接任何真实远程主机；真机行为只由用户运行后反馈日志和截图。
+
+**兼容**：`transport=local` 保留旧镜像链路，但不再是默认值，也不在 remote 模式自动触发。
+
+---
+
+## 2026-10-17 修正：默认改为开发机 LSP + 只读 SSHFS，目标机零语言服务
+
+上一版仍要求目标机安装 clangd/pylsp，这不满足“目标机零部署、用户不需要自己准备语言服务”的要求，
+因此不能作为最终方案。默认架构修正为：
+
+```text
+sshfs:// 文档 ⇄ 开发机只读 SSHFS（远端整棵 /） → 开发机标准 LSP
+```
+
+**完成**：
+
+- 新增 `SshfsMount`：只读挂载远端 `/`，密码/口令仅走子进程 stdin，支持重连、缓存和安全卸载；
+- 新增 `mounted-workspace`：把远端 `compile_commands.json`、CMake flags、目标 triple、
+  GCC C++ 系统头搜索目录重写到 SSHFS 前缀，不复制源码/sysroot；
+- C++/ROS 使用开发机内置 clangd；clangd 索引不写回远端（`background-index=0`、PCH 在内存）；
+- Python 内置 `python-lsp-server` 到 IDE resources，不要求开发机预装 pylsp；
+- `rce.lsp.transport` 默认改为 `mount`；`remote`（目标机已有 LSP）和 `local`（旧镜像）降为兼容；
+- Provider 在首次挂载竞态时自动重试，避免 VSCode 把一次空符号结果缓存下来；
+- deb 声明开发机依赖 `sshfs`，目标机仍然只需要 sshd/sftp。
+
+**验证**：
+
+- 新增只读 SSHFS 真挂载集成测试、挂载路径/编译视图单测、内置 pylsp initialize+completion 测试；
+- CodeOSS E2E 改用“假 SSH + 真只读 SSHFS + 本机假 LSP”，17/17 通过，符号、补全、定义、诊断均恢复；
+- 根项目 typecheck、lint、174 项测试通过；
+- 不连接真实远程主机。
+
+---
+
+## 2026-10-17 收尾：正式包体积对齐 VS Code
+
+实装机对比发现 WeaveCode 安装体积约 1.3 GB，而本机 VS Code 约 979 MB。拆包后确认主要浪费：
+
+- CodeOSS 开发构建带入 **296 MB `.map` source map**，正式运行不需要；
+- 内置 clangd 带 **约 70 MB 调试符号**；
+- 语言库本身约 116 MB，与 VS Code 用户安装 C/C++/Python 语言扩展属于同一类成本。
+
+**修复**：
+
+- deb 打包阶段删除全部 `*.map`；
+- 内置 clangd 复制到正式包后执行 `strip --strip-unneeded`，129 MB → 55 MB；
+- 发行门禁新增：包内 clangd 必须可执行、内置 pylsp 必须存在、不得残留 source map、
+  `Installed-Size` 不得超过 1,150,000 KB，并检查开发机 `sshfs` 依赖。
+
+**结果**：
+
+- deb：308 MB → 207 MB；
+- `Installed-Size`：1,309,365 KB → 934,226 KB（约 912 MiB）；
+- 本机 VS Code：995,096 KB（约 972 MiB）；
+- 正式包不再包含 source map，内置 clangd 可独立执行。
+
+---
+
+## 2026-10-17 ROS 诊断修复：逐 target 编译命令 + 软链接路径对齐
+
+实机 ROS2 项目仍出现 `std::chrono`、`is_convertible_v`、`rclcpp::Node` 和 `nav_msgs::msg::Odometry` 报错。
+检查实际生成文件后确认是两个编译视图错误：
+
+1. `compile_flags.txt` 写完后对整行做了 `Set` 去重，导致重复的 `-isystem` 被删掉，只剩第一个系统头目录；
+   后面的 `/usr/include/c++/11` 等目录被 clangd 当成输入文件，标准库解析失败。
+2. CMake 没有 `compile_commands.json` 时，旧逻辑把所有 target 的 `flags.make` 合并，业务 target
+   意外继承了 rosidl 生成 target 的 `-std=gnu++14`，导致 C++17 代码报错。
+
+**修复**：
+
+- 根据每个 target 的 `build.make` 提取真实源文件，生成逐文件 `compile_commands.json`；
+- 普通业务 target 优先于 `*__rosidl_*` target，不再混合其他 target flags；
+- 远端 `g++` 默认 `__cplusplus` 探测为 201703L，缺失 `-std` 时显式补 `gnu++17`；
+- 系统头目录按 `-isystem <dir>` 成对写入，不再对整行去重；
+- SSHFS 模式下执行 `pwd -P`，把工作区软链接路径映射到真实构建路径
+  `/home/Le/ros2_ws/... → /robotdata/Le/ros2_ws/...`，确保文档命中 compile database。
+
+**实测**：
+
+- 使用实机项目当前只读 SSHFS 视图生成 4 条真正的 `diff_driver_node` 编译命令；
+- 当前源文件参数包含 `-std=gnu++17`、完整 ROS include 和 7 个目标系统头目录，不再含 `gnu++14`；
+- 直接运行内置 clangd `--check` 完成 preamble/AST 构建，没有上述语义诊断；
+- 178 项单测/集成测试和 CodeOSS E2E 17/17 通过。

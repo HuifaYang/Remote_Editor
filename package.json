@@ -12,6 +12,8 @@
     "lint": "eslint . --ext .ts,.mjs",
     "test": "vitest run",
     "build:extension": "node ide/tools/build-extension.mjs",
+    "build:deb": "bash ide/tools/build-deb.sh",
+    "verify:release": "bash ide/tools/release-check.sh",
     "run": "bash ide/tools/run-app.sh",
     "e2e": "bash ide/tools/run-e2e.sh",
     "codeoss:bootstrap": "git submodule update --init --recursive ide/vscode"

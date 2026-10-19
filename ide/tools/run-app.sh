@@ -35,16 +35,35 @@ if pgrep -f "$APP" >/dev/null 2>&1; then
   fi
 fi
 
-# 从干净用户目录启动：旧工作区、Agents 会话和布局状态都清掉，确保只出现一个窗口。
-rm -rf "$TOOLS/udd-app"
+# 默认保留用户数据（Copilot 登录态、扩展启用状态、窗口之外的缓存），避免每次重启都要重新登录；
+# 确实要“干净重来”时用 RCE_WIPE_USER_DATA=1。窗口恢复由下面的 settings.json 关掉，不会因此多开窗口。
+if [ "${RCE_WIPE_USER_DATA:-0}" = "1" ]; then
+  echo "== 清空用户数据（RCE_WIPE_USER_DATA=1）=="
+  rm -rf "$TOOLS/udd-app"
+fi
 mkdir -p "$TOOLS/udd-app"
 node "$TOOLS/ensure-language-pack.mjs"
 mkdir -p "$TOOLS/udd-app/User"
+
+# 代理：设 RCE_PROXY（例如 http://127.0.0.1:7890）后，CodeOSS 外壳与扩展的 HTTP 请求
+# （GitHub 登录、Copilot 授权）都走该代理；SSH/SFTP 通道不受影响。
+if [ -n "${RCE_PROXY:-}" ]; then
+  export HTTP_PROXY="$RCE_PROXY" HTTPS_PROXY="$RCE_PROXY"
+  export http_proxy="$RCE_PROXY" https_proxy="$RCE_PROXY"
+  # 回环地址（假靶机、本机语言服务）一律直连，绕过代理
+  export NO_PROXY="${NO_PROXY:-127.0.0.1,localhost,::1}"
+  export no_proxy="$NO_PROXY"
+  TAIL_SETTINGS='  "workbench.secondarySideBar.defaultVisibility": "hidden",
+  "http.proxy": "'"$RCE_PROXY"'"'
+else
+  TAIL_SETTINGS='  "workbench.secondarySideBar.defaultVisibility": "hidden"'
+fi
+
 printf '%s\n' \
   '{' \
   '  "window.restoreWindows": "none",' \
   '  "window.confirmSaveUntitledWorkspace": false,' \
-  '  "workbench.secondarySideBar.defaultVisibility": "hidden"' \
+  "$TAIL_SETTINGS" \
   '}' > "$TOOLS/udd-app/User/settings.json"
 
 TARGET="${1:-}"
@@ -91,11 +110,19 @@ for v in ELECTRON_RUN_AS_NODE ELECTRON_NO_ATTACH_CONSOLE VSCODE_ESM_ENTRYPOINT \
          VSCODE_NLS_CONFIG VSCODE_CODE_CACHE_PATH VSCODE_CRASH_REPORTER_PROCESS_TYPE \
          VSCODE_DEV CODEX_INTERNAL_ORIGINATOR_OVERRIDE; do unset "$v" 2>/dev/null || true; done
 export ELECTRON_DISABLE_SANDBOX=1 VSCODE_SKIP_PRELAUNCH=1
+# 别让工作台把 Copilot Chat 当“内置聊天扩展”在首次启动时禁用：
+# extensionEnablementService#ensureChatExtensionInitialDisabledState 会在 chat setup
+# 未完成时主动禁用 product.json#defaultChatAgent.chatExtensionId。我们用的是外部官方
+# VSIX，一禁就变成“扩展不可用 → 去市场装 → Open VSX 没有 → 找不到”的死循环。
+export VSCODE_SKIP_BUILTIN_EXTENSIONS="GitHub.copilot-chat"
 export RCE_SPIKE_HOST="$HOST" RCE_SPIKE_PORT="$PORT" RCE_SPIKE_USER="$USER_NAME" RCE_SPIKE_WORKSPACE="$REMOTE_DIR"
 export RCE_SPIKE_KNOWN_HOSTS="$TOOLS/tmp/known_hosts" RCE_SPIKE_SSH_DIR="$TOOLS/tmp/empty-ssh"
 [ -n "$PASS" ] && export RCE_SPIKE_PASS="$PASS"
 
-COMMON=(--no-sandbox --disable-gpu --disable-dev-shm-usage --disable-layout-restore --skip-welcome --locale=zh-cn --user-data-dir="$TOOLS/udd-app" --shared-data-dir="$TOOLS/udd-app/shared" --extensions-dir="$TOOLS/ext-oss")
+# Copilot / Copilot Chat 是官方外部 VSIX；打包版默认会拦下它们声明的 proposed API，
+# 扩展被禁用后聊天面板还会去市场反复找 GitHub.copilot-chat（Open VSX 上没有）。
+# 用官方开关逐扩展放行（见 extensionsProposedApi.ts）。
+COMMON=(--no-sandbox --disable-gpu --disable-dev-shm-usage --disable-layout-restore --skip-welcome --locale=zh-cn --user-data-dir="$TOOLS/udd-app" --shared-data-dir="$TOOLS/udd-app/shared" --extensions-dir="$TOOLS/ext-oss" --enable-proposed-api GitHub.copilot --enable-proposed-api GitHub.copilot-chat)
 URL="sshfs://${USER_NAME}@${HOST}:${PORT}${REMOTE_DIR}"
 # RCE_APP_XVFB=1 可以强制走下面的 xvfb 冒烟分支（没有桌面的机器 / 自动测试用）
 if [ -n "${DISPLAY:-}" ] && [ -z "${RCE_APP_XVFB:-}" ]; then

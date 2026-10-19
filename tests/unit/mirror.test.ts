@@ -8,14 +8,15 @@ import { extractTarGz } from "../../src/main/mirror/tar";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   MirrorManager, buildFullSyncCommand, buildIncrementalSyncCommand, buildPythonEnvTarCommand,
-  buildSysrootTarCommand, parseSections, splitStderr,
+  buildSysrootTarCommand, parseSections, selectSysrootRoots, splitStderr,
 } from "../../src/main/mirror/manager";
 import {
   createManifest, diffManifest, mirrorRelativePath, parseFindListing, parseManifest, serializeManifest, toEntryMap,
 } from "../../src/main/mirror/manifest";
 import {
-  buildCompileFlagsTxt, buildCompileCommandsFindCommand, buildDirExistsCommand, collectFromParsedData,
-  mergeCompileCommands, rewriteCompileCommand, splitCommandLine, type CompileRewriteContext,
+  buildCmakeFlagsFindCommand, buildCompileFlagsTxt, buildCompileCommandsFindCommand, buildDirExistsCommand,
+  collectFromParsedData, mergeCompileCommands, parseCmakeFlags, rewriteCompileCommand,
+  rewriteCompileFlags, splitCommandLine, type CompileRewriteContext,
 } from "../../src/main/lsp/clangd-config";
 
 let scratch: string;
@@ -60,6 +61,12 @@ describe("T5.1 同步命令拼装（A8b）", () => {
     const inc = buildSysrootTarCommand(["/usr/include"], 1729990000);
     expect(inc).toContain("-newermt '@1729990000'");
     expect(inc).toContain("-not -name '*.so*'");
+  });
+
+  it("test_cmake_flags_find_covers_colcon_outer_build", () => {
+    const cmd = buildCmakeFlagsFindCommand("/home/Le/ros2_ws/src/chassis_driver_refactor");
+    expect(cmd).toContain("find '/home/Le/ros2_ws/build/chassis_driver_refactor'");
+    expect(cmd).toContain("-path '*/CMakeFiles/*.dir/flags.make'");
   });
 
   it("test_python_env_excludes_native_extensions", () => {
@@ -195,11 +202,101 @@ describe("T5.4 compile_commands.json 收集与重写（A9）", () => {
     expect(flags.split("\n").filter(Boolean)).toEqual(["-std=c++17", "-I/mirror/x/include", "-I/mirror/x"]);
   });
 
+  it("test_parse_cmake_flags_keeps_ros_and_standard_includes", () => {
+    const parsed = parseCmakeFlags([
+      "CXX_DEFINES = -DROS_PACKAGE_NAME=\\\"chassis_driver_refactor\\\" -DFASTCDR_DYN_LINK",
+      "CXX_INCLUDES = -I/robotdata/Le/ws/src/pkg/include -isystem /opt/ros/humble/include/rclcpp -isystem /usr/include/eigen3",
+      "CXX_FLAGS = -Wall -Wextra -std=gnu++17",
+      "",
+    ].join("\n"));
+    expect(parsed.includes).toEqual([
+      "-I/robotdata/Le/ws/src/pkg/include",
+      "-isystem/opt/ros/humble/include/rclcpp",
+      "-isystem/usr/include/eigen3",
+    ]);
+    expect(parsed.defines).toContain("-DFASTCDR_DYN_LINK");
+    expect(parsed.flags).toContain("-std=gnu++17");
+  });
+
+  it("test_rewrites_cmake_flags_through_symlink_alias", () => {
+    const ctx: CompileRewriteContext = {
+      remotePrefix: "/home/Le/ws/src/pkg",
+      remoteAliases: ["/robotdata/Le/ws/src/pkg"],
+      localPrefix: "/mirror/x",
+      sysrootRoots: ["/opt/ros/humble/include/rclcpp", "/robotdata/Le/ws/build/pkg/rosidl_generator_cpp"],
+      localSysrootPrefix: "/mirror/x/_sysroot",
+    };
+    const result = rewriteCompileFlags([
+      "-I/robotdata/Le/ws/src/pkg/include",
+      "-isystem", "/opt/ros/humble/include/rclcpp",
+      "-I/robotdata/Le/ws/build/pkg/rosidl_generator_cpp",
+    ], ctx);
+    expect(result.flags).toEqual([
+      "-I/mirror/x/include",
+      "-isystem/mirror/x/_sysroot/opt/ros/humble/include/rclcpp",
+      "-I/mirror/x/_sysroot/robotdata/Le/ws/build/pkg/rosidl_generator_cpp",
+    ]);
+  });
+
+  it("test_collects_flags_make_fallback_into_compile_flags", () => {
+    const mirrorRoot = path.join(scratch, "mirror");
+    const fallbackFlags = [
+      "-I/robotdata/Le/ws/src/pkg/include",
+      "-isystem", "/opt/ros/humble/include/rclcpp",
+      "-isystem", "/usr/include/eigen3",
+      "-DROS_PACKAGE_NAME=\"pkg\"",
+      "-std=gnu++17",
+    ];
+    const compile = collectFromParsedData("/home/Le/ws/src/pkg", {
+      findOutput: "",
+      fileTexts: {},
+      probeOutput: [
+        "/usr/include",
+        "/usr/include/aarch64-linux-gnu",
+        "/opt/ros/humble/include/rclcpp",
+        "/usr/include/eigen3",
+      ].join("\n"),
+    }, {
+      mirrorRoot,
+      triplet: "aarch64-linux-gnu",
+      remoteAliases: ["/robotdata/Le/ws/src/pkg"],
+      fallbackFlags,
+    });
+    expect(compile.sysrootRoots).toEqual(expect.arrayContaining([
+      "/opt/ros/humble/include/rclcpp",
+      "/usr/include/eigen3",
+    ]));
+    const flags = fs.readFileSync(path.join(mirrorRoot, "compile_flags.txt"), "utf8");
+    expect(flags).toContain("-I" + path.join(mirrorRoot, "include"));
+    expect(flags).toContain("-isystem" + path.join(mirrorRoot, "_sysroot", "opt", "ros", "humble", "include", "rclcpp"));
+    expect(flags).toContain("-isystem" + path.join(mirrorRoot, "_sysroot", "usr", "include", "eigen3"));
+    expect(flags).toContain("-DROS_PACKAGE_NAME=\"pkg\"");
+    expect(flags).toContain("-std=gnu++17");
+    expect(flags).not.toContain("-std=c++17");
+  });
+
+  it("test_incremental_uses_newly_collected_sysroots", () => {
+    const previous = ["/usr/include"];
+    const collected = collectFromParsedData("/ws", { findOutput: "", fileTexts: {}, probeOutput: "/usr/include\n/opt/ros/humble/include" }, {
+      mirrorRoot: path.join(scratch, "mirror"),
+      triplet: "aarch64-linux-gnu",
+      fallbackFlags: ["-isystem", "/opt/ros/humble/include"],
+    });
+    expect(selectSysrootRoots(collected, previous)).toContain("/opt/ros/humble/include");
+  });
+
   it("test_collect_command_prefers_build_then_limited_depth", () => {
     const cmd = buildCompileCommandsFindCommand("/ws");
     expect(cmd).toContain("[ -d '/ws/build' ]");
     expect(cmd).toContain("find '/ws/build' -type f -name compile_commands.json");
     expect(cmd).toContain("-maxdepth 4");
+  });
+
+  it("test_collect_command_searches_colcon_outer_build", () => {
+    // ROS2/colcon：源码在 ~/ros2_ws/src/<pkg>，编译数据库在 ~/ros2_ws/build/<pkg>
+    const cmd = buildCompileCommandsFindCommand("/home/Le/ros2_ws/src/chassis_driver_refactor");
+    expect(cmd).toContain("'/home/Le/ros2_ws/build/chassis_driver_refactor'");
+    expect(cmd).toContain("find '/home/Le/ros2_ws/build' -maxdepth 2 -type f -name compile_commands.json");
   });
 
   it("test_dir_exists_command_quotes_each_dir", () => {

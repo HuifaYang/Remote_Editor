@@ -24,6 +24,8 @@ export interface ConnectionOptions {
 export interface ExecStreamHandle {
   /** SSH 通道的 stdout 读端（同时可写，作为远端进程 stdin） */
   stdout: ClientChannel;
+  /** SSH 通道的 stderr 读端（不参与双向协议，只用于诊断日志） */
+  stderr: NodeJS.ReadableStream;
   /** 等远端进程退出（close 之后才会 resolve） */
   wait(): Promise<{ code: number; stderr: string }>;
   close(): void;
@@ -274,6 +276,7 @@ export class SSHConnection {
         });
         resolve({
           stdout: stream,
+          stderr: stream.stderr,
           wait: () => exitResult
             ? Promise.resolve(exitResult)
             : new Promise<{ code: number; stderr: string }>((res) => { settle = res; }),

@@ -13,7 +13,10 @@
   "enabledApiProposals": [
     "fileSearchProvider",
     "textSearchProvider",
-    "contribViewsRemote"
+    "contribViewsRemote",
+    "scmHistoryProvider",
+    "scmActionButton",
+    "contribSourceControlHistoryItemMenu"
   ],
   "capabilities": {
     "virtualWorkspaces": true,
@@ -88,11 +91,84 @@
       {
         "command": "rce.scm.commit",
         "title": "提交",
+        "category": "织码 WeaveCode",
+        "icon": "$(check)"
+      },
+      {
+        "command": "rce.scm.commitAmend",
+        "title": "提交（修改）",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.scm.commitAndPush",
+        "title": "提交和推送",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.scm.checkout",
+        "title": "切换分支",
+        "category": "织码 WeaveCode",
+        "icon": "$(git-branch)"
+      },
+      {
+        "command": "rce.scm.checkoutCommit",
+        "title": "检出此提交",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.scm.revertCommit",
+        "title": "撤销此提交",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.scm.resetCommit",
+        "title": "重置到此提交（丢弃之后所有提交）",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.scm.copyCommitId",
+        "title": "复制提交 ID",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.scm.stageAll",
+        "title": "暂存全部更改",
+        "category": "织码 WeaveCode",
+        "icon": "$(add)"
+      },
+      {
+        "command": "rce.scm.unstageAll",
+        "title": "取消暂存全部更改",
+        "category": "织码 WeaveCode",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "rce.lsp.menu",
+        "title": "语言服务：模式与操作"
+      },
+      {
+        "command": "rce.lsp.browseMode",
+        "title": "切换到浏览模式",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.lsp.intelligentMode",
+        "title": "切换到代码智能",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.lsp.toggleMode",
+        "title": "切换浏览/代码智能模式",
+        "category": "织码 WeaveCode"
+      },
+      {
+        "command": "rce.lsp.configure",
+        "title": "配置语言服务器…",
         "category": "织码 WeaveCode"
       },
       {
         "command": "rce.lsp.syncMirror",
-        "title": "重新同步远端镜像",
+        "title": "刷新语言服务（兼容镜像同步）",
         "category": "织码 WeaveCode",
         "icon": "$(cloud-download)"
       },
@@ -104,7 +180,7 @@
       },
       {
         "command": "rce.cache.cleanup",
-        "title": "清理本机语言服务缓存",
+        "title": "清理本地兼容镜像缓存",
         "category": "织码 WeaveCode",
         "icon": "$(trash)"
       },
@@ -164,9 +240,53 @@
     "menus": {
       "scm/title": [
         {
+          "command": "rce.scm.commit",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "navigation"
+        },
+        {
+          "command": "rce.scm.checkout",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "navigation"
+        },
+        {
           "command": "rce.scm.refresh",
           "when": "scmProvider =~ /^rce-sshfs/",
           "group": "navigation"
+        }
+      ],
+      "scm/historyItem/context": [
+        {
+          "command": "rce.scm.checkoutCommit",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "1_checkout@1"
+        },
+        {
+          "command": "rce.scm.revertCommit",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "3_modify@1"
+        },
+        {
+          "command": "rce.scm.resetCommit",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "3_modify@2"
+        },
+        {
+          "command": "rce.scm.copyCommitId",
+          "when": "scmProvider =~ /^rce-sshfs/",
+          "group": "9_copy@1"
+        }
+      ],
+      "scm/resourceGroup/context": [
+        {
+          "command": "rce.scm.stageAll",
+          "when": "scmProvider =~ /^rce-sshfs/ && scmResourceGroup == changes",
+          "group": "inline"
+        },
+        {
+          "command": "rce.scm.unstageAll",
+          "when": "scmProvider =~ /^rce-sshfs/ && scmResourceGroup == staged",
+          "group": "inline"
         }
       ],
       "scm/resourceState/context": [
@@ -310,27 +430,81 @@
         "rce.lsp.enabled": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "是否启用远端语言服务（C/C++ 补全·跳转·诊断 / Python）。开启后会把远端目录镜像到本机（1 条 tar 命令），由**工作机上的** clangd / pylsp 提供服务；目标机不装任何东西。"
+          "markdownDescription": "是否启用标准 LSP 语言服务。默认在开发机按需运行，通过只读 SSHFS 惰性读取远端文件；目标机无需安装语言服务，也不会复制源码/sysroot。"
         },
         "rce.lsp.transport": {
           "type": "string",
           "enum": [
+            "mount",
             "local",
             "remote",
             "disabled"
           ],
-          "default": "local",
-          "markdownDescription": "语言服务跑在哪：`local` = 工作机（默认，指向本地镜像）；`remote` = 唯一例外，按需拉起**你自己装在板子上**的 clangd/pylsp；`disabled` = 完全关闭。"
+          "enumDescriptions": [
+            "开发机运行语言服务，通过只读 SSHFS 惰性读取远端整棵文件系统（推荐）",
+            "开发机运行语言服务，使用旧的源码镜像兼容模式",
+            "目标机已自行安装语言服务器时，通过 SSH exec 直接运行",
+            "完全关闭语言服务"
+          ],
+          "default": "mount",
+          "markdownDescription": "语言服务执行位置。`mount` 默认推荐：目标机只需 sshd/sftp，开发机语言服务通过只读 SSHFS 直接读取远端源码、系统头和 ROS 环境；`remote` 仅在目标机已有对应 LSP 时使用；`local` 是旧镜像兼容模式。"
+        },
+        "rce.lsp.mode": {
+          "type": "string",
+          "enum": ["browse", "intelligent"],
+          "enumDescriptions": ["只浏览：不启动语言服务，资源占用最低", "代码智能：补全、跳转、诊断、格式化和重构"],
+          "default": "browse",
+          "markdownDescription": "语言模式。浏览模式保持零语言服务进程；切到代码智能时当前文件优先启动，不重启窗口，标签、光标和撤销历史都保留。"
+        },
+        "rce.lsp.autoPromoteOnEdit": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "浏览模式下第一次编辑时自动切换到代码智能。只想看代码时不会启动任何语言服务。"
+        },
+        "rce.lsp.warmRetentionMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 0,
+          "markdownDescription": "从代码智能切回浏览模式后，语言服务热保留多少分钟供快速切回；0 = 立即停止。RK3566/2GB 建议 2–5 分钟。"
+        },
+        "rce.lsp.servers": {
+          "type": "object",
+          "default": {},
+          "markdownDescription": "任意标准 LSP 的启动描述，键是服务器 ID。示例：`{\"go\":{\"command\":\"gopls\",\"args\":[],\"extensions\":[\".go\"],\"rootMarkers\":[\"go.mod\"]}}`。C++/Python 已内置，可用 `false` 关闭默认项。",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "string" },
+              { "type": "boolean" },
+              {
+                "type": "object",
+                "properties": {
+                  "enabled": { "type": "boolean" },
+                  "command": { "type": "string" },
+                  "args": { "type": "array", "items": { "type": "string" } },
+                  "languageIds": { "type": "array", "items": { "type": "string" } },
+                  "extensions": { "type": "array", "items": { "type": "string" } },
+                  "rootMarkers": { "type": "array", "items": { "type": "string" } },
+                  "env": { "type": "object", "additionalProperties": { "type": "string" } },
+                  "initializationOptions": {}
+                }
+              }
+            ]
+          }
         },
         "rce.lsp.cppPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "clangd 可执行文件路径（留空 = 内置 clangd，再退回 PATH 里的 `clangd`）。"
+          "markdownDescription": "开发机 clangd 命令或绝对路径（留空 = IDE 内置 clangd）。仅 remote 兼容模式会在目标机执行。"
         },
         "rce.lsp.pythonPath": {
           "type": "string",
           "default": "",
-          "markdownDescription": "Python 语言服务路径（留空 = `python3 -m pylsp`）。"
+          "markdownDescription": "开发机 Python 语言服务命令（留空 = 内置 python-lsp-server）。仅 remote 兼容模式会在目标机执行。"
+        },
+        "rce.lsp.sshfsPath": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "开发机 sshfs 可执行文件路径（留空 = PATH 中的 `sshfs`）。mount 模式需要该工具；deb 会自动安装依赖。"
         },
         "remote.SSH.configFile": {
           "type": "string",
@@ -361,22 +535,22 @@
         "rce.lsp.maxFiles": {
           "type": "number",
           "default": 20000,
-          "markdownDescription": "自动建立语言服务镜像的最大源文件数。超过此值时暂停自动镜像，状态栏会提示；点击状态栏可强制同步。VS Code Remote-SSH 不镜像目录，这里是为了嵌入式场景在工作机跑语言服务而做的折中。"
+          "markdownDescription": "仅 local 兼容模式的镜像文件上限；remote 模式直接读取远端源码，不受此项影响。"
         },
         "rce.cache.maxSizeMB": {
           "type": "number",
           "default": 10240,
-          "markdownDescription": "本机语言服务影子缓存的总容量上限（MB）。超过后按最近使用时间淘汰非活跃项目；当前项目和未同步项目不会被自动删除。"
+          "markdownDescription": "仅 local 兼容模式的影子缓存总容量上限（MB）；remote 模式不建立源码镜像。"
         },
         "rce.cache.maxProjectMB": {
           "type": "number",
           "default": 5120,
-          "markdownDescription": "单个项目影子缓存的上限（MB）。源码镜像和 clangd/pylsp 索引合计超过此值且项目不活跃时会被清理。"
+          "markdownDescription": "仅 local 兼容模式的单项目影子缓存上限（MB）。"
         },
         "rce.cache.ttlDays": {
           "type": "number",
           "default": 30,
-          "markdownDescription": "影子缓存多久未使用后允许自动清理（天）。设为 0 表示不按时间清理。"
+          "markdownDescription": "仅 local 兼容模式的影子缓存 TTL（天）。设为 0 表示不按时间清理。"
         },
         "rce.cache.cleanupOnDisconnect": {
           "type": "boolean",

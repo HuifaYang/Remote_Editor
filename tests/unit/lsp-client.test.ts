@@ -170,6 +170,29 @@ describe("T8.3 报文转换", () => {
     client.didChange("/mirror/x/a.cpp", "int b;\n", 2);
     expect(transport.last().method).toBe("textDocument/didChange");
     expect((transport.last().params as { contentChanges: unknown[] }).contentChanges).toEqual([{ text: "int b;\n" }]);
+
+    // 任意语言的配置可以覆盖 VSCode/扩展名推断出的 languageId
+    client.didOpen("/ws/main.rs", "fn main() {}\n", 1, "rust");
+    expect((transport.last().params as { textDocument: Record<string, unknown> }).textDocument.languageId).toBe("rust");
+  });
+
+  it("test_request_cancellation_sends_cancel_notification", async () => {
+    const { client, transport } = await startedClient();
+    let cancelled = false;
+    let listener: (() => void) | undefined;
+    const token = {
+      get isCancellationRequested() { return cancelled; },
+      onCancellationRequested(cb: () => void) {
+        listener = cb;
+        return { dispose: () => { listener = undefined; } };
+      },
+    };
+    const pending = client.completion("file:///ws/a.cpp", 0, 0, token);
+    cancelled = true;
+    listener?.();
+    await expect(pending).rejects.toThrow("请求已取消");
+    const cancel = transport.messages().find((message) => message.method === "$/cancelRequest");
+    expect(cancel?.params).toMatchObject({ id: expect.any(Number) });
   });
 
   it("test_diagnostics_event_is_forwarded", async () => {
